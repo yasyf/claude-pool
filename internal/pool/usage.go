@@ -121,15 +121,13 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.C
 
 // AdoptRotatedToken re-reads an account's credential from the Keychain (where a
 // live claude session may have rotated it) and propagates it across the
-// account's services. Used by the daemon on session check-in.
+// account's services, keeping acct-00's mirror in lockstep with the canonical
+// item. Used by the daemon on session check-in.
 func (m *Manager) AdoptRotatedToken(a store.Account) error {
-	cred, src, err := m.readCredential(a)
+	cred, _, err := m.readCredential(a)
 	if err != nil {
 		return err
 	}
-	// Re-write to all services (including src) to re-assert ACL ownership and
-	// keep acct-00's mirror in lockstep with the canonical item.
-	_ = src
 	return m.writeCredentialAll(a, cred)
 }
 
@@ -188,5 +186,7 @@ func (m *Manager) recordSample(accountID int, u *oauth.Usage, rateLimited bool) 
 		Resets7dOpus: u.SevenDayOpus.ResetsAt,
 		RateLimited:  rateLimited,
 	}
+	// Best-effort: a failed insert self-heals on the next poll and surfaces as
+	// the account going stale, so it is intentionally not escalated here.
 	_ = m.Store.InsertUsageSample(s)
 }

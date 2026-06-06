@@ -27,6 +27,19 @@ class ClaudePool < Formula
     bin.install_symlink "claude-pool" => "clp"
   end
 
+  # Run the daemon as a USER LaunchAgent (no sudo): it needs the user's login
+  # Keychain, which a root daemon cannot read. `brew services start claude-pool`
+  # installs ~/Library/LaunchAgents/homebrew.mxcl.claude-pool.plist.
+  service do
+    run [opt_bin/"claude-pool", "daemon"]
+    keep_alive true
+    run_at_load true
+    environment_variables PATH: std_service_path_env,
+                          CGOFUSE_LIBFUSE_PATH: "/usr/local/lib/libfuse-t.dylib"
+    log_path "#{Dir.home}/.claude-pool/daemon.log"
+    error_log_path "#{Dir.home}/.claude-pool/daemon.log"
+  end
+
   def caveats
     <<~EOS
       Get started:
@@ -35,7 +48,7 @@ class ClaudePool < Formula
         CLAUDE_CONFIG_DIR=$(clp select) claude
 
       Enable the background daemon (keeps idle tokens fresh, scores live):
-        clp service install
+        brew services start claude-pool
 
       Optional live-mirror overlay (instead of per-entry symlinks) needs fuse-t:
         brew install macos-fuse-t/cask/fuse-t

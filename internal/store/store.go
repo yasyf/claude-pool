@@ -122,6 +122,8 @@ func (s *Store) UpsertAccount(a Account) error {
 	return nil
 }
 
+// scanAccount decodes one account row; the parameter is satisfied by both
+// *sql.Row and *sql.Rows.
 func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	var a Account
 	var zero int
@@ -260,6 +262,43 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 	}
 	u.RateLimited = rl != 0
 	return u, true, nil
+}
+
+// RecentUsageSamples returns up to limit of an account's most recent samples,
+// newest first. Used to estimate the utilization burn rate.
+func (s *Store) RecentUsageSamples(accountID, limit int) ([]UsageSample, error) {
+	rows, err := s.db.Query(
+		`SELECT account_id,ts,util_5h,util_7d,util_7d_opus,resets_5h,resets_7d,resets_7d_opus,rate_limited
+		 FROM usage_samples WHERE account_id=? ORDER BY ts DESC LIMIT ?`, accountID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageSample
+	for rows.Next() {
+		var u UsageSample
+		var ts int64
+		var u5, u7, u7o sql.NullFloat64
+		var r5, r7, r7o sql.NullInt64
+		var rl int
+		if err := rows.Scan(&u.AccountID, &ts, &u5, &u7, &u7o, &r5, &r7, &r7o, &rl); err != nil {
+			return nil, err
+		}
+		u.TS = time.Unix(ts, 0)
+		u.Util5h, u.Util7d, u.Util7dOpus = u5.Float64, u7.Float64, u7o.Float64
+		if r5.Valid {
+			u.Resets5h = time.Unix(r5.Int64, 0)
+		}
+		if r7.Valid {
+			u.Resets7d = time.Unix(r7.Int64, 0)
+		}
+		if r7o.Valid {
+			u.Resets7dOpus = time.Unix(r7o.Int64, 0)
+		}
+		u.RateLimited = rl != 0
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 // ---- sessions ----

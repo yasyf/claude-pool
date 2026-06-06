@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/claude-pool/internal/overlay"
 	"github.com/yasyf/claude-pool/internal/pool"
+	"github.com/yasyf/claude-pool/internal/service"
 )
 
 func newInitCmd() *cobra.Command {
@@ -37,22 +38,26 @@ func newInitCmd() *cobra.Command {
 						"  (tip: install fuse-t and a fuse-enabled build for a live mirror overlay: brew install macos-fuse-t/cask/fuse-t)"))
 				}
 
-				// Offer to install the background daemon.
+				// Enable the background daemon.
 				if !noService {
-					install := isTTY()
-					if isTTY() {
-						_ = huh.NewConfirm().
-							Title("Install the claude-pool background daemon now?").
-							Description("Keeps idle accounts refreshed and scores live (recommended).").
-							Value(&install).
-							Run()
-					}
-					if install {
-						if err := runServiceInstall(cmd); err != nil {
-							fmt.Fprintf(cmd.ErrOrStderr(), "service install failed: %v\n", err)
-						}
+					if service.IsBrewManaged() {
+						fmt.Fprintln(out, "  Enable the daemon with: brew services start claude-pool")
 					} else {
-						fmt.Fprintln(out, "  Run `clp service install` later to enable the daemon.")
+						install := isTTY()
+						if isTTY() {
+							_ = huh.NewConfirm().
+								Title("Install the claude-pool background daemon now?").
+								Description("Keeps idle accounts refreshed and scores live (recommended).").
+								Value(&install).
+								Run()
+						}
+						if install {
+							if err := runServiceInstall(cmd); err != nil {
+								fmt.Fprintf(cmd.ErrOrStderr(), "service install failed: %v\n", err)
+							}
+						} else {
+							fmt.Fprintln(out, "  Run `clp service install` later to enable the daemon.")
+						}
 					}
 				}
 

@@ -104,7 +104,11 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 				report(prefix+" mirror", false, werr.Error())
 			}
 		} else {
-			report(prefix+" mirror", inSync, ternary(inSync, "", "drifted from ~/.claude credential"))
+			detail := ""
+			if !inSync {
+				detail = "drifted from ~/.claude credential"
+			}
+			report(prefix+" mirror", inSync, detail)
 		}
 		return // acct-00 has no overlay to check
 	}
@@ -124,11 +128,4 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 	} else {
 		report(prefix+" overlay", true, string(prov.Kind()))
 	}
-}
-
-func ternary(cond bool, a, b string) string {
-	if cond {
-		return a
-	}
-	return b
 }

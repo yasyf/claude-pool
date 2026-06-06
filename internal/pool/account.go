@@ -124,11 +124,9 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 
 	// Re-assert: read the item Claude wrote and write it straight back so our
 	// tooling owns the ACL for prompt-free refresh thereafter.
-	cred, err := keychain.Reassert(p.KeychainService, account)
-	if err != nil {
+	if _, err := keychain.Reassert(p.KeychainService, account); err != nil {
 		return nil, fmt.Errorf("re-assert keychain item: %w", err)
 	}
-	_ = cred
 
 	acct := store.Account{
 		ID:              p.Index,
@@ -152,9 +150,10 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 	return &acct, nil
 }
 
-// AbandonAdd cleans up a prepared-but-not-finalized account dir.
+// AbandonAdd cleans up a prepared-but-not-finalized account dir. p must be a
+// non-nil PendingAdd returned by PrepareAdd.
 func (m *Manager) AbandonAdd(p *PendingAdd) error {
-	if p == nil || p.Index == AcctZero {
+	if p.Index == AcctZero {
 		return nil
 	}
 	prov := overlay.For(p.OverlayKind)
@@ -188,6 +187,18 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 		_ = keychain.Delete(a.KeychainService, a.KeychainAccount)
 	}
 	return m.Store.DeleteAccount(id)
+}
+
+// SyncOverlay re-asserts an account's overlay so it reflects the current
+// ~/.claude (the symlink provider links any new top-level entry; the fuse
+// provider is a live mirror, so this just health-checks). acct-00 IS the base,
+// so it is a no-op. Called at launch time and periodically by the daemon, which
+// is why explicit `clp sync` is unnecessary.
+func (m *Manager) SyncOverlay(a store.Account) error {
+	if a.IsZero {
+		return nil
+	}
+	return overlay.For(overlay.Kind(a.OverlayKind)).Sync(ClaudeDir(), a.ConfigDir)
 }
 
 // overlayKind returns the provider kind to use for new accounts, taken from

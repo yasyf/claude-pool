@@ -53,10 +53,15 @@ func (s *Server) scheduler(ctx context.Context) {
 // pollOnce reconciles sessions, then samples usage for every account,
 // refreshing the token only for idle accounts.
 func (s *Server) pollOnce(ctx context.Context) {
-	sessions, _ := procscan.Scan()
-	alive := procscan.AlivePIDs(sessions)
-	if alive != nil {
-		if n, err := s.m.Store.CloseDeadSessions(alive); err == nil && n > 0 {
+	sessions, err := procscan.Scan()
+	if err != nil {
+		s.log.Printf("procscan: %v", err)
+	}
+	if alive := procscan.AlivePIDs(sessions); alive != nil {
+		switch n, err := s.m.Store.CloseDeadSessions(alive); {
+		case err != nil:
+			s.log.Printf("close dead sessions: %v", err)
+		case n > 0:
 			s.log.Printf("reconciled %d ended session(s)", n)
 		}
 	}
@@ -80,6 +85,13 @@ func (s *Server) pollOnce(ctx context.Context) {
 			case <-time.After(perAccountSpacing):
 			}
 		}
+		// Re-assert the overlay so long-lived setups pick up new top-level
+		// ~/.claude entries without an explicit sync (symlink relinks; fuse
+		// health-checks). acct-00 is a no-op.
+		if err := s.m.SyncOverlay(a); err != nil {
+			s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
+		}
+
 		idle := procscan.CountByConfigDir(sessions, a.ConfigDir, s.m.DefaultDir) == 0
 
 		// A previously checked-out account that is now idle may carry a token
@@ -87,12 +99,15 @@ func (s *Server) pollOnce(ctx context.Context) {
 		// this propagates plain claude's rotated token; SampleUsage never
 		// POST-refreshes acct-00.)
 		if idle {
-			_ = s.m.AdoptRotatedToken(a)
+			if err := s.m.AdoptRotatedToken(a); err != nil {
+				s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)
+			}
 		}
 
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		_, rateLimited, err := s.m.SampleUsage(cctx, a, idle)
 		cancel()
+		// rlStreak is scheduler-local (this goroutine only) — no lock needed.
 		if rateLimited {
 			s.rlStreak[a.ID]++
 		} else if err == nil {

@@ -73,8 +73,9 @@ Each account dir presents **all of `~/.claude`** — your `projects/`, `skills/`
 every session shares the same workspace. Two providers:
 
 - **symlink** (default, zero-dependency): symlinks each top-level entry of
-  `~/.claude` into the account dir. `clp sync`/`clp doctor` re-assert links when
-  new entries appear.
+  `~/.claude` into the account dir. New top-level entries are picked up
+  automatically at launch (`clp select`/`clp run`), by the daemon, and by
+  `clp doctor` — no manual step needed.
 - **fuse** (optional, live mirror): an in-process passthrough mirror mounted via
   [fuse-t](https://github.com/macos-fuse-t/fuse-t) (kext-less, mounted as you,
   no root). Auto-includes new entries with no re-sync. Requires a
@@ -86,22 +87,30 @@ would conflict across concurrent sessions. Each account gets its own.
 
 ### Scoring
 
+For a healthy account the score is exactly:
+
 ```
 score = 0.70·(100−util_5h) + 0.25·(100−util_7d)
       − 2·active_sessions − 100·rate_limited − 20·stale_or_refresh_failed
 ```
 
-`select` picks argmax; ties break toward the soonest 5-hour reset. Usage comes
-from Claude's own `/api/oauth/usage` endpoint.
+Near limits it gets smarter (each term reduces to the above when not engaged):
+an **imminent reset** is credited (a 90%-used window resetting in 10 min ranks
+*up*, not down); a **low-headroom barrier** stops a nearly-exhausted 7-day window
+from being masked by 5-hour headroom; and a **burn-rate** term downranks an
+account being actively drained. `select` picks argmax. Usage comes from Claude's
+own `/api/oauth/usage` endpoint.
 
 ### The daemon
 
-`clp service install` runs a **user LaunchAgent** (a root daemon couldn't read
-your login Keychain). It polls usage every ~45s, refreshes **idle** accounts'
-tokens before they expire (a checked-out session owns its own refresh; the
-daemon re-reads and adopts whatever token it rotated to on check-in), caches
-scores, and — with the fuse overlay — owns the mount lifecycle. With the daemon
-running, `clp select` is a sub-millisecond cache read.
+`brew services start claude-pool` (Homebrew installs) or `clp service install`
+(source builds) runs a **user LaunchAgent** (a root daemon couldn't read your
+login Keychain). It polls usage every ~3 min with exponential backoff, refreshes
+**idle** accounts' tokens before they expire (a checked-out session owns its own
+refresh; the daemon re-reads and adopts whatever token it rotated to on
+check-in — and it never refreshes acct-00, whose token plain `claude` owns),
+caches scores, and — with the fuse overlay — owns the mount lifecycle. If the
+daemon isn't running, `clp select` auto-spawns it (≤2s) or samples live.
 
 No secrets are ever stored in claude-pool's database — the macOS Keychain is the
 only secret store.
@@ -117,10 +126,9 @@ only secret store.
 | `clp status [-w]` | Live table of usage / score / sessions |
 | `clp list` | Static account list |
 | `clp env [--account N]` | Print `export` lines to launch a specific account |
-| `clp sync` | Re-assert overlays (pick up new `~/.claude` entries) |
 | `clp doctor [--fix]` | Re-validate Keychain items and overlays; repair drift |
 | `clp remove <id>` | Remove an account from the pool |
-| `clp service install\|uninstall\|status` | Manage the daemon LaunchAgent |
+| `clp service install\|uninstall\|status` | Manage the daemon (delegates to `brew services` on Homebrew installs) |
 
 ## Uninstall
 

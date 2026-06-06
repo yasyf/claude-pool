@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os/exec"
 	"regexp"
-	"strings"
 )
 
 // acctAttrRE matches the account attribute line in `security
@@ -39,6 +38,3 @@ func ServiceExists(service string) bool {
 	cmd := exec.Command(securityBin, "find-generic-password", "-s", service)
 	return cmd.Run() == nil
 }
-
-// trimAttr is a small helper used by tests to normalize security output.
-func trimAttr(s string) string { return strings.TrimSpace(s) }

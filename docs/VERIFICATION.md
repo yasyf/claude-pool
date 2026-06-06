@@ -24,12 +24,13 @@ claude-pool --version  # same binary, both names work
 
 ## 2. init keeps plain claude working; add a second account; status; daemon refresh
 ```sh
-clp init               # registers acct-00; mirrors its credential; offers the daemon
+clp init               # registers acct-00; mirrors its credential; points at the daemon
 claude                 # (human) plain claude STILL launches on ~/.claude, untouched
-clp add                # (human) interactive: logs in acct-01, discovers + re-asserts its keychain item
-clp status             # both accounts shown with live 5h/7d remaining + score
-clp service install    # daemon runs; after onboarding it refreshes idle tokens with NO GUI prompt
-clp service status     # daemon: running
+clp add                # (human) interactive: logs in an account, then loops ("Add another?")
+                       #         so you can onboard several subscriptions in one run
+clp status             # all accounts shown with live 5h/7d remaining + score
+brew services start claude-pool   # brew install: enable the daemon (or `clp service install` on a source build)
+clp service status     # shows "Homebrew (brew services)" or self-managed, + Daemon: running
 ```
 Verify in `Keychain Access` that there is now `Claude Code-credentials`
 (canonical) plus suffixed `Claude Code-credentials-<hash>` items — distinct per

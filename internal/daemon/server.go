@@ -219,7 +219,9 @@ func (s *Server) handleSelect(req Request) Response {
 	if !req.NoMark {
 		s.reserve(best.Account.ID)
 		if req.PID > 0 {
-			_, _ = s.m.Store.OpenSession(best.Account.ID, req.PID, best.Account.ConfigDir)
+			if _, err := s.m.Store.OpenSession(best.Account.ID, req.PID, best.Account.ConfigDir); err != nil {
+				s.log.Printf("open session for acct-%02d pid %d: %v", best.Account.ID, req.PID, err)
+			}
 		}
 	}
 	id := best.Account.ID
@@ -230,12 +232,20 @@ func (s *Server) handleSelect(req Request) Response {
 
 // handleCheckin closes sessions for a pid and adopts any rotated token.
 func (s *Server) handleCheckin(req Request) Response {
-	sessions, _ := s.m.Store.ListActiveSessions()
+	sessions, err := s.m.Store.ListActiveSessions()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
 	for _, se := range sessions {
-		if se.PID == req.PID {
-			_ = s.m.Store.CloseSession(se.ID)
-			if a, err := s.m.Store.GetAccount(se.AccountID); err == nil {
-				_ = s.m.AdoptRotatedToken(a)
+		if se.PID != req.PID {
+			continue
+		}
+		if err := s.m.Store.CloseSession(se.ID); err != nil {
+			s.log.Printf("checkin close session %d: %v", se.ID, err)
+		}
+		if a, err := s.m.Store.GetAccount(se.AccountID); err == nil {
+			if err := s.m.AdoptRotatedToken(a); err != nil {
+				s.log.Printf("acct-%02d adopt rotated token on checkin: %v", a.ID, err)
 			}
 		}
 	}
@@ -277,6 +287,8 @@ func (s *Server) pickWithReservations(snaps []pool.Snapshot) (pool.Snapshot, boo
 			Util5h:         sn.Util5h,
 			Util7d:         sn.Util7d,
 			Resets5h:       sn.Resets5h,
+			Resets7d:       sn.Resets7d,
+			Burn5hPerHour:  sn.Burn5hPerHour,
 			ActiveSessions: sn.ActiveSessions + s.reservedCount(sn.Account.ID),
 			RateLimited:    sn.RateLimited,
 			RefreshFailed:  sn.Stale && !sn.HasUsage,
@@ -366,5 +378,7 @@ func (s *Server) fallbackToSymlink(a store.Account) {
 		return
 	}
 	a.OverlayKind = string(overlay.KindSymlink)
-	_ = s.m.Store.UpsertAccount(a)
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		s.log.Printf("acct-%02d persist symlink fallback: %v", a.ID, err)
+	}
 }

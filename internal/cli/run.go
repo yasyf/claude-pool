@@ -36,6 +36,9 @@ and owns the resulting process — so the session is tracked precisely and the
 				if err != nil {
 					return err
 				}
+				if err := m.SyncOverlay(a); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: overlay sync: %v\n", err)
+				}
 				if err := m.PreflightRefresh(cmd.Context(), a); err != nil && !errors.Is(err, pool.ErrNeedsLogin) {
 					fmt.Fprintf(cmd.ErrOrStderr(), "warning: %v\n", err)
 				}

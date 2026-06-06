@@ -66,6 +66,11 @@ scores; otherwise it samples usage live.`,
 // daemon was unreachable and the caller should fall back to live selection.
 func selectViaDaemon(cmd *cobra.Command, account *int, wait bool) (dir string, done bool, err error) {
 	cl := daemon.NewClient()
+	// Auto-spawn a detached daemon if none is running (≤2s), then fall through
+	// to live selection if it still doesn't come up.
+	if !cl.EnsureRunning(2 * time.Second) {
+		return "", false, nil
+	}
 	// pid 0: clp exits before `claude` starts, so its pid is useless for
 	// session tracking. We still want a reservation (anti-thundering-herd), but
 	// no session row — procscan attributes the real claude process. `clp run`
@@ -131,6 +136,11 @@ func selectLive(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, fr
 // emitChoice preflight-refreshes the chosen account, prints its dir to stdout
 // (and only its dir), and a diagnostic line to stderr.
 func emitChoice(cmd *cobra.Command, m *pool.Manager, a store.Account, reason string) error {
+	// Re-assert the overlay so the launched session sees any new top-level
+	// ~/.claude entries (replaces the old explicit `clp sync`).
+	if err := m.SyncOverlay(a); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: overlay sync: %v\n", err)
+	}
 	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
 		if errors.Is(err, pool.ErrNeedsLogin) {
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: acct-%02d needs re-login (`clp add` or `claude /login`)\n", a.ID)

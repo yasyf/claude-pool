@@ -89,3 +89,69 @@ func TestNeverSampledIsSelectableButPenalized(t *testing.T) {
 		t.Fatal("never-sampled account should score below a known-good one due to stale penalty")
 	}
 }
+
+// TestHealthyEqualsBaseline: a healthy account (windows far from reset, above
+// the barrier knee, no measured burn) scores exactly the baseline formula.
+func TestHealthyEqualsBaseline(t *testing.T) {
+	now := time.Now()
+	in := Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 40, Util7d: 30}
+	got := Score(in, now).Score
+	want := W5h*(100-40) + W7d*(100-30) // no penalties, no guards
+	if got != want {
+		t.Fatalf("healthy score = %.4f, want baseline %.4f", got, want)
+	}
+}
+
+func TestImminentResetRanksUp(t *testing.T) {
+	now := time.Now()
+	imminent := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 80, Resets5h: now.Add(12 * time.Minute)}, now)
+	far := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 80, Resets5h: now.Add(4 * time.Hour)}, now)
+	if imminent.Score <= far.Score {
+		t.Fatalf("about-to-reset account should rank up: imminent=%.2f far=%.2f", imminent.Score, far.Score)
+	}
+	if imminent.Components.Eff5 < 90 {
+		t.Fatalf("imminent reset should lift eff5 near full, got %.1f", imminent.Components.Eff5)
+	}
+}
+
+// TestBarrierGuardsLowSevenDay: a 5h-rich account whose 7-day window is nearly
+// exhausted must rank below a balanced peer (the weighted sum alone would mask it).
+func TestBarrierGuardsLowSevenDay(t *testing.T) {
+	now := time.Now()
+	lowWeekly := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 10, Util7d: 92}, now)
+	balanced := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 40, Util7d: 40}, now)
+	if lowWeekly.Components.Barrier7d == 0 {
+		t.Fatal("expected a 7d barrier penalty for the nearly-exhausted weekly window")
+	}
+	if lowWeekly.Score >= balanced.Score {
+		t.Fatalf("barrier should downrank the low-weekly account: low=%.2f balanced=%.2f", lowWeekly.Score, balanced.Score)
+	}
+}
+
+func TestBurnRateRunwayDownranks(t *testing.T) {
+	now := time.Now()
+	draining := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 50, Burn5hPerHour: 20}, now)
+	stable := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 50, Burn5hPerHour: 0}, now)
+	if draining.Components.RunwayPenalty == 0 {
+		t.Fatal("expected a runway penalty for the actively-draining account")
+	}
+	if draining.Score >= stable.Score {
+		t.Fatalf("burn-rate should downrank the draining account: draining=%.2f stable=%.2f", draining.Score, stable.Score)
+	}
+}
+
+// TestZeroKnobsReproduceBaseline: disabling the guards recovers the exact
+// baseline even for an account that would otherwise trip them.
+func TestZeroKnobsReproduceBaseline(t *testing.T) {
+	defer restoreKnobs(BarrierKnee, RunwayWeight)
+	BarrierKnee, RunwayWeight = 0, 0
+	now := time.Now()
+	in := Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 95, Util7d: 96, Burn5hPerHour: 50}
+	got := Score(in, now).Score
+	want := W5h*(100-95) + W7d*(100-96)
+	if got != want {
+		t.Fatalf("with guards disabled, score = %.4f, want baseline %.4f", got, want)
+	}
+}
+
+func restoreKnobs(knee, runway float64) { BarrierKnee, RunwayWeight = knee, runway }

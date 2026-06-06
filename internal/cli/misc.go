@@ -7,7 +7,6 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/claude-pool/internal/overlay"
 	"github.com/yasyf/claude-pool/internal/pool"
 	"github.com/yasyf/claude-pool/internal/store"
 )
@@ -34,34 +33,6 @@ func newListCmd() *cobra.Command {
 						a.ID, a.Label, a.OverlayKind, a.ConfigDir, a.KeychainService)
 				}
 				return tw.Flush()
-			})
-		},
-	}
-}
-
-func newSyncCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "sync",
-		Short: "Re-assert each account's overlay (pick up new ~/.claude entries)",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withManager(func(m *pool.Manager) error {
-				accts, err := m.Store.ListAccounts()
-				if err != nil {
-					return err
-				}
-				for _, a := range accts {
-					if a.IsZero {
-						continue // acct-00 IS the base; nothing to overlay
-					}
-					prov := overlay.For(overlay.Kind(a.OverlayKind))
-					if err := prov.Sync(pool.ClaudeDir(), a.ConfigDir); err != nil {
-						fmt.Fprintf(cmd.ErrOrStderr(), "acct-%02d: %v\n", a.ID, err)
-						continue
-					}
-					fmt.Fprintf(cmd.OutOrStdout(), "acct-%02d synced (%s)\n", a.ID, a.OverlayKind)
-				}
-				return nil
 			})
 		},
 	}
@@ -138,6 +109,8 @@ For acct-00 it emits the escape-hatch var so the canonical credential is used.`,
 	return cmd
 }
 
+// shellQuote single-quotes s for POSIX shells; an embedded quote becomes the
+// classic close-quote/escaped-quote/reopen-quote sequence '\”.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

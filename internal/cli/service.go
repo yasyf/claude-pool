@@ -30,9 +30,15 @@ func newServiceCmd() *cobra.Command {
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
-				fmt.Fprintf(out, "LaunchAgent loaded: %v\n", service.Loaded())
-				cl := daemon.NewClient()
-				if resp, err := cl.Health(); err == nil && resp.OK {
+				if service.IsBrewManaged() {
+					fmt.Fprintln(out, "Management: Homebrew (brew services)")
+					if info, err := service.BrewInfo(); err == nil {
+						fmt.Fprintln(out, info)
+					}
+				} else {
+					fmt.Fprintf(out, "Management: self-managed LaunchAgent (loaded: %v)\n", service.Loaded())
+				}
+				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					fmt.Fprintf(out, "Daemon: running (%s)\n", resp.Version)
 				} else {
 					fmt.Fprintln(out, "Daemon: not responding")
@@ -53,10 +59,19 @@ func newServiceUninstallCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			out := cmd.OutOrStdout()
-			if err := service.Uninstall(); err != nil {
-				return err
+			if service.IsBrewManaged() {
+				if err := service.BrewStop(); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "brew services stop: %v\n", err)
+				}
+				// Remove any stale self-rolled agent from before the brew switch.
+				_ = service.Uninstall()
+				fmt.Fprintln(out, "✓ Daemon stopped (brew services)")
+			} else {
+				if err := service.Uninstall(); err != nil {
+					return err
+				}
+				fmt.Fprintln(out, "✓ LaunchAgent removed")
 			}
-			fmt.Fprintln(out, "✓ LaunchAgent removed")
 
 			// Always unmount any fuse overlays and re-assert nothing is left mounted.
 			_ = withManager(func(m *pool.Manager) error {
@@ -107,11 +122,25 @@ func purgeAll(cmd *cobra.Command) error {
 	return nil
 }
 
-// runServiceInstall installs the LaunchAgent and reports status.
+// runServiceInstall starts the daemon: via `brew services` when Homebrew-managed
+// (booting out any stale self-rolled agent first), else the self-rolled
+// LaunchAgent.
 func runServiceInstall(cmd *cobra.Command) error {
+	out := cmd.OutOrStdout()
+	if service.IsBrewManaged() {
+		// Migration safety: a previous `clp service install` may have left a
+		// self-rolled com.yasyf.claude-pool agent that would run alongside the
+		// brew one. Boot it out before delegating.
+		_ = service.Uninstall()
+		if err := service.BrewStart(); err != nil {
+			return fmt.Errorf("brew services start: %w", err)
+		}
+		fmt.Fprintln(out, "✓ Daemon started via brew services")
+		return nil
+	}
 	if err := service.Install(); err != nil {
 		return err
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), "✓ Daemon installed and started")
+	fmt.Fprintln(out, "✓ Daemon installed and started")
 	return nil
 }

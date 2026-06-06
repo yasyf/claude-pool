@@ -118,13 +118,36 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 		in.Util5h = s.Util5h
 		in.Util7d = s.Util7d
 		in.Resets5h = s.Resets5h
+		in.Resets7d = s.Resets7d
 		in.RateLimited = s.RateLimited
+		in.Burn5hPerHour = m.burnRate5h(a.ID)
 	}
 	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir, m.DefaultDir)
 	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && !r.OK {
 		in.RefreshFailed = true
 	}
 	return in, nil
+}
+
+// burnRate5h estimates the recent rate of change of util_5h in percent/hour
+// from the two most recent samples. Returns 0 if there is too little history,
+// the samples are too close together (<30s), or utilization decreased (a window
+// reset happened, which is not a burn).
+func (m *Manager) burnRate5h(accountID int) float64 {
+	samples, err := m.Store.RecentUsageSamples(accountID, 2)
+	if err != nil || len(samples) < 2 {
+		return 0
+	}
+	newer, older := samples[0], samples[1]
+	dt := newer.TS.Sub(older.TS)
+	if dt < 30*time.Second {
+		return 0
+	}
+	dUtil := newer.Util5h - older.Util5h
+	if dUtil <= 0 {
+		return 0
+	}
+	return dUtil / dt.Hours()
 }
 
 // PreflightRefresh refreshes the chosen account's token if it expires within

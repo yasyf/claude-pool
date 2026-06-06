@@ -24,6 +24,8 @@ type Snapshot struct {
 	RateLimited    bool
 	Stale          bool
 	Resets5h       time.Time
+	Resets7d       time.Time
+	Burn5hPerHour  float64
 	SampleAge      time.Duration
 }
 
@@ -69,6 +71,8 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			RateLimited:    in.RateLimited,
 			Stale:          r.Stale,
 			Resets5h:       in.Resets5h,
+			Resets7d:       in.Resets7d,
+			Burn5hPerHour:  in.Burn5hPerHour,
 		}
 		if in.HasUsage {
 			s.SampleAge = now.Sub(in.SampleTS)

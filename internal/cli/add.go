@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 	"github.com/yasyf/claude-pool/internal/pool"
+	"github.com/yasyf/claude-pool/internal/store"
 )
 
 func newAddCmd() *cobra.Command {
@@ -15,84 +17,146 @@ func newAddCmd() *cobra.Command {
 		label   string
 		runNow  bool
 		autoYes bool
+		count   int
 	)
 	cmd := &cobra.Command{
 		Use:   "add",
-		Short: "Pool another Claude subscription (interactive login)",
+		Short: "Pool one or more Claude subscriptions (interactive login)",
 		Long: `add allocates a new account dir, sets up its overlay onto ~/.claude, then
 walks you through logging that account in. After login it discovers the
 account's Keychain item, takes over its ACL for prompt-free refresh, validates
-with one usage call, and records it.`,
+with one usage call, and records it.
+
+Run interactively it loops, offering to add another account after each one. Use
+--count to add a fixed number, or -y to add a single account without prompts.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				out := cmd.OutOrStdout()
-				pending, err := m.PrepareAdd()
-				if err != nil {
-					return err
-				}
-				fmt.Fprintf(out, "Allocated acct-%02d → %s (overlay: %s)\n",
-					pending.Index, pending.ConfigDir, pending.OverlayKind)
-
-				doRun := runNow
-				if isTTY() && !runNow && !autoYes {
-					choice := "run"
-					_ = huh.NewSelect[string]().
-						Title("How do you want to log in this account?").
-						Options(
-							huh.NewOption("Run `claude /login` now in this terminal", "run"),
-							huh.NewOption("I'll run the login command myself in another terminal", "manual"),
-						).
-						Value(&choice).
-						Run()
-					doRun = choice == "run"
-				}
-
-				if doRun {
-					if err := runClaudeLogin(pending.ConfigDir); err != nil {
-						fmt.Fprintf(cmd.ErrOrStderr(), "login command exited with error: %v\n", err)
+				var added []store.Account
+				for i := 0; ; i++ {
+					lbl := ""
+					if i == 0 {
+						lbl = label // --label applies to the first account
 					}
-				} else {
-					fmt.Fprintf(out, "\nRun this, complete the login, then return here:\n\n    %s\n\n", pending.LoginCommand)
-					if isTTY() {
-						cont := true
-						_ = huh.NewConfirm().Title("Press enter once login is complete").Value(&cont).Run()
-					}
-				}
-
-				// Optional human label.
-				if label == "" && isTTY() {
-					_ = huh.NewInput().
-						Title("Label for this account (optional)").
-						Placeholder("e.g. work@example.com").
-						Value(&label).
-						Run()
-				}
-
-				acct, err := m.FinalizeAdd(cmd.Context(), pending, label)
-				if err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "could not finalize: %v\n", err)
-					if shouldAbandon(cmd) {
-						if aerr := m.AbandonAdd(pending); aerr != nil {
-							fmt.Fprintf(cmd.ErrOrStderr(), "cleanup failed: %v\n", aerr)
-						} else {
-							fmt.Fprintf(out, "rolled back acct-%02d\n", pending.Index)
+					acct, err := addOne(cmd, m, lbl, runNow || autoYes)
+					if err != nil {
+						if len(added) == 0 {
+							return err // nothing added yet → propagate (nonzero exit)
 						}
+						fmt.Fprintf(cmd.ErrOrStderr(), "stopping after %d account(s): %v\n", len(added), err)
+						break
 					}
-					return err
+					added = append(added, *acct)
+					if !addAnother(cmd, len(added), count, autoYes) {
+						break
+					}
 				}
-				fmt.Fprintf(out, "✓ Added acct-%02d (%s). Keychain: %s\n", acct.ID, acct.Label, acct.KeychainService)
+				summarizeAdds(cmd, m, added)
 				return nil
 			})
 		},
 	}
-	cmd.Flags().StringVar(&label, "label", "", "human label for the account")
-	cmd.Flags().BoolVar(&runNow, "run-login", false, "run `claude /login` immediately (non-interactive)")
-	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "assume defaults; do not prompt")
+	cmd.Flags().StringVar(&label, "label", "", "human label for the (first) account")
+	cmd.Flags().BoolVar(&runNow, "run-login", false, "run `claude /login` immediately instead of asking")
+	cmd.Flags().BoolVarP(&autoYes, "yes", "y", false, "add a single account with no prompts")
+	cmd.Flags().IntVar(&count, "count", 0, "add exactly N accounts without the continue prompt")
 	return cmd
+}
+
+// addOne runs the full prepare → login → finalize flow for a single account.
+func addOne(cmd *cobra.Command, m *pool.Manager, label string, runNow bool) (*store.Account, error) {
+	out := cmd.OutOrStdout()
+	pending, err := m.PrepareAdd()
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(out, "Allocated acct-%02d → %s (overlay: %s)\n",
+		pending.Index, pending.ConfigDir, pending.OverlayKind)
+
+	doRun := runNow
+	if isTTY() && !runNow {
+		choice := "run"
+		_ = huh.NewSelect[string]().
+			Title("How do you want to log in this account?").
+			Options(
+				huh.NewOption("Run `claude /login` now in this terminal", "run"),
+				huh.NewOption("I'll run the login command myself in another terminal", "manual"),
+			).
+			Value(&choice).
+			Run()
+		doRun = choice == "run"
+	}
+
+	if doRun {
+		if err := runClaudeLogin(pending.ConfigDir); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "login command exited with error: %v\n", err)
+		}
+	} else {
+		fmt.Fprintf(out, "\nRun this, complete the login, then return here:\n\n    %s\n\n", pending.LoginCommand)
+		if isTTY() {
+			cont := true
+			_ = huh.NewConfirm().Title("Press enter once login is complete").Value(&cont).Run()
+		}
+	}
+
+	if label == "" && isTTY() {
+		_ = huh.NewInput().
+			Title("Label for this account (optional)").
+			Placeholder("e.g. work@example.com").
+			Value(&label).
+			Run()
+	}
+
+	acct, err := m.FinalizeAdd(cmd.Context(), pending, label)
+	if err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "could not finalize: %v\n", err)
+		if shouldAbandon(cmd) {
+			if aerr := m.AbandonAdd(pending); aerr != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "cleanup failed: %v\n", aerr)
+			} else {
+				fmt.Fprintf(out, "rolled back acct-%02d\n", pending.Index)
+			}
+		}
+		return nil, err
+	}
+	fmt.Fprintf(out, "✓ Added acct-%02d (%s). Keychain: %s\n", acct.ID, acct.Label, acct.KeychainService)
+	return acct, nil
+}
+
+// addAnother decides whether the loop continues after a successful add.
+func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
+	if count > 0 {
+		return done < count
+	}
+	if autoYes || !isTTY() {
+		return false
+	}
+	again := false
+	if err := huh.NewConfirm().Title("Add another account?").Value(&again).Run(); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "prompt error: %v\n", err)
+		return false
+	}
+	return again
+}
+
+// summarizeAdds prints a closing summary of what was added.
+func summarizeAdds(cmd *cobra.Command, m *pool.Manager, added []store.Account) {
+	if len(added) == 0 {
+		return
+	}
+	names := make([]string, len(added))
+	for i, a := range added {
+		names[i] = fmt.Sprintf("acct-%02d", a.ID)
+	}
+	total := len(added)
+	if all, err := m.Store.ListAccounts(); err == nil {
+		total = len(all)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "\nAdded %s; pool now has %d account(s).\n",
+		strings.Join(names, ", "), total)
 }
 
 // runClaudeLogin execs `claude /login` with CLAUDE_CONFIG_DIR set, attached to
