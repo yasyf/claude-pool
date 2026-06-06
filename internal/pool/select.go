@@ -39,12 +39,6 @@ type SelectResult struct {
 	byID   map[int]store.Account
 }
 
-// Account returns the account for a ranked result.
-func (sr *SelectResult) Account(id int) (store.Account, bool) {
-	a, ok := sr.byID[id]
-	return a, ok
-}
-
 // Select scores all accounts and returns the best available one.
 func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult, error) {
 	accts, err := m.Store.ListAccounts()

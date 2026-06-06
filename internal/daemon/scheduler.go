@@ -53,12 +53,14 @@ func (s *Server) scheduler(ctx context.Context) {
 // pollOnce reconciles sessions, then samples usage for every account,
 // refreshing the token only for idle accounts.
 func (s *Server) pollOnce(ctx context.Context) {
+	// Only reconcile sessions on a successful scan: AlivePIDs always returns a
+	// non-nil map, so reconciling off a failed (nil) scan would treat every PID
+	// as dead and close every active session.
 	sessions, err := procscan.Scan()
 	if err != nil {
 		s.log.Printf("procscan: %v", err)
-	}
-	if alive := procscan.AlivePIDs(sessions); alive != nil {
-		switch n, err := s.m.Store.CloseDeadSessions(alive); {
+	} else {
+		switch n, err := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions)); {
 		case err != nil:
 			s.log.Printf("close dead sessions: %v", err)
 		case n > 0:

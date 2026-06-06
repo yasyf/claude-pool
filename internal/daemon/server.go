@@ -63,7 +63,9 @@ func Run(ctx context.Context) error {
 
 // detectClaudeVersion runs `claude --version` (best-effort) to stamp the UA.
 func detectClaudeVersion() string {
-	out, err := exec.Command("claude", "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "claude", "--version").Output()
 	if err != nil {
 		return ""
 	}
@@ -80,8 +82,10 @@ func (s *Server) serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// No defer os.Remove(s.socket): *net.UnixListener unlinks the socket file on
+	// Close. An explicit Remove here would race a restart — a successor daemon
+	// that bound a fresh socket in the gap would have its live socket deleted.
 	defer ln.Close()
-	defer os.Remove(s.socket)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -102,9 +106,13 @@ func (s *Server) serve(ctx context.Context) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				break
 			}
+			// Back off on a transient accept error (e.g. EMFILE) instead of
+			// busy-spinning a core until the next shutdown.
+			s.log.Printf("accept: %v", err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		go s.handle(conn)
@@ -166,9 +174,6 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleSelect(req)
 	case OpCheckin:
 		return s.handleCheckin(req)
-	case OpRefresh:
-		s.pollOnce(context.Background())
-		return Response{OK: true}
 	default:
 		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
 	}

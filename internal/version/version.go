@@ -8,8 +8,6 @@ var (
 	Version = "dev"
 	// Commit is the short git SHA, set by -ldflags at release time.
 	Commit = ""
-	// Date is the build date, set by -ldflags at release time.
-	Date = ""
 )
 
 // String renders a human-readable version line.

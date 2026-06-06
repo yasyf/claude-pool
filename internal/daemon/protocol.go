@@ -17,7 +17,6 @@ const (
 	OpStatus  Op = "status"  // return scored status for all accounts
 	OpCheckin Op = "checkin" // release a checkout and adopt a rotated token
 	OpHealth  Op = "health"  // liveness + version probe
-	OpRefresh Op = "refresh" // force a usage/refresh cycle now
 )
 
 // Request is one client request (one JSON object per line).

@@ -5,6 +5,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -93,8 +94,6 @@ func (s *Store) migrate() error {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// ---- accounts ----
-
 // UpsertAccount inserts or replaces an account row by id.
 func (s *Store) UpsertAccount(a Account) error {
 	zero := 0
@@ -161,7 +160,7 @@ func (s *Store) ListAccounts() ([]Account, error) {
 func (s *Store) GetAccount(id int) (Account, error) {
 	row := s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE id=?`, id)
 	a, err := scanAccount(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return a, fmt.Errorf("account %d not found", id)
 	}
 	return a, err
@@ -209,8 +208,6 @@ func (s *Store) NextAccountIndex() (int, error) {
 	}
 }
 
-// ---- usage samples ----
-
 func tsOrNil(t time.Time) any {
 	if t.IsZero() {
 		return nil
@@ -244,7 +241,7 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 	var r5, r7, r7o sql.NullInt64
 	var rl int
 	if err := row.Scan(&u.AccountID, &ts, &u5, &u7, &u7o, &r5, &r7, &r7o, &rl); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return u, false, nil
 		}
 		return u, false, err
@@ -300,8 +297,6 @@ func (s *Store) RecentUsageSamples(accountID, limit int) ([]UsageSample, error) 
 	}
 	return out, rows.Err()
 }
-
-// ---- sessions ----
 
 // OpenSession records a new checkout and returns its id.
 func (s *Store) OpenSession(accountID, pid int, configDir string) (int64, error) {
@@ -372,8 +367,6 @@ func (s *Store) CloseDeadSessions(alive map[int]bool) (int, error) {
 	return closed, nil
 }
 
-// ---- refresh log ----
-
 // LogRefresh records a refresh attempt outcome.
 func (s *Store) LogRefresh(accountID int, ok bool, errMsg string) error {
 	v := 0
@@ -396,7 +389,7 @@ func (s *Store) LastRefresh(accountID int) (RefreshEntry, bool, error) {
 	var ts int64
 	var ok int
 	if err := row.Scan(&e.AccountID, &ts, &ok, &e.Err); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return e, false, nil
 		}
 		return e, false, err

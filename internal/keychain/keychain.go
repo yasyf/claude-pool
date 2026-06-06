@@ -111,8 +111,12 @@ func readRaw(service, account string) ([]byte, error) {
 }
 
 // Write stores cred under (service, account), creating or updating the item
-// in place (-U). The secret is passed as hex via -X so the daemon never leaks
-// it through argv; this mirrors Claude Code's own write path.
+// in place (-U). The secret is hex-encoded and passed via -X, mirroring Claude
+// Code's own write path. NOTE: -X places the value in the spawned process's
+// argv, which is briefly visible to same-user `ps -Eww`. This matches Claude
+// Code's behavior and the same-user trust model (a same-user process can read
+// the item outright via `security ... -w`), but it is not argv-private;
+// eliminating it would require the native SecItemAdd API.
 func Write(service, account string, cred *Credential) error {
 	if account == "" {
 		account = AccountLabel()

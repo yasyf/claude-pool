@@ -5,6 +5,7 @@ package service
 
 import (
 	"bytes"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
@@ -65,6 +66,13 @@ type plistData struct {
 	Label, Bin, Log, Path string
 }
 
+// xmlEscape escapes a value for safe interpolation into the plist XML.
+func xmlEscape(s string) string {
+	var b bytes.Buffer
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
+
 // WritePlist renders and writes the LaunchAgent plist for the current binary.
 func WritePlist() (string, error) {
 	bin, err := os.Executable()
@@ -87,11 +95,13 @@ func WritePlist() (string, error) {
 	}
 	tmpl := template.Must(template.New("plist").Parse(plistTemplate))
 	var buf bytes.Buffer
+	// XML-escape interpolated values: a path containing <, >, or & (legal on
+	// APFS) would otherwise produce a malformed plist that launchctl rejects.
 	if err := tmpl.Execute(&buf, plistData{
 		Label: Label,
-		Bin:   bin,
-		Log:   pool.LogPath(),
-		Path:  os.Getenv("PATH"),
+		Bin:   xmlEscape(bin),
+		Log:   xmlEscape(pool.LogPath()),
+		Path:  xmlEscape(os.Getenv("PATH")),
 	}); err != nil {
 		return "", err
 	}

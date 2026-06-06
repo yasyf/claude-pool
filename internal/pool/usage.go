@@ -19,6 +19,10 @@ const RefreshLeadTime = 10 * time.Minute
 // account must be re-logged-in interactively.
 var ErrNeedsLogin = errors.New("account needs re-login (refresh token missing or revoked)")
 
+// ErrRefuseAcctZeroRefresh is returned by refresh when asked to POST-refresh
+// acct-00, whose single-use refresh token is owned by plain `claude`.
+var ErrRefuseAcctZeroRefresh = errors.New("refusing to POST-refresh acct-00 (shared single-use token owned by plain claude)")
+
 // credServices returns the Keychain services that must be kept in sync for an
 // account, primary first. acct-00 has two: the canonical un-suffixed item plain
 // `claude` uses (source of truth) and a suffixed mirror that makes
@@ -102,7 +106,16 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 
 // refresh performs the OAuth refresh and persists the new blob, preserving the
 // non-token fields from the prior credential.
+//
+// acct-00's refresh token is the single-use token plain `claude` owns; POST-
+// refreshing it here would log the user out. This is the linchpin guard: every
+// refresh path (EnsureFreshToken's pre-flight AND fetchUsage's 401 retry) funnels
+// through here, so refusing acct-00 at this chokepoint is what actually upholds
+// the invariant regardless of caller.
 func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.Credential) (*keychain.Credential, error) {
+	if a.IsZero {
+		return nil, ErrRefuseAcctZeroRefresh
+	}
 	tr, err := m.OAuth.Refresh(ctx, fmt.Sprintf("acct-%d", a.ID), prev.ClaudeAiOauth.RefreshToken)
 	if err != nil {
 		return nil, err

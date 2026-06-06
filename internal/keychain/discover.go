@@ -32,9 +32,3 @@ func DiscoverAccount(service string) (string, error) {
 	// Fall back to the computed label if the attribute is absent.
 	return AccountLabel(), nil
 }
-
-// ServiceExists reports whether any item exists for service (any account).
-func ServiceExists(service string) bool {
-	cmd := exec.Command(securityBin, "find-generic-password", "-s", service)
-	return cmd.Run() == nil
-}
