@@ -10,6 +10,30 @@ cc-pool (`clp`) pools several Claude Max/Pro subscriptions and launches each Cla
 - **Test**: `go test ./...` — must pass with no network, no Keychain, no daemon
 - **Vet**: `go vet ./...` before every commit
 
+## Repository Structure
+
+```
+cc-pool/
+├── cmd/cc-pool/        # main: CLI entrypoint (installs as cc-pool, clp symlink)
+├── internal/
+│   ├── cli/            # clp subcommands (init, add, select, run, status, doctor, …)
+│   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol
+│   ├── keychain/       # macOS Keychain access for Claude Code credentials
+│   ├── oauth/          # Claude OAuth refresh + /api/oauth/usage client
+│   ├── overlay/        # shared ~/.claude overlay providers (symlink, fuse-t mirror)
+│   ├── pool/           # account dirs, paths, pool manager
+│   ├── procscan/       # detect live claude sessions per config dir
+│   ├── score/          # account scoring (5h/7d headroom, reset credit, burn rate)
+│   ├── service/        # LaunchAgent install / brew services delegation
+│   ├── store/          # SQLite state (no secrets — Keychain only)
+│   └── version/        # build metadata injected via -ldflags
+├── launchd/            # LaunchAgent plist template
+├── Formula/            # Homebrew formula
+├── docs/               # verification notes
+├── AGENTS.md           # This file — shared conventions
+└── STYLEGUIDE.md       # Full style guide
+```
+
 Two filesystem trees, never confused:
 
 - `~/.claude` — canonical Claude Code config dir. **NEVER moved or modified structurally.** It is acct-00 and the shared base; plain `claude` must keep working untouched.
@@ -40,6 +64,21 @@ If the user responds to a plan with questions, answer conversationally and surfa
 ## Parallelize Independent Work
 
 Independent investigations dispatch concurrently — one message, multiple subagent calls. A lone ad-hoc lookup gets one subagent; substantive multi-step work gets a structured fan-out with verification.
+
+## Code Search
+
+`semble` is wired up via `.mcp.json` (project-scoped MCP server, runs via `uvx` — nothing to install). It's the default tool for any "find code by intent or symbol" question:
+
+1. **"How do we do X?" / "Where is the code that does Y?"** → `semble.search("...")`
+2. **"Where is `Foo` defined?"** → `semble.search("Foo")` (or `search("type Foo")` for a relevance boost)
+3. **"Show me other code like this"** → `semble.find_related` on a prior hit
+4. **Cross-repo lookup** → pass an `https://...git` URL as `repo`
+
+`repo` defaults to the current project root for local searches. Semble is purely semantic — it ranks by meaning, not substring, so it won't find literal strings that don't appear in nearby code.
+
+Reach for the **LSP** when the answer must be *exhaustive* or *structural*: `findReferences`/`incomingCalls` for "who calls X", `goToImplementation` for "what implements interface I", `hover` for types.
+
+Reach for **`Grep`** only for material neither tool indexes: literal *content* of strings/comments (error messages, env-var names, Keychain service names, TODOs) and non-source files (plists, JSON, logs). File-pattern questions go through `Glob`.
 
 ## Style Rules (summary — see STYLEGUIDE.md)
 

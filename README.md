@@ -1,5 +1,8 @@
 # cc-pool
 
+[![CI](https://img.shields.io/github/actions/workflow/status/yasyf/cc-pool/ci.yml?branch=main&label=CI)](https://github.com/yasyf/cc-pool/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/yasyf/cc-pool/blob/main/LICENSE)
+
 **Predictive, start-of-session load-balancing across multiple Claude subscriptions — for macOS.**
 
 If you have several Claude Max/Pro subscriptions, `cc-pool` launches each
