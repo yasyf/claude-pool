@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,11 +28,20 @@ import (
 // same account before the real claude process is visible to procscan.
 const reservationTTL = 30 * time.Second
 
+// preflightTimeout bounds a best-effort preflight refresh so shutdown is never
+// blocked on a slow network refresh.
+const preflightTimeout = 8 * time.Second
+
 // Server is the running daemon.
 type Server struct {
 	m      *pool.Manager
 	socket string
 	log    *log.Logger
+
+	// wg tracks every daemon goroutine (scheduler, connection handlers,
+	// preflight refreshes); serve Waits on it before tearing down mounts and
+	// before Run's deferred m.Close() closes the database under them.
+	wg sync.WaitGroup
 
 	mu           sync.Mutex
 	reservations map[int]time.Time // accountID -> reserved-at
@@ -94,9 +104,8 @@ func (s *Server) serve(ctx context.Context) error {
 	s.establishMounts()
 
 	// Scheduler.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); s.scheduler(ctx) }()
+	s.wg.Add(1)
+	go func() { defer s.wg.Done(); s.scheduler(ctx) }()
 
 	// Accept loop.
 	go func() {
@@ -115,10 +124,11 @@ func (s *Server) serve(ctx context.Context) error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go s.handle(ctx, conn)
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); s.handle(ctx, conn) }()
 	}
 
-	wg.Wait()
+	s.wg.Wait()
 	s.teardownMounts()
 	s.log.Printf("daemon stopped")
 	return nil
@@ -132,8 +142,10 @@ func (s *Server) listen() (net.Listener, error) {
 		return nil, errors.New("another cc-pool daemon is already running")
 	}
 	_ = os.Remove(s.socket) // clear a stale socket
-	if err := pool.EnsureStateDir(); err != nil {
-		return nil, err
+	// Only the socket's parent dir is needed here (in production that is the
+	// state dir); deriving it from s.socket keeps tests off the real ~/.cc-pool.
+	if err := os.MkdirAll(filepath.Dir(s.socket), 0o700); err != nil {
+		return nil, fmt.Errorf("ensure socket dir: %w", err)
 	}
 	ln, err := net.Listen("unix", s.socket)
 	if err != nil {
@@ -246,7 +258,17 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	}
 	id := best.Account.ID
 	// Preflight refresh the winner if idle and expiring soon (best-effort).
-	go s.m.PreflightRefresh(ctx, best.Account)
+	// The Add(1) runs inside an already-tracked handler goroutine, so the
+	// counter is ≥1 here and can never race a zero-counter Wait.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		pctx, cancel := context.WithTimeout(ctx, preflightTimeout)
+		defer cancel()
+		if err := s.m.PreflightRefresh(pctx, best.Account); err != nil {
+			s.log.Printf("acct-%02d preflight refresh: %v", best.Account.ID, err)
+		}
+	}()
 	return Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id, Sticky: sticky}
 }
 

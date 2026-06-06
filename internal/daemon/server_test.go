@@ -1,9 +1,15 @@
 package daemon
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"log"
+	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,5 +120,120 @@ func TestHandleSelectForcedRecordsSticky(t *testing.T) {
 	st, ok, err := s.m.Store.GetSticky("/proj")
 	if err != nil || !ok || st.AccountID != 2 {
 		t.Fatalf("forced account not recorded: %+v ok=%v err=%v", st, ok, err)
+	}
+}
+
+// TestServeDrainsInFlightHandlerOnShutdown pins the shutdown ordering: serve
+// must wait for in-flight request handlers before returning (after which Run's
+// deferred m.Close() closes the database under them).
+//
+// Synchronization is structural, not sleep-based: a first connection is parked
+// mid-request (its handler is wg-tracked the moment the accept loop dequeues
+// it), then a second connection completes a full health round-trip. The accept
+// loop is sequential and unix sockets accept FIFO, so the health response
+// proves the parked connection was already accepted and tracked — only then is
+// the ctx cancelled.
+func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "pool.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// macOS caps sun_path at 104 bytes; t.TempDir's /var/folders/... path plus
+	// the long test name exceeds it, so the socket gets its own short dir.
+	sockDir, err := os.MkdirTemp("/tmp", "clp-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	var logBuf bytes.Buffer
+	s := &Server{
+		m:            &pool.Manager{Store: st, DefaultDir: filepath.Join(dir, "claude")},
+		socket:       filepath.Join(sockDir, "d.sock"),
+		log:          log.New(&logBuf, "", 0),
+		reservations: map[int]time.Time{},
+		rlStreak:     map[int]int{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var serveErr, closeErr error
+	done := make(chan struct{})
+	go func() {
+		// Mirror Run's defer ordering: the DB closes as soon as serve returns.
+		serveErr = s.serve(ctx)
+		closeErr = st.Close()
+		close(done)
+	}()
+
+	dial := func() net.Conn {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			conn, err := net.Dial("unix", s.socket)
+			if err == nil {
+				return conn
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("dial daemon socket: %v", err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Park a handler mid-request: it blocks in Decode awaiting the closing brace.
+	parked := dial()
+	defer parked.Close()
+	if _, err := parked.Write([]byte(`{"op":"status"`)); err != nil {
+		t.Fatal(err)
+	}
+
+	// A full round-trip on a second connection orders the parked connection's
+	// accept (and wg tracking) before the cancellation below.
+	probe := dial()
+	defer probe.Close()
+	if _, err := probe.Write([]byte(`{"op":"health"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	var health Response
+	if err := json.NewDecoder(probe).Decode(&health); err != nil || !health.OK {
+		t.Fatalf("health probe failed: %+v err=%v", health, err)
+	}
+
+	cancel()
+
+	// The structural drain assertion: with a handler still parked, serve must
+	// not return. Without handler tracking, wg.Wait sees only the (instantly
+	// exiting) scheduler and serve returns within this window deterministically.
+	select {
+	case <-done:
+		t.Fatal("serve returned while a handler was still in flight")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Finish the parked request after shutdown began; the drain must let it
+	// complete against a still-open DB.
+	if _, err := parked.Write([]byte("}\n")); err != nil {
+		t.Fatal(err)
+	}
+	var resp Response
+	if err := json.NewDecoder(parked).Decode(&resp); err != nil {
+		t.Fatalf("decode in-flight response: %v", err)
+	}
+	if !resp.OK || resp.Error != "" {
+		t.Fatalf("in-flight request failed during shutdown: %+v", resp)
+	}
+
+	<-done
+	if serveErr != nil {
+		t.Fatalf("serve: %v", serveErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("store close: %v", closeErr)
+	}
+	// logBuf is safe to read here: every writer goroutine exited before done.
+	if strings.Contains(logBuf.String(), "database is closed") {
+		t.Fatalf("teardown raced an in-flight handler:\n%s", logBuf.String())
 	}
 }
