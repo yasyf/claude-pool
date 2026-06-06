@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/yasyf/claude-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/pool"
 )
 
 // ErrDaemonUnavailable means the daemon socket could not be reached.

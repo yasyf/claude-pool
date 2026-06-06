@@ -30,7 +30,7 @@ jobs:
         run: go build ./...
 
       - name: Build amd64 (cross, pure Go)
-        run: CGO_ENABLED=0 GOARCH=amd64 go build -o /tmp/clp-amd64 ./cmd/claude-pool
+        run: CGO_ENABLED=0 GOARCH=amd64 go build -o /tmp/clp-amd64 ./cmd/cc-pool
 
       - name: Vet + compile fuse variant (cgo + fuse-t headers)
         # fuse-t is not present on CI runners; install headers/lib so the cgo
@@ -56,7 +56,7 @@ jobs:
           cache: true
       - name: Build + version smoke
         run: |
-          go build -ldflags "-X github.com/yasyf/claude-pool/internal/version.Version=ci" -o /tmp/claude-pool ./cmd/claude-pool
-          /tmp/claude-pool --version | grep -q ci
-          /tmp/claude-pool --help | grep -q "emptiest account"
-          /tmp/claude-pool list || true   # exits cleanly with "no accounts" before init
+          go build -ldflags "-X github.com/yasyf/cc-pool/internal/version.Version=ci" -o /tmp/cc-pool ./cmd/cc-pool
+          /tmp/cc-pool --version | grep -q ci
+          /tmp/cc-pool --help | grep -q "emptiest account"
+          /tmp/cc-pool list || true   # exits cleanly with "no accounts" before init

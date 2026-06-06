@@ -1,4 +1,4 @@
-// Package store is claude-pool's sole state layer: a modernc.org/sqlite
+// Package store is cc-pool's sole state layer: a modernc.org/sqlite
 // (pure-Go) database holding accounts, usage samples, sessions, and the
 // refresh log. It stores NO secrets — the Keychain is the only secret store.
 package store

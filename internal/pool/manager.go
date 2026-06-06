@@ -3,8 +3,8 @@ package pool
 import (
 	"fmt"
 
-	"github.com/yasyf/claude-pool/internal/oauth"
-	"github.com/yasyf/claude-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/oauth"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // Manager is the high-level façade over the store, the OAuth client, and the

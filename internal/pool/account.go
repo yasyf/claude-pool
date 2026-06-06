@@ -7,9 +7,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/yasyf/claude-pool/internal/keychain"
-	"github.com/yasyf/claude-pool/internal/overlay"
-	"github.com/yasyf/claude-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // ErrNotLoggedIn means plain `claude` has no stored credential, so there is
@@ -31,7 +31,7 @@ func (m *Manager) Init(ctx context.Context) (*InitResult, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err
 	}
-	if err := EnsurePoolDir(); err != nil {
+	if err := EnsureAccountsDir(); err != nil {
 		return nil, err
 	}
 

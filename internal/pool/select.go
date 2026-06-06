@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yasyf/claude-pool/internal/procscan"
-	"github.com/yasyf/claude-pool/internal/score"
-	"github.com/yasyf/claude-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/procscan"
+	"github.com/yasyf/cc-pool/internal/score"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // ErrNoAccounts means the pool is empty (run `clp init`/`clp add`).

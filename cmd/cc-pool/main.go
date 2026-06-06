@@ -1,4 +1,4 @@
-// Command claude-pool is the single binary behind both `claude-pool` and its
+// Command cc-pool is the single binary behind both `cc-pool` and its
 // `clp` symlink.
 package main
 
@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/yasyf/claude-pool/internal/cli"
+	"github.com/yasyf/cc-pool/internal/cli"
 )
 
 func main() {
@@ -18,7 +18,7 @@ func main() {
 	defer stop()
 
 	root := cli.NewRootCmd()
-	// Present the invoked name (clp or claude-pool) in help/usage.
+	// Present the invoked name (clp or cc-pool) in help/usage.
 	if base := filepath.Base(os.Args[0]); base == "clp" {
 		root.Use = "clp"
 	}

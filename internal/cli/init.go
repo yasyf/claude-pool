@@ -6,9 +6,9 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
-	"github.com/yasyf/claude-pool/internal/overlay"
-	"github.com/yasyf/claude-pool/internal/pool"
-	"github.com/yasyf/claude-pool/internal/service"
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/service"
 )
 
 func newInitCmd() *cobra.Command {
@@ -41,12 +41,12 @@ func newInitCmd() *cobra.Command {
 				// Enable the background daemon.
 				if !noService {
 					if service.IsBrewManaged() {
-						fmt.Fprintln(out, "  Enable the daemon with: brew services start claude-pool")
+						fmt.Fprintln(out, "  Enable the daemon with: brew services start cc-pool")
 					} else {
 						install := isTTY()
 						if isTTY() {
 							_ = huh.NewConfirm().
-								Title("Install the claude-pool background daemon now?").
+								Title("Install the cc-pool background daemon now?").
 								Description("Keeps idle accounts refreshed and scores live (recommended).").
 								Value(&install).
 								Run()

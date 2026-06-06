@@ -1,4 +1,4 @@
-module github.com/yasyf/claude-pool
+module github.com/yasyf/cc-pool
 
 go 1.26.2
 

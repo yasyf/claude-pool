@@ -2,7 +2,7 @@ package cli
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/yasyf/claude-pool/internal/daemon"
+	"github.com/yasyf/cc-pool/internal/daemon"
 )
 
 // newDaemonCmd is the hidden entry point launched by the LaunchAgent.

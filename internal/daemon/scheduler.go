@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/yasyf/claude-pool/internal/procscan"
+	"github.com/yasyf/cc-pool/internal/procscan"
 )
 
 const (

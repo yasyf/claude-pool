@@ -22,15 +22,15 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
-          LDFLAGS="-s -w -X github.com/yasyf/claude-pool/internal/version.Version=${VERSION} -X github.com/yasyf/claude-pool/internal/version.Commit=${COMMIT}"
+          LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT}"
           mkdir -p dist
-          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/claude-pool-arm64 ./cmd/claude-pool
-          CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/claude-pool-amd64 ./cmd/claude-pool
-          lipo -create -output dist/claude-pool dist/claude-pool-arm64 dist/claude-pool-amd64
+          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/cc-pool-arm64 ./cmd/cc-pool
+          CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/cc-pool-amd64 ./cmd/cc-pool
+          lipo -create -output dist/cc-pool dist/cc-pool-arm64 dist/cc-pool-amd64
           cd dist
-          tar -czf claude-pool-${VERSION}-darwin-universal.tar.gz claude-pool
-          tar -czf claude-pool-${VERSION}-darwin-arm64.tar.gz -s '/claude-pool-arm64/claude-pool/' claude-pool-arm64 2>/dev/null || \
-            { cp claude-pool-arm64 claude-pool && tar -czf claude-pool-${VERSION}-darwin-arm64.tar.gz claude-pool && rm claude-pool; }
+          tar -czf cc-pool-${VERSION}-darwin-universal.tar.gz cc-pool
+          tar -czf cc-pool-${VERSION}-darwin-arm64.tar.gz -s '/cc-pool-arm64/cc-pool/' cc-pool-arm64 2>/dev/null || \
+            { cp cc-pool-arm64 cc-pool && tar -czf cc-pool-${VERSION}-darwin-arm64.tar.gz cc-pool && rm cc-pool; }
           shasum -a 256 *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
@@ -58,7 +58,7 @@ jobs:
           # The tag tarball is immutable; its sha256 is stable.
           curl -fsSL "$TARBALL_URL" -o /tmp/src.tar.gz
           SHA="$(shasum -a 256 /tmp/src.tar.gz | awk '{print $1}')"
-          F=Formula/claude-pool.rb
+          F=Formula/cc-pool.rb
           sed -i -E "s|url \".*\"|url \"${TARBALL_URL}\"|" "$F"
           sed -i -E "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${SHA}\"|" "$F"
           git config user.name "github-actions[bot]"

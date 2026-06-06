@@ -8,18 +8,18 @@ cannot be automated. Run from a clean machine state where possible.
 
 ```sh
 # From source:
-CGO_ENABLED=0 go build -o /usr/local/bin/claude-pool ./cmd/claude-pool
-ln -sf /usr/local/bin/claude-pool /usr/local/bin/clp
+CGO_ENABLED=0 go build -o /usr/local/bin/cc-pool ./cmd/cc-pool
+ln -sf /usr/local/bin/cc-pool /usr/local/bin/clp
 
 # Or via the tap once released:
-brew tap yasyf/claude-pool https://github.com/yasyf/claude-pool
-brew install yasyf/claude-pool/claude-pool
+brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool
+brew install yasyf/cc-pool/cc-pool
 ```
 
 ## 1. Release installs and reports version
 ```sh
 clp --version          # prints the version
-claude-pool --version  # same binary, both names work
+cc-pool --version  # same binary, both names work
 ```
 
 ## 2. init keeps plain claude working; add a second account; status; daemon refresh
@@ -29,7 +29,7 @@ claude                 # (human) plain claude STILL launches on ~/.claude, untou
 clp add                # (human) interactive: logs in an account, then loops ("Add another?")
                        #         so you can onboard several subscriptions in one run
 clp status             # all accounts shown with live 5h/7d remaining + score
-brew services start claude-pool   # brew install: enable the daemon (or `clp service install` on a source build)
+brew services start cc-pool   # brew install: enable the daemon (or `clp service install` on a source build)
 clp service status     # shows "Homebrew (brew services)" or self-managed, + Daemon: running
 ```
 Verify in `Keychain Access` that there is now `Claude Code-credentials`
@@ -56,14 +56,14 @@ diff <(ls ~/.claude/skills) <(ls "$(clp env --account 1 2>/dev/null | sed -n 's/
 ## 5. Overlay parity (writes shared both ways)
 ```sh
 # symlink provider (default):
-ls -la ~/.claude.pool/acct-01            # top-level entries are symlinks into ~/.claude
+ls -la ~/.cc-pool/accounts/acct-01            # top-level entries are symlinks into ~/.claude
 #                                          except daemon/ and ide/ (private dirs)
-echo hi > ~/.claude.pool/acct-01/projects/_clp_probe && \
+echo hi > ~/.cc-pool/accounts/acct-01/projects/_clp_probe && \
   cat ~/.claude/projects/_clp_probe       # write through the overlay lands in ~/.claude
 rm ~/.claude/projects/_clp_probe
 
 # fuse provider (only with a -tags fuse build + fuse-t + Network Volumes grant):
-mount | grep claude-pool                  # account dir is a fuse-t mirror mount
+mount | grep cc-pool                  # account dir is a fuse-t mirror mount
 ```
 
 ## 6. End session → token adopted, checkout released; uninstall leaves ~/.claude intact
@@ -75,7 +75,7 @@ clp status                                # active sessions for that account bac
 
 clp service uninstall                     # stops daemon, unmounts any fuse overlays
 clp service uninstall --purge             # also removes pool accounts/dirs/state
-brew uninstall claude-pool                # (if installed via brew)
+brew uninstall cc-pool                # (if installed via brew)
 test -d ~/.claude && claude --version     # (human) ~/.claude intact; plain claude still works
 ```
 

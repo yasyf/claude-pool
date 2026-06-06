@@ -5,10 +5,10 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/claude-pool/internal/daemon"
-	"github.com/yasyf/claude-pool/internal/overlay"
-	"github.com/yasyf/claude-pool/internal/pool"
-	"github.com/yasyf/claude-pool/internal/service"
+	"github.com/yasyf/cc-pool/internal/daemon"
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/service"
 )
 
 func newServiceCmd() *cobra.Command {
@@ -96,9 +96,9 @@ func newServiceUninstallCmd() *cobra.Command {
 	return cmd
 }
 
-// purgeAll removes every pool account (overlay + keychain mirror/items), the
-// pool dir, and the state dir. ~/.claude and its canonical credential are never
-// touched.
+// purgeAll removes every pool account (overlay + keychain mirror/items) and
+// the state dir (which contains the account dirs). ~/.claude and its canonical
+// credential are never touched.
 func purgeAll(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	err := withManager(func(m *pool.Manager) error {
@@ -116,7 +116,6 @@ func purgeAll(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	_ = os.RemoveAll(pool.PoolDir())
 	_ = os.RemoveAll(pool.StateDir())
 	fmt.Fprintln(out, "✓ Purged all pool state (~/.claude left intact)")
 	return nil
@@ -129,7 +128,7 @@ func runServiceInstall(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if service.IsBrewManaged() {
 		// Migration safety: a previous `clp service install` may have left a
-		// self-rolled com.yasyf.claude-pool agent that would run alongside the
+		// self-rolled com.yasyf.cc-pool agent that would run alongside the
 		// brew one. Boot it out before delegating.
 		_ = service.Uninstall()
 		if err := service.BrewStart(); err != nil {

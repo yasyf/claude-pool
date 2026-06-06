@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/yasyf/claude-pool/internal/procscan"
-	"github.com/yasyf/claude-pool/internal/score"
-	"github.com/yasyf/claude-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/procscan"
+	"github.com/yasyf/cc-pool/internal/score"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // Snapshot is a fully-resolved per-account view for status/list rendering. It

@@ -71,7 +71,7 @@ func parse(out string) []Session {
 }
 
 // isClaudeProcess reports whether a command line belongs to the claude CLI
-// itself (argv[0] basename == "claude"), excluding our own clp/claude-pool.
+// itself (argv[0] basename == "claude"), excluding our own clp/cc-pool.
 func isClaudeProcess(cmd string) bool {
 	tok := cmd
 	if i := strings.IndexByte(cmd, ' '); i >= 0 {

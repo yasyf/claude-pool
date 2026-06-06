@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/claude-pool/internal/keychain"
-	"github.com/yasyf/claude-pool/internal/oauth"
-	"github.com/yasyf/claude-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/oauth"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // RefreshLeadTime is how close to expiry an idle account's token is refreshed

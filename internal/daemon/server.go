@@ -15,12 +15,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yasyf/claude-pool/internal/oauth"
-	"github.com/yasyf/claude-pool/internal/overlay"
-	"github.com/yasyf/claude-pool/internal/pool"
-	"github.com/yasyf/claude-pool/internal/score"
-	"github.com/yasyf/claude-pool/internal/store"
-	"github.com/yasyf/claude-pool/internal/version"
+	"github.com/yasyf/cc-pool/internal/oauth"
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/score"
+	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 // reservationTTL is how long a select-reservation suppresses re-picking the
@@ -38,7 +38,7 @@ type Server struct {
 	rlStreak     map[int]int       // accountID -> consecutive 429 count
 }
 
-// Run is the entry point for `claude-pool daemon`. It blocks until the process
+// Run is the entry point for `cc-pool daemon`. It blocks until the process
 // is signalled.
 func Run(ctx context.Context) error {
 	m, err := pool.Open()
@@ -54,7 +54,7 @@ func Run(ctx context.Context) error {
 	s := &Server{
 		m:            m,
 		socket:       pool.SocketPath(),
-		log:          log.New(os.Stderr, "[claude-pool] ", log.LstdFlags),
+		log:          log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},
 	}
@@ -121,7 +121,7 @@ func (s *Server) serve(ctx context.Context) error {
 func (s *Server) listen() (net.Listener, error) {
 	if conn, err := net.DialTimeout("unix", s.socket, 300*time.Millisecond); err == nil {
 		conn.Close()
-		return nil, errors.New("another claude-pool daemon is already running")
+		return nil, errors.New("another cc-pool daemon is already running")
 	}
 	_ = os.Remove(s.socket) // clear a stale socket
 	if err := pool.EnsureStateDir(); err != nil {

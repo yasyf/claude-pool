@@ -1,4 +1,4 @@
-// Package score implements claude-pool's account-selection scoring. Higher is
+// Package score implements cc-pool's account-selection scoring. Higher is
 // better; select picks argmax. There are no roles — the best account across the
 // whole pool wins.
 package score

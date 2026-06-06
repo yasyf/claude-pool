@@ -1,21 +1,21 @@
-// Package cli wires up the cobra command tree for claude-pool. The binary is
-// installed as `claude-pool` with a `clp` symlink; both dispatch here.
+// Package cli wires up the cobra command tree for cc-pool. The binary is
+// installed as `cc-pool` with a `clp` symlink; both dispatch here.
 package cli
 
 import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/claude-pool/internal/pool"
-	"github.com/yasyf/claude-pool/internal/version"
+	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 // NewRootCmd builds the root command and attaches all subcommands.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "claude-pool",
+		Use:   "cc-pool",
 		Short: "Predictive multi-account load-balancing for Claude Code",
-		Long: `claude-pool (clp) pools several Claude subscriptions and launches each
+		Long: `cc-pool (clp) pools several Claude subscriptions and launches each
 session on the emptiest account:
 
     CLAUDE_CONFIG_DIR=$(clp select) claude

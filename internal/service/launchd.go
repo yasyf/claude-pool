@@ -1,4 +1,4 @@
-// Package service manages the claude-pool user LaunchAgent. It must be a user
+// Package service manages the cc-pool user LaunchAgent. It must be a user
 // agent (not a root LaunchDaemon) because credential refresh needs access to
 // the user's login Keychain, which a root daemon cannot read.
 package service
@@ -12,11 +12,11 @@ import (
 	"strconv"
 	"text/template"
 
-	"github.com/yasyf/claude-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/pool"
 )
 
 // Label is the LaunchAgent label / reverse-DNS identifier.
-const Label = "com.yasyf.claude-pool"
+const Label = "com.yasyf.cc-pool"
 
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -72,7 +72,7 @@ func WritePlist() (string, error) {
 		return "", err
 	}
 	// Do NOT EvalSymlinks here: a Homebrew install exposes a stable
-	// /opt/homebrew/bin/claude-pool symlink into a versioned Cellar path.
+	// /opt/homebrew/bin/cc-pool symlink into a versioned Cellar path.
 	// Resolving to the Cellar path would change every upgrade and re-trigger the
 	// fuse-t "Network Volumes" TCC prompt. launchd happily execs the symlink.
 	path, err := PlistPath()

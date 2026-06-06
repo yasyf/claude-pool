@@ -8,7 +8,7 @@ import (
 )
 
 // EnsureRunning returns true if the daemon is reachable, auto-spawning a
-// detached `claude-pool daemon` and waiting up to timeout for its socket if it
+// detached `cc-pool daemon` and waiting up to timeout for its socket if it
 // is not. A second instance is harmless: the daemon refuses to start if the
 // socket is already owned. Used by the `select` hot path so it stays fast when
 // the daemon is up and self-heals when it is not.

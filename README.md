@@ -1,8 +1,8 @@
-# claude-pool
+# cc-pool
 
 **Predictive, start-of-session load-balancing across multiple Claude subscriptions — for macOS.**
 
-If you have several Claude Max/Pro subscriptions, `claude-pool` launches each
+If you have several Claude Max/Pro subscriptions, `cc-pool` launches each
 session on the **emptiest** account, so you stop hitting 5-hour and weekly
 limits on one account while another sits idle:
 
@@ -19,11 +19,11 @@ account *before* the session starts, from live 5-hour / 7-day usage. Plain
 ## Install
 
 ```sh
-brew tap yasyf/claude-pool https://github.com/yasyf/claude-pool
-brew install yasyf/claude-pool/claude-pool
+brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool
+brew install yasyf/cc-pool/cc-pool
 ```
 
-The binary installs as `claude-pool` with a `clp` symlink.
+The binary installs as `cc-pool` with a `clp` symlink.
 
 ## Quickstart
 
@@ -55,8 +55,8 @@ alias cl='CLAUDE_CONFIG_DIR=$(clp select) claude'
 
 Claude Code namespaces its Keychain credential **per config dir**: the default
 `~/.claude` uses the item `Claude Code-credentials`; a custom `CLAUDE_CONFIG_DIR`
-gets a suffixed item `Claude Code-credentials-<hash>`. claude-pool gives each
-account a real, unique dir (`~/.claude.pool/acct-NN`) so each gets its own
+gets a suffixed item `Claude Code-credentials-<hash>`. cc-pool gives each
+account a real, unique dir (`~/.cc-pool/accounts/acct-NN`) so each gets its own
 Keychain item and runs on its own **subscription** (never API billing).
 
 > **acct-00 nuance.** Plain `claude` uses the *un-suffixed* default item.
@@ -103,7 +103,7 @@ own `/api/oauth/usage` endpoint.
 
 ### The daemon
 
-`brew services start claude-pool` (Homebrew installs) or `clp service install`
+`brew services start cc-pool` (Homebrew installs) or `clp service install`
 (source builds) runs a **user LaunchAgent** (a root daemon couldn't read your
 login Keychain). It polls usage every ~3 min with exponential backoff, refreshes
 **idle** accounts' tokens before they expire (a checked-out session owns its own
@@ -112,7 +112,7 @@ check-in — and it never refreshes acct-00, whose token plain `claude` owns),
 caches scores, and — with the fuse overlay — owns the mount lifecycle. If the
 daemon isn't running, `clp select` auto-spawns it (≤2s) or samples live.
 
-No secrets are ever stored in claude-pool's database — the macOS Keychain is the
+No secrets are ever stored in cc-pool's database — the macOS Keychain is the
 only secret store.
 
 ## Commands
@@ -135,7 +135,7 @@ only secret store.
 ```sh
 clp service uninstall            # stop & remove the daemon, unmount fuse overlays
 clp service uninstall --purge    # ...and remove all pool accounts/dirs/state
-brew uninstall claude-pool
+brew uninstall cc-pool
 ```
 
 `~/.claude` and its credential are never touched.

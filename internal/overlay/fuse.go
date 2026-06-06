@@ -90,7 +90,7 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	// this mirror, so disable attribute caching to avoid stale reads. nobrowse
 	// keeps the mount out of Finder sidebars.
 	opts := []string{
-		"-o", "volname=claude-pool-" + filepath.Base(accountDir),
+		"-o", "volname=cc-pool-" + filepath.Base(accountDir),
 		"-o", "noattrcache",
 		"-o", "nobrowse",
 	}

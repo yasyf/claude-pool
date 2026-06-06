@@ -10,8 +10,8 @@ import (
 // oracle (values computed via `shasum -a 256` of the NFC path, first 8 hex).
 func TestServiceNameGoldenVectors(t *testing.T) {
 	cases := map[string]string{
-		"/Users/yasyf/.claude.pool/acct-01": "Claude Code-credentials-ed0d2df9",
-		"/Users/yasyf/.claude":              "Claude Code-credentials-c25ff9d8",
+		"/Users/yasyf/.cc-pool/accounts/acct-01": "Claude Code-credentials-0fc8328e",
+		"/Users/yasyf/.claude":                   "Claude Code-credentials-c25ff9d8",
 	}
 	for dir, want := range cases {
 		if got := ServiceName(dir); got != want {

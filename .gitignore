@@ -1,7 +1,7 @@
-# Build artifacts (anchored to repo root so cmd/claude-pool/ is NOT ignored)
+# Build artifacts (anchored to repo root so cmd/cc-pool/ is NOT ignored)
 /dist/
 /build/
-/claude-pool
+/cc-pool
 /clp
 *.test
 *.out

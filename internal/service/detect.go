@@ -7,7 +7,7 @@ import (
 )
 
 // FormulaName is the Homebrew formula / brew-services name.
-const FormulaName = "claude-pool"
+const FormulaName = "cc-pool"
 
 // IsBrewManaged reports whether this binary was installed via Homebrew, in
 // which case the daemon should be managed with `brew services` rather than the
