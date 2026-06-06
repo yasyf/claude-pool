@@ -13,7 +13,7 @@ class CcPool < Formula
   desc "Predictive multi-account load-balancing for Claude Code"
   homepage "https://github.com/yasyf/cc-pool"
   url "https://github.com/yasyf/cc-pool/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "6be6bbebf66b55deadaea391e627cb94ff5e017b9a0c0df542428f552e404d56"
   license "MIT"
   head "https://github.com/yasyf/cc-pool.git", branch: "main"
 
