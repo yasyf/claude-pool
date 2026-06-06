@@ -34,6 +34,11 @@ var (
 	// up to RunwayWeight points.
 	RunwayWeight  = 15.0
 	RunwayHorizon = 5 * time.Hour
+
+	// StickyMinEff5 is the effective-5h-remaining floor (percent) below which a
+	// sticky selection is abandoned: with this little headroom the resumed
+	// session would hit the limit anyway, so cache continuity is worthless.
+	StickyMinEff5 = 10.0
 )
 
 // Input is everything the scorer needs about one account.
@@ -189,6 +194,13 @@ func runwayPenalty(eff5, burnPerHour float64) float64 {
 		frac = 1
 	}
 	return RunwayWeight * frac
+}
+
+// UsableForSticky reports whether a previously-selected account can keep
+// serving a sticky session: it must be available (not rate-limited) and have
+// at least StickyMinEff5 effective 5h headroom.
+func UsableForSticky(r Result) bool {
+	return r.Available && r.Components.Eff5 >= StickyMinEff5
 }
 
 // Rank scores all inputs and returns results sorted best-first. Ties on score

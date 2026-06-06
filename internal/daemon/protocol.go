@@ -21,11 +21,12 @@ const (
 
 // Request is one client request (one JSON object per line).
 type Request struct {
-	Proto   int  `json:"proto"`
-	Op      Op   `json:"op"`
-	Account *int `json:"account,omitempty"` // force a specific account (select)
-	PID     int  `json:"pid,omitempty"`     // launching pid (select checkout / checkin)
-	NoMark  bool `json:"no_mark,omitempty"` // select without recording a checkout
+	Proto   int    `json:"proto"`
+	Op      Op     `json:"op"`
+	Account *int   `json:"account,omitempty"` // force a specific account (select)
+	PID     int    `json:"pid,omitempty"`     // launching pid (select checkout / checkin)
+	NoMark  bool   `json:"no_mark,omitempty"` // select without recording a checkout
+	Cwd     string `json:"cwd,omitempty"`     // caller's working directory, keys select stickiness
 }
 
 // AccountStatus is the per-account view returned by status/select.
@@ -52,6 +53,7 @@ type Response struct {
 	Error        string          `json:"error,omitempty"`
 	Dir          string          `json:"dir,omitempty"` // select: chosen config dir
 	SelectedID   *int            `json:"selected_id,omitempty"`
+	Sticky       bool            `json:"sticky,omitempty"`   // select honored a sticky record
 	Accounts     []AccountStatus `json:"accounts,omitempty"` // status
 	Version      string          `json:"version,omitempty"`  // health
 	SoonestReset *time.Time      `json:"soonest_reset,omitempty"`

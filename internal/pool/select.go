@@ -26,6 +26,9 @@ type SelectOptions struct {
 	Live bool
 	// FreshFor is the cache window for Live sampling.
 	FreshFor time.Duration
+	// Cwd is the caller's working directory, keying select stickiness.
+	// Empty disables stickiness.
+	Cwd string
 }
 
 // DefaultFreshFor is the default cache window for live selection.
@@ -36,6 +39,7 @@ type SelectResult struct {
 	Best   store.Account
 	Result score.Result
 	Ranked []score.Result
+	Sticky bool // the pick honored a sticky record rather than the ranking
 	byID   map[int]store.Account
 }
 
@@ -68,10 +72,16 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	}
 
 	ranked := score.Rank(inputs, now)
+	if r, ok := m.StickyPick(opts.Cwd, ranked, now); ok {
+		// Best-effort: stickiness must never fail a select.
+		_ = m.RecordSticky(opts.Cwd, r.AccountID, now)
+		return &SelectResult{Best: byID[r.AccountID], Result: r, Ranked: ranked, Sticky: true, byID: byID}, nil
+	}
 	best, ok := score.Pick(ranked)
 	if !ok {
 		return &SelectResult{Ranked: ranked, byID: byID}, ErrNoneAvailable
 	}
+	_ = m.RecordSticky(opts.Cwd, best.AccountID, now) // best-effort, as above
 	return &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked, byID: byID}, nil
 }
 

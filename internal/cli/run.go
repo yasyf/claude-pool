@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
@@ -26,12 +27,17 @@ and owns the resulting process — so the session is tracked precisely and the
 				if err := requireInit(m); err != nil {
 					return err
 				}
+				// Best-effort: an unreadable cwd just disables stickiness.
+				cwd, _ := os.Getwd()
 				var a store.Account
 				var err error
 				if cmd.Flags().Changed("account") {
 					a, err = m.Store.GetAccount(account)
+					if err == nil {
+						_ = m.RecordSticky(cwd, a.ID, time.Now()) // anchor future selects here
+					}
 				} else {
-					a, err = chooseAccount(cmd, m)
+					a, err = chooseAccount(cmd, m, cwd)
 				}
 				if err != nil {
 					return err
@@ -51,11 +57,11 @@ and owns the resulting process — so the session is tracked precisely and the
 }
 
 // chooseAccount prefers the daemon's pick, falling back to a live selection.
-func chooseAccount(cmd *cobra.Command, m *pool.Manager) (store.Account, error) {
-	if resp, ok := daemon.NewClient().Select(nil, 0, true); ok && resp.OK && resp.SelectedID != nil {
+func chooseAccount(cmd *cobra.Command, m *pool.Manager, cwd string) (store.Account, error) {
+	if resp, ok := daemon.NewClient().Select(nil, 0, true, cwd); ok && resp.OK && resp.SelectedID != nil {
 		return m.Store.GetAccount(*resp.SelectedID)
 	}
-	sr, err := m.Select(cmd.Context(), pool.SelectOptions{Live: true})
+	sr, err := m.Select(cmd.Context(), pool.SelectOptions{Live: true, Cwd: cwd})
 	if err != nil {
 		return store.Account{}, err
 	}

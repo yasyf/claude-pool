@@ -39,6 +39,14 @@ type Session struct {
 	EndedAt   *time.Time
 }
 
+// Sticky is the last account selected for a working directory, used to keep
+// resumed sessions on the same account for prompt-cache continuity.
+type Sticky struct {
+	Cwd        string
+	AccountID  int
+	SelectedAt time.Time
+}
+
 // RefreshEntry is one credential-refresh attempt.
 type RefreshEntry struct {
 	AccountID int

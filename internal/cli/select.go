@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -38,10 +39,13 @@ scores; otherwise it samples usage live.`,
 				if cmd.Flags().Changed("account") {
 					acctPtr = &account
 				}
+				// Best-effort: an unreadable cwd just disables stickiness, never
+				// fails select.
+				cwd, _ := os.Getwd()
 
 				// Fast path: ask the daemon for its cached pick.
 				if !noDaemon {
-					if dir, done, err := selectViaDaemon(cmd, acctPtr, wait); done {
+					if dir, done, err := selectViaDaemon(cmd, acctPtr, wait, cwd); done {
 						if err != nil {
 							return err
 						}
@@ -51,7 +55,7 @@ scores; otherwise it samples usage live.`,
 				}
 
 				// Live path (no daemon): sample + score synchronously.
-				return selectLive(cmd, m, acctPtr, wait, fresh)
+				return selectLive(cmd, m, acctPtr, wait, fresh, cwd)
 			})
 		},
 	}
@@ -64,7 +68,7 @@ scores; otherwise it samples usage live.`,
 
 // selectViaDaemon attempts a daemon-served selection. done=false means the
 // daemon was unreachable and the caller should fall back to live selection.
-func selectViaDaemon(cmd *cobra.Command, account *int, wait bool) (dir string, done bool, err error) {
+func selectViaDaemon(cmd *cobra.Command, account *int, wait bool, cwd string) (dir string, done bool, err error) {
 	cl := daemon.NewClient()
 	// Auto-spawn a detached daemon if none is running (≤2s), then fall through
 	// to live selection if it still doesn't come up.
@@ -75,12 +79,16 @@ func selectViaDaemon(cmd *cobra.Command, account *int, wait bool) (dir string, d
 	// session tracking. We still want a reservation (anti-thundering-herd), but
 	// no session row — procscan attributes the real claude process. `clp run`
 	// is the path that records real-pid sessions.
-	resp, ok := cl.Select(account, 0, false)
+	resp, ok := cl.Select(account, 0, false, cwd)
 	if !ok {
 		return "", false, nil
 	}
 	if resp.OK && resp.Dir != "" {
-		fmt.Fprintf(cmd.ErrOrStderr(), "selected via daemon: %s\n", resp.Dir)
+		if resp.Sticky {
+			fmt.Fprintf(cmd.ErrOrStderr(), "selected via daemon (sticky): %s\n", resp.Dir)
+		} else {
+			fmt.Fprintf(cmd.ErrOrStderr(), "selected via daemon: %s\n", resp.Dir)
+		}
 		return resp.Dir, true, nil
 	}
 	if !resp.OK && wait && resp.SoonestReset != nil {
@@ -95,15 +103,16 @@ func selectViaDaemon(cmd *cobra.Command, account *int, wait bool) (dir string, d
 }
 
 // selectLive performs a daemonless selection, optionally waiting.
-func selectLive(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, fresh time.Duration) error {
+func selectLive(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, fresh time.Duration, cwd string) error {
 	if account != nil {
 		a, err := m.Store.GetAccount(*account)
 		if err != nil {
 			return err
 		}
+		_ = m.RecordSticky(cwd, a.ID, time.Now()) // best-effort: anchor future selects here
 		return emitChoice(cmd, m, a, fmt.Sprintf("forced acct-%02d", a.ID))
 	}
-	opts := pool.SelectOptions{Live: true, FreshFor: fresh}
+	opts := pool.SelectOptions{Live: true, FreshFor: fresh, Cwd: cwd}
 	for {
 		sr, err := m.Select(cmd.Context(), opts)
 		if errors.Is(err, pool.ErrNoneAvailable) {
@@ -129,7 +138,11 @@ func selectLive(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, fr
 		if err != nil {
 			return err
 		}
-		return emitChoice(cmd, m, sr.Best, fmt.Sprintf("acct-%02d score %.1f", sr.Best.ID, sr.Result.Score))
+		reason := fmt.Sprintf("acct-%02d score %.1f", sr.Best.ID, sr.Result.Score)
+		if sr.Sticky {
+			reason = fmt.Sprintf("acct-%02d (sticky)", sr.Best.ID)
+		}
+		return emitChoice(cmd, m, sr.Best, reason)
 	}
 }
 

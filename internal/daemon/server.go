@@ -205,6 +205,7 @@ func (s *Server) handleSelect(req Request) Response {
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
 				s.reserve(sn.Account.ID)
+				s.recordSticky(req.Cwd, sn.Account.ID)
 				id := sn.Account.ID
 				return Response{OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id}
 			}
@@ -212,15 +213,21 @@ func (s *Server) handleSelect(req Request) Response {
 		return Response{OK: false, Error: fmt.Sprintf("account %d not found", *req.Account)}
 	}
 
-	best, ok := s.pickWithReservations(snaps)
-	if !ok {
-		soonest := soonestReset(snaps)
-		resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error()}
-		if !soonest.IsZero() {
-			resp.SoonestReset = &soonest
+	ranked, bySnap := s.rankWithReservations(snaps)
+	r, sticky := s.m.StickyPick(req.Cwd, ranked, time.Now())
+	if !sticky {
+		var ok bool
+		r, ok = score.Pick(ranked)
+		if !ok {
+			soonest := soonestReset(snaps)
+			resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error()}
+			if !soonest.IsZero() {
+				resp.SoonestReset = &soonest
+			}
+			return resp
 		}
-		return resp
 	}
+	best := bySnap[r.AccountID]
 	if !req.NoMark {
 		s.reserve(best.Account.ID)
 		if req.PID > 0 {
@@ -229,10 +236,24 @@ func (s *Server) handleSelect(req Request) Response {
 			}
 		}
 	}
+	// Record regardless of NoMark: cache continuity is established by
+	// `clp run`'s no-mark select too.
+	s.recordSticky(req.Cwd, best.Account.ID)
+	if sticky {
+		s.log.Printf("sticky select: %s -> acct-%02d", req.Cwd, best.Account.ID)
+	}
 	id := best.Account.ID
 	// Preflight refresh the winner if idle and expiring soon (best-effort).
 	go s.m.PreflightRefresh(context.Background(), best.Account)
-	return Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id}
+	return Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id, Sticky: sticky}
+}
+
+// recordSticky upserts the cwd->account sticky record, logging (not failing)
+// on error.
+func (s *Server) recordSticky(cwd string, accountID int) {
+	if err := s.m.RecordSticky(cwd, accountID, time.Now()); err != nil {
+		s.log.Printf("record sticky for %s: %v", cwd, err)
+	}
 }
 
 // handleCheckin closes sessions for a pid and adopts any rotated token.
@@ -279,8 +300,9 @@ func (s *Server) reservedCount(id int) int {
 	return 1
 }
 
-// pickWithReservations re-ranks snapshots with reservation penalties applied.
-func (s *Server) pickWithReservations(snaps []pool.Snapshot) (pool.Snapshot, bool) {
+// rankWithReservations re-ranks snapshots with reservation penalties applied,
+// returning the ranking plus a snapshot lookup by account id.
+func (s *Server) rankWithReservations(snaps []pool.Snapshot) ([]score.Result, map[int]pool.Snapshot) {
 	bySnap := map[int]pool.Snapshot{}
 	inputs := make([]score.Input, 0, len(snaps))
 	for _, sn := range snaps {
@@ -299,12 +321,7 @@ func (s *Server) pickWithReservations(snaps []pool.Snapshot) (pool.Snapshot, boo
 			RefreshFailed:  sn.Stale && !sn.HasUsage,
 		})
 	}
-	ranked := score.Rank(inputs, time.Now())
-	r, ok := score.Pick(ranked)
-	if !ok {
-		return pool.Snapshot{}, false
-	}
-	return bySnap[r.AccountID], true
+	return score.Rank(inputs, time.Now()), bySnap
 }
 
 func soonestReset(snaps []pool.Snapshot) time.Time {

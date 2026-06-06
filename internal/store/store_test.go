@@ -102,6 +102,67 @@ func TestSessionsReconcile(t *testing.T) {
 	}
 }
 
+func TestSticky(t *testing.T) {
+	s := openTest(t)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+
+	if _, ok, err := s.GetSticky("/proj"); ok || err != nil {
+		t.Fatalf("empty table: ok=%v err=%v", ok, err)
+	}
+
+	t0 := time.Now().Truncate(time.Second)
+	if err := s.UpsertSticky("/proj", 1, t0); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetSticky("/proj")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.Cwd != "/proj" || got.AccountID != 1 || !got.SelectedAt.Equal(t0) {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+
+	// Re-upsert (the sliding-TTL write path) overwrites both fields.
+	t1 := t0.Add(time.Minute)
+	if err := s.UpsertSticky("/proj", 2, t1); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ = s.GetSticky("/proj")
+	if got.AccountID != 2 || !got.SelectedAt.Equal(t1) {
+		t.Fatalf("upsert did not overwrite: %+v", got)
+	}
+}
+
+func TestPruneSticky(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	s.UpsertSticky("/old", 1, now.Add(-2*time.Hour))
+	s.UpsertSticky("/fresh", 1, now)
+	n, err := s.PruneSticky(now.Add(-time.Hour))
+	if err != nil || n != 1 {
+		t.Fatalf("prune: n=%d err=%v", n, err)
+	}
+	if _, ok, _ := s.GetSticky("/old"); ok {
+		t.Fatal("old row should be pruned")
+	}
+	if _, ok, _ := s.GetSticky("/fresh"); !ok {
+		t.Fatal("fresh row should survive")
+	}
+}
+
+func TestDeleteAccountRemovesSticky(t *testing.T) {
+	s := openTest(t)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	s.UpsertSticky("/proj", 1, time.Now())
+	if err := s.DeleteAccount(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetSticky("/proj"); ok {
+		t.Fatal("sticky row should be deleted with its account")
+	}
+}
+
 func TestRefreshLog(t *testing.T) {
 	s := openTest(t)
 	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})

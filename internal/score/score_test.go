@@ -155,3 +155,23 @@ func TestZeroKnobsReproduceBaseline(t *testing.T) {
 }
 
 func restoreKnobs(knee, runway float64) { BarrierKnee, RunwayWeight = knee, runway }
+
+func TestUsableForSticky(t *testing.T) {
+	cases := []struct {
+		name string
+		r    Result
+		want bool
+	}{
+		{"healthy", Result{Available: true, Components: Components{Eff5: 90}}, true},
+		{"rate-limited despite headroom", Result{Available: false, Components: Components{Eff5: 90}}, false},
+		{"just below floor", Result{Available: true, Components: Components{Eff5: StickyMinEff5 - 0.1}}, false},
+		{"exactly at floor", Result{Available: true, Components: Components{Eff5: StickyMinEff5}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UsableForSticky(tc.r); got != tc.want {
+				t.Fatalf("UsableForSticky(%+v) = %v, want %v", tc.r, got, tc.want)
+			}
+		})
+	}
+}

@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS refresh_log (
   err        TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, ts)
 );
+CREATE TABLE IF NOT EXISTS sticky (
+  cwd         TEXT PRIMARY KEY,
+  account_id  INTEGER NOT NULL,
+  selected_at INTEGER NOT NULL
+);
 `
 
 // Open opens (creating if needed) the database at path and applies the schema.
@@ -177,6 +182,7 @@ func (s *Store) DeleteAccount(id int) error {
 		`DELETE FROM usage_samples WHERE account_id=?`,
 		`DELETE FROM sessions WHERE account_id=?`,
 		`DELETE FROM refresh_log WHERE account_id=?`,
+		`DELETE FROM sticky WHERE account_id=?`,
 		`DELETE FROM accounts WHERE id=?`,
 	} {
 		if _, err := tx.Exec(q, id); err != nil {
@@ -365,6 +371,46 @@ func (s *Store) CloseDeadSessions(alive map[int]bool) (int, error) {
 		}
 	}
 	return closed, nil
+}
+
+// UpsertSticky records (or refreshes) the account last selected for cwd.
+func (s *Store) UpsertSticky(cwd string, accountID int, at time.Time) error {
+	_, err := s.db.Exec(
+		`INSERT INTO sticky(cwd,account_id,selected_at) VALUES(?,?,?)
+		 ON CONFLICT(cwd) DO UPDATE SET
+		   account_id=excluded.account_id,
+		   selected_at=excluded.selected_at`,
+		cwd, accountID, at.Unix())
+	if err != nil {
+		return fmt.Errorf("upsert sticky for %s: %w", cwd, err)
+	}
+	return nil
+}
+
+// GetSticky returns the sticky record for cwd, ok=false if none exists.
+func (s *Store) GetSticky(cwd string) (Sticky, bool, error) {
+	row := s.db.QueryRow(`SELECT cwd,account_id,selected_at FROM sticky WHERE cwd=?`, cwd)
+	var st Sticky
+	var at int64
+	if err := row.Scan(&st.Cwd, &st.AccountID, &at); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return st, false, nil
+		}
+		return st, false, err
+	}
+	st.SelectedAt = time.Unix(at, 0)
+	return st, true, nil
+}
+
+// PruneSticky deletes sticky rows last refreshed before cutoff, returning the
+// number deleted.
+func (s *Store) PruneSticky(cutoff time.Time) (int, error) {
+	res, err := s.db.Exec(`DELETE FROM sticky WHERE selected_at < ?`, cutoff.Unix())
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // LogRefresh records a refresh attempt outcome.

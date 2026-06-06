@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 )
 
@@ -66,6 +67,12 @@ func (s *Server) pollOnce(ctx context.Context) {
 		case n > 0:
 			s.log.Printf("reconciled %d ended session(s)", n)
 		}
+	}
+
+	// Row hygiene only: StickyPick checks freshness on read, which also covers
+	// the daemonless path where no pruner runs.
+	if _, err := s.m.Store.PruneSticky(time.Now().Add(-pool.StickyTTL)); err != nil {
+		s.log.Printf("prune sticky: %v", err)
 	}
 
 	accts, err := s.m.Store.ListAccounts()
