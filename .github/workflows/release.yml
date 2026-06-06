@@ -14,9 +14,9 @@ jobs:
       pure_sha256: ${{ steps.shas.outputs.pure }}
       fuse_sha256: ${{ steps.shas.outputs.fuse }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
           cache: true
@@ -68,13 +68,13 @@ jobs:
           echo "pure=${PURE}" >> "$GITHUB_OUTPUT"
           echo "fuse=${FUSE}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tarballs
           path: dist/*.tar.gz
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
@@ -88,7 +88,7 @@ jobs:
     runs-on: macos-15
     needs: build
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tarballs
 
@@ -105,7 +105,7 @@ jobs:
     # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the formula.
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
