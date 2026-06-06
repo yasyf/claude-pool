@@ -76,7 +76,7 @@ func TestReservedCountExpiresAfterTTL(t *testing.T) {
 
 func TestHandleSelectRecordsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
-	resp := s.handleSelect(Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[1] {
 		t.Fatalf("expected emptier acct-1 (%s), got %+v", dirs[1], resp)
 	}
@@ -95,7 +95,7 @@ func TestHandleSelectHonorsSticky(t *testing.T) {
 	if err := s.m.Store.UpsertSticky("/proj", 2, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	resp := s.handleSelect(Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
 		t.Fatalf("expected sticky acct-2 (%s), got %+v", dirs[2], resp)
 	}
@@ -104,7 +104,7 @@ func TestHandleSelectHonorsSticky(t *testing.T) {
 func TestHandleSelectForcedRecordsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
 	acct := 2
-	resp := s.handleSelect(Request{Op: OpSelect, Account: &acct, Cwd: "/proj"})
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &acct, Cwd: "/proj"})
 	if !resp.OK || resp.Dir != dirs[2] {
 		t.Fatalf("expected forced acct-2 (%s), got %+v", dirs[2], resp)
 	}

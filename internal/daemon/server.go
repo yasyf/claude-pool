@@ -115,7 +115,7 @@ func (s *Server) serve(ctx context.Context) error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go s.handle(conn)
+		go s.handle(ctx, conn)
 	}
 
 	wg.Wait()
@@ -146,7 +146,9 @@ func (s *Server) listen() (net.Listener, error) {
 	return ln, nil
 }
 
-func (s *Server) handle(conn net.Conn) {
+// handle serves one connection. ctx is the daemon's lifecycle context (bounds
+// shutdown); the conn deadline independently bounds a single slow client.
+func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	var req Request
@@ -154,7 +156,7 @@ func (s *Server) handle(conn net.Conn) {
 		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
 		return
 	}
-	resp := s.dispatch(req)
+	resp := s.dispatch(ctx, req)
 	resp.Proto = ProtocolVersion
 	writeResp(conn, resp)
 }
@@ -164,14 +166,14 @@ func writeResp(conn net.Conn, r Response) {
 	_ = json.NewEncoder(conn).Encode(r)
 }
 
-func (s *Server) dispatch(req Request) Response {
+func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	switch req.Op {
 	case OpHealth:
 		return Response{OK: true, Version: version.String()}
 	case OpStatus:
-		return s.handleStatus()
+		return s.handleStatus(ctx)
 	case OpSelect:
-		return s.handleSelect(req)
+		return s.handleSelect(ctx, req)
 	case OpCheckin:
 		return s.handleCheckin(req)
 	default:
@@ -180,8 +182,8 @@ func (s *Server) dispatch(req Request) Response {
 }
 
 // handleStatus returns scored snapshots from cached samples (no live fetch).
-func (s *Server) handleStatus() Response {
-	snaps, err := s.m.Snapshots(context.Background(), false, 0)
+func (s *Server) handleStatus(ctx context.Context) Response {
+	snaps, err := s.m.Snapshots(ctx, false, 0)
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
@@ -191,8 +193,8 @@ func (s *Server) handleStatus() Response {
 // handleSelect picks the best available account from cached scores, applying
 // short-lived reservations to avoid two selects colliding, and records a
 // reservation for the winner.
-func (s *Server) handleSelect(req Request) Response {
-	snaps, err := s.m.Snapshots(context.Background(), false, 0)
+func (s *Server) handleSelect(ctx context.Context, req Request) Response {
+	snaps, err := s.m.Snapshots(ctx, false, 0)
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
@@ -244,7 +246,7 @@ func (s *Server) handleSelect(req Request) Response {
 	}
 	id := best.Account.ID
 	// Preflight refresh the winner if idle and expiring soon (best-effort).
-	go s.m.PreflightRefresh(context.Background(), best.Account)
+	go s.m.PreflightRefresh(ctx, best.Account)
 	return Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id, Sticky: sticky}
 }
 
