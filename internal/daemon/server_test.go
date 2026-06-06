@@ -47,6 +47,33 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	}, dirs
 }
 
+func TestReservedCountExpiresAfterTTL(t *testing.T) {
+	s := &Server{reservations: map[int]time.Time{}}
+
+	if got := s.reservedCount(1); got != 0 {
+		t.Fatalf("reservedCount before reserve = %d, want 0", got)
+	}
+
+	s.reserve(1)
+	if got := s.reservedCount(1); got != 1 {
+		t.Fatalf("reservedCount after reserve = %d, want 1", got)
+	}
+
+	// Backdate past the TTL: the reservation must read as expired AND be pruned.
+	s.mu.Lock()
+	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
+	s.mu.Unlock()
+	if got := s.reservedCount(1); got != 0 {
+		t.Fatalf("reservedCount after TTL = %d, want 0", got)
+	}
+	s.mu.Lock()
+	_, ok := s.reservations[1]
+	s.mu.Unlock()
+	if ok {
+		t.Fatal("expired reservation was not deleted")
+	}
+}
+
 func TestHandleSelectRecordsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
 	resp := s.handleSelect(Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})

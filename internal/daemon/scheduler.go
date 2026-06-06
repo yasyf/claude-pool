@@ -101,7 +101,11 @@ func (s *Server) pollOnce(ctx context.Context) {
 			s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
 		}
 
-		idle := procscan.CountByConfigDir(sessions, a.ConfigDir, s.m.DefaultDir) == 0
+		// A reserved account was just handed out by handleSelect but its claude
+		// is not yet visible to procscan — treat it as busy so we don't refresh
+		// the token out from under the launching session.
+		idle := procscan.CountByConfigDir(sessions, a.ConfigDir, s.m.DefaultDir) == 0 &&
+			s.reservedCount(a.ID) == 0
 
 		// A previously checked-out account that is now idle may carry a token
 		// rotated by its live session — adopt it before sampling. (For acct-00
