@@ -8,11 +8,14 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/yasyf/claude-pool/internal/oauth"
 	"github.com/yasyf/claude-pool/internal/overlay"
 	"github.com/yasyf/claude-pool/internal/pool"
 	"github.com/yasyf/claude-pool/internal/score"
@@ -32,6 +35,7 @@ type Server struct {
 
 	mu           sync.Mutex
 	reservations map[int]time.Time // accountID -> reserved-at
+	rlStreak     map[int]int       // accountID -> consecutive 429 count
 }
 
 // Run is the entry point for `claude-pool daemon`. It blocks until the process
@@ -43,13 +47,32 @@ func Run(ctx context.Context) error {
 	}
 	defer m.Close()
 
+	// Stamp our OAuth User-Agent with the detected claude version so polling
+	// looks like the official client.
+	oauth.SetUserAgentVersion(detectClaudeVersion())
+
 	s := &Server{
 		m:            m,
 		socket:       pool.SocketPath(),
 		log:          log.New(os.Stderr, "[claude-pool] ", log.LstdFlags),
 		reservations: map[int]time.Time{},
+		rlStreak:     map[int]int{},
 	}
 	return s.serve(ctx)
+}
+
+// detectClaudeVersion runs `claude --version` (best-effort) to stamp the UA.
+func detectClaudeVersion() string {
+	out, err := exec.Command("claude", "--version").Output()
+	if err != nil {
+		return ""
+	}
+	// Output looks like "2.1.166 (Claude Code)"; take the leading version token.
+	fields := strings.Fields(string(out))
+	if len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
 }
 
 func (s *Server) serve(ctx context.Context) error {

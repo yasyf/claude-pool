@@ -31,6 +31,19 @@ const (
 	betaHeader = "oauth-2025-04-20"
 )
 
+// UserAgent matches the Claude Code CLI's own User-Agent format
+// (`claude-cli/<version> (external)`, from the binary's Io() builder) so the
+// OAuth endpoints treat our polling like the official client. The daemon stamps
+// the detected claude version via SetUserAgentVersion.
+var UserAgent = "claude-cli/2.1.166 (external)"
+
+// SetUserAgentVersion sets UserAgent to claude-cli/<version> (external).
+func SetUserAgentVersion(version string) {
+	if version != "" {
+		UserAgent = "claude-cli/" + version + " (external)"
+	}
+}
+
 // Client is a thin OAuth client. The zero value is not usable; use New.
 type Client struct {
 	http      *http.Client
@@ -105,6 +118,7 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -128,9 +142,7 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 
 // Window is one usage window (5-hour, 7-day, or 7-day-opus).
 type Window struct {
-	// Utilization is normalized to a fraction in [0,1]. The API reports a
-	// fraction (e.g. 0.7 == 70%); if a future version reports a percent we
-	// detect values > 1 and rescale.
+	// Utilization is a fraction in [0,1] (e.g. 0.7 == 70%), as the API reports it.
 	Utilization float64
 	// ResetsAt is when this window resets. Zero if absent.
 	ResetsAt time.Time
@@ -160,7 +172,9 @@ type Usage struct {
 	SevenDayOpus Window
 }
 
-// rawWindow matches the JSON shape {utilization, resets_at}.
+// rawWindow matches the API JSON: utilization is a fraction in [0,1] and
+// resets_at is a Unix epoch in seconds (the binary does utilization*100 and
+// new Date(resets_at*1000).toISOString() on the raw response).
 type rawWindow struct {
 	Utilization *float64 `json:"utilization"`
 	ResetsAt    *float64 `json:"resets_at"` // Unix epoch SECONDS
@@ -172,11 +186,7 @@ func (rw *rawWindow) toWindow() Window {
 	}
 	w := Window{Present: true}
 	if rw.Utilization != nil {
-		u := *rw.Utilization
-		if u > 1 { // API gave a percent; normalize to a fraction
-			u = u / 100
-		}
-		w.Utilization = u
+		w.Utilization = *rw.Utilization
 	}
 	if rw.ResetsAt != nil {
 		w.ResetsAt = time.Unix(int64(*rw.ResetsAt), 0)
@@ -216,6 +226,7 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", betaHeader)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

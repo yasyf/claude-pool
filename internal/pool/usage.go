@@ -68,6 +68,14 @@ func (m *Manager) writeCredentialAll(a store.Account, cred *keychain.Credential)
 // is written back to all of the account's services and logged. allowRefresh
 // should be false for accounts with a live session (that session owns refresh).
 func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, bool, error) {
+	// acct-00's refresh token is the one plain `claude` uses (the canonical and
+	// mirror items share it). Refreshing it here would consume that single-use
+	// token out from under a possibly-live plain claude → forced re-login. So we
+	// NEVER POST-refresh acct-00; plain claude (or a pooled acct-00 session)
+	// owns its lifecycle, and we only propagate whatever token it rotates to.
+	if a.IsZero {
+		allowRefresh = false
+	}
 	cred, _, err := m.readCredential(a)
 	if err != nil {
 		return nil, false, err

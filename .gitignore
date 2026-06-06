@@ -1,8 +1,8 @@
-# Build artifacts
+# Build artifacts (anchored to repo root so cmd/claude-pool/ is NOT ignored)
 /dist/
 /build/
-claude-pool
-clp
+/claude-pool
+/clp
 *.test
 *.out
 coverage.txt

@@ -6,27 +6,47 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/winfsp/cgofuse/fuse"
 )
 
-// mirrorFS is a passthrough filesystem: every operation is applied directly to
+// mirrorFS is a passthrough filesystem: most operations are applied directly to
 // the corresponding path under root (~/.claude), so reads and writes are shared
-// with plain `claude`. There is NO copy-up and NO separate backing store.
+// with plain `claude`. There is NO copy-up. The exception is the instance-local
+// ExcludedEntries (daemon/, ide/): their whole subtrees are redirected to a
+// private per-account backing dir so concurrent sessions don't fight over one
+// supervisor/IDE registry — matching the symlink provider's invariant.
 type mirrorFS struct {
 	fuse.FileSystemBase
-	root string
+	root        string // ~/.claude
+	privateRoot string // per-account backing for ExcludedEntries
 }
 
-func newMirrorFS(root string) *mirrorFS {
-	abs, _ := filepath.Abs(root)
-	return &mirrorFS{root: abs}
+func newMirrorFS(root, privateRoot string) *mirrorFS {
+	absRoot, _ := filepath.Abs(root)
+	absPriv, _ := filepath.Abs(privateRoot)
+	return &mirrorFS{root: absRoot, privateRoot: absPriv}
 }
 
-// real maps a fuse path ("/foo/bar") to the backing path under root.
+// real maps a fuse path ("/foo/bar") to its backing path: under privateRoot for
+// an excluded top-level component, else under root.
 func (fs *mirrorFS) real(path string) string {
-	return filepath.Join(fs.root, filepath.FromSlash(path))
+	rel := filepath.FromSlash(path)
+	if ExcludedEntries[topComponent(path)] {
+		return filepath.Join(fs.privateRoot, rel)
+	}
+	return filepath.Join(fs.root, rel)
+}
+
+// topComponent returns the first path component of a fuse path ("/daemon/x" -> "daemon").
+func topComponent(path string) string {
+	p := strings.TrimPrefix(path, "/")
+	if i := strings.IndexByte(p, '/'); i >= 0 {
+		p = p[:i]
+	}
+	return p
 }
 
 func errno(err error) int {

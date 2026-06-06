@@ -8,10 +8,31 @@ import (
 )
 
 const (
-	basePollInterval = 45 * time.Second
-	pollJitter       = 15 * time.Second
-	rateLimitBackoff = 5 * time.Minute
+	// The /usage and token endpoints rate-limit aggressively: polling every
+	// 30–60s can trip a 30+ minute 429 with no Retry-After. 180s + jitter keeps
+	// us well clear while still feeling live for start-of-session selection.
+	basePollInterval = 180 * time.Second
+	pollJitter       = 30 * time.Second
+
+	// Per-account spacing so N accounts don't hit the shared-IP bucket at once.
+	perAccountSpacing = 2 * time.Second
+
+	// Exponential rate-limit backoff: 3, 6, 12, … capped at 15 minutes.
+	rateLimitBackoffBase = 3 * time.Minute
+	rateLimitBackoffCap  = 15 * time.Minute
 )
+
+// rlBackoff returns the backoff duration for a given consecutive-429 streak.
+func rlBackoff(streak int) time.Duration {
+	d := rateLimitBackoffBase
+	for i := 1; i < streak && d < rateLimitBackoffCap; i++ {
+		d *= 2
+	}
+	if d > rateLimitBackoffCap {
+		d = rateLimitBackoffCap
+	}
+	return d
+}
 
 // scheduler runs the periodic usage poll + idle-only refresh + session
 // reconciliation until ctx is cancelled.
@@ -45,24 +66,38 @@ func (s *Server) pollOnce(ctx context.Context) {
 		s.log.Printf("list accounts: %v", err)
 		return
 	}
-	for _, a := range accts {
-		// Respect a rate-limit backoff: if the latest sample is rate-limited
-		// and recent, skip until the backoff elapses.
+	for i, a := range accts {
+		// Respect an exponential rate-limit backoff keyed on the consecutive-429
+		// streak for this account.
 		if last, ok, _ := s.m.Store.LatestUsageSample(a.ID); ok && last.RateLimited &&
-			time.Since(last.TS) < rateLimitBackoff {
+			time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
 			continue
+		}
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(perAccountSpacing):
+			}
 		}
 		idle := procscan.CountByConfigDir(sessions, a.ConfigDir, s.m.DefaultDir) == 0
 
 		// A previously checked-out account that is now idle may carry a token
-		// rotated by its live session — adopt it before sampling.
+		// rotated by its live session — adopt it before sampling. (For acct-00
+		// this propagates plain claude's rotated token; SampleUsage never
+		// POST-refreshes acct-00.)
 		if idle {
 			_ = s.m.AdoptRotatedToken(a)
 		}
 
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, _, err := s.m.SampleUsage(cctx, a, idle)
+		_, rateLimited, err := s.m.SampleUsage(cctx, a, idle)
 		cancel()
+		if rateLimited {
+			s.rlStreak[a.ID]++
+		} else if err == nil {
+			s.rlStreak[a.ID] = 0
+		}
 		if err != nil {
 			s.log.Printf("acct-%02d sample: %v", a.ID, err)
 		}

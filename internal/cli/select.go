@@ -3,7 +3,6 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -67,7 +66,11 @@ scores; otherwise it samples usage live.`,
 // daemon was unreachable and the caller should fall back to live selection.
 func selectViaDaemon(cmd *cobra.Command, account *int, wait bool) (dir string, done bool, err error) {
 	cl := daemon.NewClient()
-	resp, ok := cl.Select(account, os.Getpid(), false)
+	// pid 0: clp exits before `claude` starts, so its pid is useless for
+	// session tracking. We still want a reservation (anti-thundering-herd), but
+	// no session row — procscan attributes the real claude process. `clp run`
+	// is the path that records real-pid sessions.
+	resp, ok := cl.Select(account, 0, false)
 	if !ok {
 		return "", false, nil
 	}

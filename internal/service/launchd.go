@@ -45,6 +45,8 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <dict>
         <key>PATH</key>
         <string>{{.Path}}</string>
+        <key>CGOFUSE_LIBFUSE_PATH</key>
+        <string>/usr/local/lib/libfuse-t.dylib</string>
     </dict>
 </dict>
 </plist>
@@ -69,7 +71,10 @@ func WritePlist() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	bin, _ = filepath.EvalSymlinks(bin)
+	// Do NOT EvalSymlinks here: a Homebrew install exposes a stable
+	// /opt/homebrew/bin/claude-pool symlink into a versioned Cellar path.
+	// Resolving to the Cellar path would change every upgrade and re-trigger the
+	// fuse-t "Network Volumes" TCC prompt. launchd happily execs the symlink.
 	path, err := PlistPath()
 	if err != nil {
 		return "", err

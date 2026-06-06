@@ -98,19 +98,20 @@ func TestUsageHeadersAndParsing(t *testing.T) {
 	}
 }
 
-func TestUsagePercentNormalization(t *testing.T) {
+func TestUsageUserAgentSent(t *testing.T) {
+	var ua string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"five_hour":{"utilization":70,"resets_at":1}}`)
+		ua = r.Header.Get("User-Agent")
+		io.WriteString(w, `{"five_hour":{"utilization":0.5,"resets_at":1}}`)
 	}))
 	defer srv.Close()
 	c := New()
 	c.usageURL = srv.URL
-	u, err := c.Usage(context.Background(), "x")
-	if err != nil {
+	if _, err := c.Usage(context.Background(), "x"); err != nil {
 		t.Fatal(err)
 	}
-	if u.FiveHour.Used() != 70 { // 70 (percent) normalized to fraction 0.7 -> Used 70
-		t.Errorf("normalized used = %.1f, want 70", u.FiveHour.Used())
+	if !strings.HasPrefix(ua, "claude-cli/") {
+		t.Errorf("User-Agent = %q, want claude-cli/... form", ua)
 	}
 }
 

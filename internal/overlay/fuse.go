@@ -29,6 +29,21 @@ const fuseBuilt = true
 
 func fuseProvider() (Provider, bool) { return &FuseProvider{}, true }
 
+func init() {
+	// This machine (and many dev Macs) may have BOTH macFUSE's libfuse.2.dylib
+	// and fuse-t's libfuse-t.dylib. cgofuse dlopens libfuse.2.dylib first, so
+	// pin fuse-t explicitly unless the user already set the override.
+	if os.Getenv("CGOFUSE_LIBFUSE_PATH") == "" {
+		_ = os.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
+	}
+}
+
+// privateRootFor is the per-account backing dir holding the excluded
+// (instance-local) subtrees daemon/ and ide/. It sits beside the mountpoint.
+func privateRootFor(accountDir string) string {
+	return accountDir + ".private"
+}
+
 // mountRegistry tracks live mounts so Teardown can unmount the right host.
 var (
 	mountMu sync.Mutex
@@ -58,15 +73,26 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	}
 	mountMu.Unlock()
 
-	fs := newMirrorFS(base)
+	// Private backing for excluded (instance-local) entries.
+	priv := privateRootFor(accountDir)
+	for name := range ExcludedEntries {
+		_ = os.MkdirAll(filepath.Join(priv, name), 0o700)
+	}
+
+	fs := newMirrorFS(base, priv)
 	host := fuse.NewFileSystemHost(fs)
 	host.SetCapReaddirPlus(true)
 	done := make(chan struct{})
 
+	// fuse-t mount options (its NFS backend has NO soft/timeout/retrans knobs;
+	// the coherence lever is noattrcache). The backing ~/.claude is written
+	// directly by plain `claude` (acct-00) while a pooled session reads through
+	// this mirror, so disable attribute caching to avoid stale reads. nobrowse
+	// keeps the mount out of Finder sidebars.
 	opts := []string{
 		"-o", "volname=claude-pool-" + filepath.Base(accountDir),
-		"-o", "noappledouble",
-		"-o", "noapplexattr",
+		"-o", "noattrcache",
+		"-o", "nobrowse",
 	}
 	go func() {
 		defer close(done)
@@ -116,14 +142,33 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 	if !ok {
 		// Not ours (e.g. left over from a prior run): best-effort unmount.
 		_ = syscall.Unmount(accountDir, 0)
-		return nil
+	} else {
+		h.host.Unmount()
+		select {
+		case <-h.done:
+		case <-time.After(5 * time.Second):
+		}
 	}
-	h.host.Unmount()
-	select {
-	case <-h.done:
-	case <-time.After(5 * time.Second):
+	// Honest teardown: confirm the path is no longer a mountpoint. If the
+	// unmount wedged (e.g. fuse-t issue-45), report it so callers do NOT
+	// RemoveAll through a live mount into the backing ~/.claude.
+	if stillMounted(accountDir) {
+		return fmt.Errorf("unmount of %s did not take; refusing to treat it as torn down", accountDir)
 	}
 	return nil
+}
+
+// stillMounted reports whether dir is a mountpoint (its device differs from its
+// parent's).
+func stillMounted(dir string) bool {
+	var ds, ps syscall.Stat_t
+	if syscall.Lstat(dir, &ds) != nil {
+		return false
+	}
+	if syscall.Lstat(filepath.Dir(dir), &ps) != nil {
+		return false
+	}
+	return ds.Dev != ps.Dev
 }
 
 // waitMounted polls until base's contents are visible through accountDir.
