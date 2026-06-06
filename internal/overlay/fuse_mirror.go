@@ -1,0 +1,225 @@
+//go:build fuse && cgo && darwin
+
+package overlay
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"syscall"
+
+	"github.com/winfsp/cgofuse/fuse"
+)
+
+// mirrorFS is a passthrough filesystem: every operation is applied directly to
+// the corresponding path under root (~/.claude), so reads and writes are shared
+// with plain `claude`. There is NO copy-up and NO separate backing store.
+type mirrorFS struct {
+	fuse.FileSystemBase
+	root string
+}
+
+func newMirrorFS(root string) *mirrorFS {
+	abs, _ := filepath.Abs(root)
+	return &mirrorFS{root: abs}
+}
+
+// real maps a fuse path ("/foo/bar") to the backing path under root.
+func (fs *mirrorFS) real(path string) string {
+	return filepath.Join(fs.root, filepath.FromSlash(path))
+}
+
+func errno(err error) int {
+	if err == nil {
+		return 0
+	}
+	var e syscall.Errno
+	if errors.As(err, &e) {
+		return -int(e)
+	}
+	return -int(syscall.EIO)
+}
+
+func (fs *mirrorFS) Statfs(path string, stat *fuse.Statfs_t) int {
+	var s syscall.Statfs_t
+	if err := syscall.Statfs(fs.real(path), &s); err != nil {
+		return errno(err)
+	}
+	stat.Bsize = uint64(s.Bsize)
+	stat.Frsize = uint64(s.Bsize)
+	stat.Blocks = s.Blocks
+	stat.Bfree = s.Bfree
+	stat.Bavail = s.Bavail
+	stat.Files = s.Files
+	stat.Ffree = s.Ffree
+	stat.Namemax = 255
+	return 0
+}
+
+func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+	var st syscall.Stat_t
+	var err error
+	if fh != ^uint64(0) {
+		err = syscall.Fstat(int(fh), &st)
+	} else {
+		err = syscall.Lstat(fs.real(path), &st)
+	}
+	if err != nil {
+		return errno(err)
+	}
+	copyStat(stat, &st)
+	return 0
+}
+
+func (fs *mirrorFS) Open(path string, flags int) (int, uint64) {
+	fd, err := syscall.Open(fs.real(path), flags, 0)
+	if err != nil {
+		return errno(err), ^uint64(0)
+	}
+	return 0, uint64(fd)
+}
+
+func (fs *mirrorFS) Create(path string, flags int, mode uint32) (int, uint64) {
+	fd, err := syscall.Open(fs.real(path), flags|syscall.O_CREAT, mode)
+	if err != nil {
+		return errno(err), ^uint64(0)
+	}
+	return 0, uint64(fd)
+}
+
+func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+	n, err := syscall.Pread(int(fh), buff, ofst)
+	if err != nil {
+		return errno(err)
+	}
+	return n
+}
+
+func (fs *mirrorFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+	n, err := syscall.Pwrite(int(fh), buff, ofst)
+	if err != nil {
+		return errno(err)
+	}
+	return n
+}
+
+func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
+	var err error
+	if fh != ^uint64(0) {
+		err = syscall.Ftruncate(int(fh), size)
+	} else {
+		err = syscall.Truncate(fs.real(path), size)
+	}
+	return errno(err)
+}
+
+func (fs *mirrorFS) Fsync(path string, datasync bool, fh uint64) int {
+	return errno(syscall.Fsync(int(fh)))
+}
+
+func (fs *mirrorFS) Release(path string, fh uint64) int {
+	return errno(syscall.Close(int(fh)))
+}
+
+func (fs *mirrorFS) Opendir(path string) (int, uint64) {
+	fd, err := syscall.Open(fs.real(path), syscall.O_RDONLY, 0)
+	if err != nil {
+		return errno(err), ^uint64(0)
+	}
+	return 0, uint64(fd)
+}
+
+func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int {
+	dir, err := os.Open(fs.real(path))
+	if err != nil {
+		return errno(err)
+	}
+	defer dir.Close()
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		return errno(err)
+	}
+	fill(".", nil, 0)
+	fill("..", nil, 0)
+	for _, name := range names {
+		if !fill(name, nil, 0) {
+			break
+		}
+	}
+	return 0
+}
+
+func (fs *mirrorFS) Releasedir(path string, fh uint64) int {
+	return errno(syscall.Close(int(fh)))
+}
+
+func (fs *mirrorFS) Mkdir(path string, mode uint32) int {
+	return errno(syscall.Mkdir(fs.real(path), mode))
+}
+
+func (fs *mirrorFS) Unlink(path string) int {
+	return errno(syscall.Unlink(fs.real(path)))
+}
+
+func (fs *mirrorFS) Rmdir(path string) int {
+	return errno(syscall.Rmdir(fs.real(path)))
+}
+
+func (fs *mirrorFS) Link(oldpath string, newpath string) int {
+	return errno(syscall.Link(fs.real(oldpath), fs.real(newpath)))
+}
+
+func (fs *mirrorFS) Symlink(target string, newpath string) int {
+	return errno(syscall.Symlink(target, fs.real(newpath)))
+}
+
+func (fs *mirrorFS) Readlink(path string) (int, string) {
+	buf := make([]byte, 4096)
+	n, err := syscall.Readlink(fs.real(path), buf)
+	if err != nil {
+		return errno(err), ""
+	}
+	return 0, string(buf[:n])
+}
+
+func (fs *mirrorFS) Rename(oldpath string, newpath string) int {
+	return errno(syscall.Rename(fs.real(oldpath), fs.real(newpath)))
+}
+
+func (fs *mirrorFS) Chmod(path string, mode uint32) int {
+	return errno(syscall.Chmod(fs.real(path), mode))
+}
+
+func (fs *mirrorFS) Chown(path string, uid uint32, gid uint32) int {
+	return errno(syscall.Lchown(fs.real(path), int(uid), int(gid)))
+}
+
+func (fs *mirrorFS) Utimens(path string, tmsp []fuse.Timespec) int {
+	if len(tmsp) < 2 {
+		return errno(syscall.EINVAL)
+	}
+	tv := []syscall.Timeval{
+		{Sec: tmsp[0].Sec, Usec: int32(tmsp[0].Nsec / 1000)},
+		{Sec: tmsp[1].Sec, Usec: int32(tmsp[1].Nsec / 1000)},
+	}
+	return errno(syscall.Utimes(fs.real(path), tv))
+}
+
+// copyStat converts a Go syscall.Stat_t (darwin) into a fuse.Stat_t.
+func copyStat(dst *fuse.Stat_t, src *syscall.Stat_t) {
+	dst.Dev = uint64(src.Dev)
+	dst.Ino = uint64(src.Ino)
+	dst.Mode = uint32(src.Mode)
+	dst.Nlink = uint32(src.Nlink)
+	dst.Uid = src.Uid
+	dst.Gid = src.Gid
+	dst.Rdev = uint64(src.Rdev)
+	dst.Size = src.Size
+	dst.Atim = fuse.Timespec{Sec: src.Atimespec.Sec, Nsec: src.Atimespec.Nsec}
+	dst.Mtim = fuse.Timespec{Sec: src.Mtimespec.Sec, Nsec: src.Mtimespec.Nsec}
+	dst.Ctim = fuse.Timespec{Sec: src.Ctimespec.Sec, Nsec: src.Ctimespec.Nsec}
+	dst.Birthtim = fuse.Timespec{Sec: src.Birthtimespec.Sec, Nsec: src.Birthtimespec.Nsec}
+	dst.Blksize = int64(src.Blksize)
+	dst.Blocks = src.Blocks
+	dst.Flags = src.Flags
+}

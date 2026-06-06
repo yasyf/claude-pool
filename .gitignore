@@ -1,0 +1,24 @@
+# Build artifacts
+/dist/
+/build/
+claude-pool
+clp
+*.test
+*.out
+coverage.txt
+
+# Local state that should never be committed
+*.db
+*.db-wal
+*.db-shm
+*.sock
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go
+/vendor/

@@ -1,0 +1,142 @@
+# claude-pool
+
+**Predictive, start-of-session load-balancing across multiple Claude subscriptions — for macOS.**
+
+If you have several Claude Max/Pro subscriptions, `claude-pool` launches each
+session on the **emptiest** account, so you stop hitting 5-hour and weekly
+limits on one account while another sits idle:
+
+```sh
+CLAUDE_CONFIG_DIR=$(clp select) claude
+```
+
+Unlike reactive proxies or manual switchers, `clp select` predicts the best
+account *before* the session starts, from live 5-hour / 7-day usage. Plain
+`claude` keeps working, untouched.
+
+---
+
+## Install
+
+```sh
+brew tap yasyf/claude-pool https://github.com/yasyf/claude-pool
+brew install yasyf/claude-pool/claude-pool
+```
+
+The binary installs as `claude-pool` with a `clp` symlink.
+
+## Quickstart
+
+```sh
+clp init                                   # register ~/.claude as acct-00 (does NOT move it)
+clp add                                    # log in another subscription (acct-01)
+clp add                                    # ...and another (acct-02)
+clp status                                 # live table: per-account 5h/7d remaining, score, sessions
+
+CLAUDE_CONFIG_DIR=$(clp select) claude     # launch on the emptiest account
+claude                                     # plain claude STILL works (acct-00 / ~/.claude)
+```
+
+Make it the default in your shell:
+
+```sh
+alias cl='CLAUDE_CONFIG_DIR=$(clp select) claude'
+```
+
+## How it works
+
+### `~/.claude` is sacred
+
+`~/.claude` is **never moved**. It stays the canonical config dir, so plain
+`claude` keeps working exactly as before. It doubles as **acct-00** and as the
+**shared base** every pooled account mirrors.
+
+### One real config dir per account
+
+Claude Code namespaces its Keychain credential **per config dir**: the default
+`~/.claude` uses the item `Claude Code-credentials`; a custom `CLAUDE_CONFIG_DIR`
+gets a suffixed item `Claude Code-credentials-<hash>`. claude-pool gives each
+account a real, unique dir (`~/.claude.pool/acct-NN`) so each gets its own
+Keychain item and runs on its own **subscription** (never API billing).
+
+> **acct-00 nuance.** Plain `claude` uses the *un-suffixed* default item.
+> Because `CLAUDE_CONFIG_DIR=$(clp select)` *sets* the variable, selecting
+> acct-00 would otherwise make Claude look for a *suffixed* item that doesn't
+> exist. `clp init` therefore mirrors acct-00's credential into a suffixed item
+> and the daemon keeps the two in lockstep, so acct-00 is selectable like any
+> other account while plain `claude` stays untouched.
+
+### Shared overlay
+
+Each account dir presents **all of `~/.claude`** — your `projects/`, `skills/`,
+`settings.json`, `history.jsonl`, etc. — with writes passing straight back, so
+every session shares the same workspace. Two providers:
+
+- **symlink** (default, zero-dependency): symlinks each top-level entry of
+  `~/.claude` into the account dir. `clp sync`/`clp doctor` re-assert links when
+  new entries appear.
+- **fuse** (optional, live mirror): an in-process passthrough mirror mounted via
+  [fuse-t](https://github.com/macos-fuse-t/fuse-t) (kext-less, mounted as you,
+  no root). Auto-includes new entries with no re-sync. Requires a
+  `-tags fuse` build and a one-time *Network Volumes* privacy grant.
+
+A small set of instance-local entries (`daemon/`, `ide/`) are **not** shared —
+they hold Claude's own PID-keyed supervisor and IDE lock/socket files, which
+would conflict across concurrent sessions. Each account gets its own.
+
+### Scoring
+
+```
+score = 0.70·(100−util_5h) + 0.25·(100−util_7d)
+      − 2·active_sessions − 100·rate_limited − 20·stale_or_refresh_failed
+```
+
+`select` picks argmax; ties break toward the soonest 5-hour reset. Usage comes
+from Claude's own `/api/oauth/usage` endpoint.
+
+### The daemon
+
+`clp service install` runs a **user LaunchAgent** (a root daemon couldn't read
+your login Keychain). It polls usage every ~45s, refreshes **idle** accounts'
+tokens before they expire (a checked-out session owns its own refresh; the
+daemon re-reads and adopts whatever token it rotated to on check-in), caches
+scores, and — with the fuse overlay — owns the mount lifecycle. With the daemon
+running, `clp select` is a sub-millisecond cache read.
+
+No secrets are ever stored in claude-pool's database — the macOS Keychain is the
+only secret store.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `clp init` | Register `~/.claude` as acct-00; set up the pool; offer to install the daemon |
+| `clp add` | Pool another subscription (interactive `claude /login`) |
+| `clp select` | Print the emptiest account's config dir (stdout only) — the hot path |
+| `clp run -- <args>` | Select an account and exec `claude`, owning the session lifecycle |
+| `clp status [-w]` | Live table of usage / score / sessions |
+| `clp list` | Static account list |
+| `clp env [--account N]` | Print `export` lines to launch a specific account |
+| `clp sync` | Re-assert overlays (pick up new `~/.claude` entries) |
+| `clp doctor [--fix]` | Re-validate Keychain items and overlays; repair drift |
+| `clp remove <id>` | Remove an account from the pool |
+| `clp service install\|uninstall\|status` | Manage the daemon LaunchAgent |
+
+## Uninstall
+
+```sh
+clp service uninstall            # stop & remove the daemon, unmount fuse overlays
+clp service uninstall --purge    # ...and remove all pool accounts/dirs/state
+brew uninstall claude-pool
+```
+
+`~/.claude` and its credential are never touched.
+
+## Platform
+
+macOS only (developed against macOS 26.5, Claude Code 2.1.16x). The default
+build is pure Go; the optional fuse overlay needs cgo + fuse-t.
+
+## License
+
+MIT © Yasyf Mohamedali

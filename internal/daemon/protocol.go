@@ -1,0 +1,59 @@
+// Package daemon implements the background user-LaunchAgent: a usage poller,
+// idle-only credential refresher, score cache, and unix-socket server. The CLI
+// hot paths (select/status) talk to it over a 0600 unix socket using the
+// newline-delimited JSON protocol defined here.
+package daemon
+
+import "time"
+
+// ProtocolVersion is bumped on incompatible wire changes.
+const ProtocolVersion = 1
+
+// Op is a request operation.
+type Op string
+
+const (
+	OpSelect  Op = "select"  // pick the best account; optionally mark a checkout
+	OpStatus  Op = "status"  // return scored status for all accounts
+	OpCheckin Op = "checkin" // release a checkout and adopt a rotated token
+	OpHealth  Op = "health"  // liveness + version probe
+	OpRefresh Op = "refresh" // force a usage/refresh cycle now
+)
+
+// Request is one client request (one JSON object per line).
+type Request struct {
+	Proto   int  `json:"proto"`
+	Op      Op   `json:"op"`
+	Account *int `json:"account,omitempty"` // force a specific account (select)
+	PID     int  `json:"pid,omitempty"`     // launching pid (select checkout / checkin)
+	NoMark  bool `json:"no_mark,omitempty"` // select without recording a checkout
+}
+
+// AccountStatus is the per-account view returned by status/select.
+type AccountStatus struct {
+	ID             int       `json:"id"`
+	ConfigDir      string    `json:"config_dir"`
+	Label          string    `json:"label"`
+	IsZero         bool      `json:"is_zero"`
+	OverlayKind    string    `json:"overlay_kind"`
+	Score          float64   `json:"score"`
+	Remaining5h    float64   `json:"remaining_5h"`
+	Remaining7d    float64   `json:"remaining_7d"`
+	ActiveSessions int       `json:"active_sessions"`
+	RateLimited    bool      `json:"rate_limited"`
+	Stale          bool      `json:"stale"`
+	Resets5h       time.Time `json:"resets_5h"`
+	SampleAge      string    `json:"sample_age"`
+}
+
+// Response is one server reply (one JSON object per line).
+type Response struct {
+	Proto        int             `json:"proto"`
+	OK           bool            `json:"ok"`
+	Error        string          `json:"error,omitempty"`
+	Dir          string          `json:"dir,omitempty"` // select: chosen config dir
+	SelectedID   *int            `json:"selected_id,omitempty"`
+	Accounts     []AccountStatus `json:"accounts,omitempty"` // status
+	Version      string          `json:"version,omitempty"`  // health
+	SoonestReset *time.Time      `json:"soonest_reset,omitempty"`
+}

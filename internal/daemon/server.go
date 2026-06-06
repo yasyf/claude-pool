@@ -1,0 +1,347 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/yasyf/claude-pool/internal/overlay"
+	"github.com/yasyf/claude-pool/internal/pool"
+	"github.com/yasyf/claude-pool/internal/score"
+	"github.com/yasyf/claude-pool/internal/store"
+	"github.com/yasyf/claude-pool/internal/version"
+)
+
+// reservationTTL is how long a select-reservation suppresses re-picking the
+// same account before the real claude process is visible to procscan.
+const reservationTTL = 30 * time.Second
+
+// Server is the running daemon.
+type Server struct {
+	m      *pool.Manager
+	socket string
+	log    *log.Logger
+
+	mu           sync.Mutex
+	reservations map[int]time.Time // accountID -> reserved-at
+}
+
+// Run is the entry point for `claude-pool daemon`. It blocks until the process
+// is signalled.
+func Run(ctx context.Context) error {
+	m, err := pool.Open()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+
+	s := &Server{
+		m:            m,
+		socket:       pool.SocketPath(),
+		log:          log.New(os.Stderr, "[claude-pool] ", log.LstdFlags),
+		reservations: map[int]time.Time{},
+	}
+	return s.serve(ctx)
+}
+
+func (s *Server) serve(ctx context.Context) error {
+	ln, err := s.listen()
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	defer os.Remove(s.socket)
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
+	s.establishMounts()
+
+	// Scheduler.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); s.scheduler(ctx) }()
+
+	// Accept loop.
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		go s.handle(conn)
+	}
+
+	wg.Wait()
+	s.teardownMounts()
+	s.log.Printf("daemon stopped")
+	return nil
+}
+
+// listen binds the unix socket with 0600 perms, refusing to start if another
+// live daemon already owns it.
+func (s *Server) listen() (net.Listener, error) {
+	if conn, err := net.DialTimeout("unix", s.socket, 300*time.Millisecond); err == nil {
+		conn.Close()
+		return nil, errors.New("another claude-pool daemon is already running")
+	}
+	_ = os.Remove(s.socket) // clear a stale socket
+	if err := pool.EnsureStateDir(); err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", s.socket)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(s.socket, 0o600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+func (s *Server) handle(conn net.Conn) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	var req Request
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
+		return
+	}
+	resp := s.dispatch(req)
+	resp.Proto = ProtocolVersion
+	writeResp(conn, resp)
+}
+
+func writeResp(conn net.Conn, r Response) {
+	r.Proto = ProtocolVersion
+	_ = json.NewEncoder(conn).Encode(r)
+}
+
+func (s *Server) dispatch(req Request) Response {
+	switch req.Op {
+	case OpHealth:
+		return Response{OK: true, Version: version.String()}
+	case OpStatus:
+		return s.handleStatus()
+	case OpSelect:
+		return s.handleSelect(req)
+	case OpCheckin:
+		return s.handleCheckin(req)
+	case OpRefresh:
+		s.pollOnce(context.Background())
+		return Response{OK: true}
+	default:
+		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
+	}
+}
+
+// handleStatus returns scored snapshots from cached samples (no live fetch).
+func (s *Server) handleStatus() Response {
+	snaps, err := s.m.Snapshots(context.Background(), false, 0)
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true, Accounts: toStatuses(snaps)}
+}
+
+// handleSelect picks the best available account from cached scores, applying
+// short-lived reservations to avoid two selects colliding, and records a
+// reservation for the winner.
+func (s *Server) handleSelect(req Request) Response {
+	snaps, err := s.m.Snapshots(context.Background(), false, 0)
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	if len(snaps) == 0 {
+		return Response{OK: false, Error: pool.ErrNoAccounts.Error()}
+	}
+
+	// Forced account.
+	if req.Account != nil {
+		for _, sn := range snaps {
+			if sn.Account.ID == *req.Account {
+				s.reserve(sn.Account.ID)
+				id := sn.Account.ID
+				return Response{OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id}
+			}
+		}
+		return Response{OK: false, Error: fmt.Sprintf("account %d not found", *req.Account)}
+	}
+
+	best, ok := s.pickWithReservations(snaps)
+	if !ok {
+		soonest := soonestReset(snaps)
+		resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error()}
+		if !soonest.IsZero() {
+			resp.SoonestReset = &soonest
+		}
+		return resp
+	}
+	if !req.NoMark {
+		s.reserve(best.Account.ID)
+		if req.PID > 0 {
+			_, _ = s.m.Store.OpenSession(best.Account.ID, req.PID, best.Account.ConfigDir)
+		}
+	}
+	id := best.Account.ID
+	// Preflight refresh the winner if idle and expiring soon (best-effort).
+	go s.m.PreflightRefresh(context.Background(), best.Account)
+	return Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id}
+}
+
+// handleCheckin closes sessions for a pid and adopts any rotated token.
+func (s *Server) handleCheckin(req Request) Response {
+	sessions, _ := s.m.Store.ListActiveSessions()
+	for _, se := range sessions {
+		if se.PID == req.PID {
+			_ = s.m.Store.CloseSession(se.ID)
+			if a, err := s.m.Store.GetAccount(se.AccountID); err == nil {
+				_ = s.m.AdoptRotatedToken(a)
+			}
+		}
+	}
+	return Response{OK: true}
+}
+
+// reserve records a short-lived reservation for an account.
+func (s *Server) reserve(id int) {
+	s.mu.Lock()
+	s.reservations[id] = time.Now()
+	s.mu.Unlock()
+}
+
+// reservedCount returns the number of live reservations for an account.
+func (s *Server) reservedCount(id int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.reservations[id]
+	if !ok {
+		return 0
+	}
+	if time.Since(t) > reservationTTL {
+		delete(s.reservations, id)
+		return 0
+	}
+	return 1
+}
+
+// pickWithReservations re-ranks snapshots with reservation penalties applied.
+func (s *Server) pickWithReservations(snaps []pool.Snapshot) (pool.Snapshot, bool) {
+	bySnap := map[int]pool.Snapshot{}
+	inputs := make([]score.Input, 0, len(snaps))
+	for _, sn := range snaps {
+		bySnap[sn.Account.ID] = sn
+		inputs = append(inputs, score.Input{
+			AccountID:      sn.Account.ID,
+			HasUsage:       sn.HasUsage,
+			SampleTS:       time.Now().Add(-sn.SampleAge),
+			Util5h:         sn.Util5h,
+			Util7d:         sn.Util7d,
+			Resets5h:       sn.Resets5h,
+			ActiveSessions: sn.ActiveSessions + s.reservedCount(sn.Account.ID),
+			RateLimited:    sn.RateLimited,
+			RefreshFailed:  sn.Stale && !sn.HasUsage,
+		})
+	}
+	ranked := score.Rank(inputs, time.Now())
+	r, ok := score.Pick(ranked)
+	if !ok {
+		return pool.Snapshot{}, false
+	}
+	return bySnap[r.AccountID], true
+}
+
+func soonestReset(snaps []pool.Snapshot) time.Time {
+	var best time.Time
+	for _, sn := range snaps {
+		if sn.Resets5h.IsZero() {
+			continue
+		}
+		if best.IsZero() || sn.Resets5h.Before(best) {
+			best = sn.Resets5h
+		}
+	}
+	return best
+}
+
+// toStatuses converts snapshots into wire AccountStatus values.
+func toStatuses(snaps []pool.Snapshot) []AccountStatus {
+	out := make([]AccountStatus, 0, len(snaps))
+	for _, sn := range snaps {
+		out = append(out, AccountStatus{
+			ID:             sn.Account.ID,
+			ConfigDir:      sn.Account.ConfigDir,
+			Label:          sn.Account.Label,
+			IsZero:         sn.Account.IsZero,
+			OverlayKind:    sn.Account.OverlayKind,
+			Score:          sn.Score,
+			Remaining5h:    sn.Remaining5h,
+			Remaining7d:    sn.Remaining7d,
+			ActiveSessions: sn.ActiveSessions,
+			RateLimited:    sn.RateLimited,
+			Stale:          sn.Stale,
+			Resets5h:       sn.Resets5h,
+			SampleAge:      sn.SampleAge.Round(time.Second).String(),
+		})
+	}
+	return out
+}
+
+// establishMounts brings up fuse mounts for fuse-kind accounts at startup.
+func (s *Server) establishMounts() {
+	accts, err := s.m.Store.ListAccounts()
+	if err != nil {
+		return
+	}
+	for _, a := range accts {
+		if a.IsZero || a.OverlayKind != string(overlay.KindFuse) {
+			continue
+		}
+		prov := overlay.For(overlay.KindFuse)
+		if err := prov.Setup(pool.ClaudeDir(), a.ConfigDir); err != nil {
+			s.log.Printf("acct-%02d mount failed, falling back to symlink: %v", a.ID, err)
+			s.fallbackToSymlink(a)
+		}
+	}
+}
+
+// teardownMounts unmounts fuse mounts on shutdown.
+func (s *Server) teardownMounts() {
+	accts, err := s.m.Store.ListAccounts()
+	if err != nil {
+		return
+	}
+	for _, a := range accts {
+		if a.IsZero || a.OverlayKind != string(overlay.KindFuse) {
+			continue
+		}
+		_ = overlay.For(overlay.KindFuse).Teardown(pool.ClaudeDir(), a.ConfigDir)
+	}
+}
+
+// fallbackToSymlink switches an account to the symlink provider after a mount
+// failure so its dir is still usable.
+func (s *Server) fallbackToSymlink(a store.Account) {
+	if err := (overlay.For(overlay.KindSymlink)).Setup(pool.ClaudeDir(), a.ConfigDir); err != nil {
+		s.log.Printf("acct-%02d symlink fallback failed: %v", a.ID, err)
+		return
+	}
+	a.OverlayKind = string(overlay.KindSymlink)
+	_ = s.m.Store.UpsertAccount(a)
+}

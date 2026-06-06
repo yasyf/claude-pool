@@ -1,0 +1,78 @@
+package daemon
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"net"
+	"time"
+
+	"github.com/yasyf/claude-pool/internal/pool"
+)
+
+// ErrDaemonUnavailable means the daemon socket could not be reached.
+var ErrDaemonUnavailable = errors.New("daemon not running")
+
+// Client is a short-lived connection to the daemon socket.
+type Client struct {
+	socket string
+}
+
+// NewClient returns a client for the default socket path.
+func NewClient() *Client { return &Client{socket: pool.SocketPath()} }
+
+// Available reports whether the daemon socket accepts a connection.
+func (c *Client) Available() bool {
+	conn, err := net.DialTimeout("unix", c.socket, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// do sends one request and reads one response.
+func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
+	conn, err := net.DialTimeout("unix", c.socket, 500*time.Millisecond)
+	if err != nil {
+		return nil, ErrDaemonUnavailable
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	req.Proto = ProtocolVersion
+	enc := json.NewEncoder(conn)
+	if err := enc.Encode(req); err != nil {
+		return nil, err
+	}
+	var resp Response
+	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// Select asks the daemon for the best account dir. ok=false means the caller
+// should fall back to a live, daemonless selection.
+func (c *Client) Select(account *int, pid int, noMark bool) (resp *Response, ok bool) {
+	r, err := c.do(Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark}, 3*time.Second)
+	if err != nil {
+		return nil, false
+	}
+	return r, true
+}
+
+// Status asks the daemon for all account statuses.
+func (c *Client) Status() (*Response, error) {
+	return c.do(Request{Op: OpStatus}, 5*time.Second)
+}
+
+// Checkin releases a checkout for pid.
+func (c *Client) Checkin(pid int) (*Response, error) {
+	return c.do(Request{Op: OpCheckin, PID: pid}, 3*time.Second)
+}
+
+// Health probes the daemon.
+func (c *Client) Health() (*Response, error) {
+	return c.do(Request{Op: OpHealth}, 2*time.Second)
+}

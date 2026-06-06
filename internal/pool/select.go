@@ -1,0 +1,149 @@
+package pool
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/yasyf/claude-pool/internal/procscan"
+	"github.com/yasyf/claude-pool/internal/score"
+	"github.com/yasyf/claude-pool/internal/store"
+)
+
+// ErrNoAccounts means the pool is empty (run `clp init`/`clp add`).
+var ErrNoAccounts = errors.New("no accounts in the pool")
+
+// ErrNoneAvailable means every account is currently rate-limited.
+var ErrNoneAvailable = errors.New("no account is currently available (all rate-limited)")
+
+// SelectOptions tunes a selection.
+type SelectOptions struct {
+	// Live samples usage synchronously for accounts whose latest sample is
+	// older than FreshFor (the M2/no-daemon path). When false, only cached
+	// samples are used (the daemon keeps them fresh).
+	Live bool
+	// FreshFor is the cache window for Live sampling.
+	FreshFor time.Duration
+}
+
+// DefaultFreshFor is the default cache window for live selection.
+const DefaultFreshFor = 60 * time.Second
+
+// SelectResult is a ranked selection outcome.
+type SelectResult struct {
+	Best   store.Account
+	Result score.Result
+	Ranked []score.Result
+	byID   map[int]store.Account
+}
+
+// Account returns the account for a ranked result.
+func (sr *SelectResult) Account(id int) (store.Account, bool) {
+	a, ok := sr.byID[id]
+	return a, ok
+}
+
+// Select scores all accounts and returns the best available one.
+func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult, error) {
+	accts, err := m.Store.ListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	if len(accts) == 0 {
+		return nil, ErrNoAccounts
+	}
+
+	sessions, _ := procscan.Scan() // best-effort; nil on error
+
+	if opts.Live {
+		m.sampleStale(ctx, accts, sessions, opts.FreshFor)
+	}
+
+	now := time.Now()
+	inputs := make([]score.Input, 0, len(accts))
+	byID := make(map[int]store.Account, len(accts))
+	for _, a := range accts {
+		byID[a.ID] = a
+		in, err := m.scoreInput(a, sessions, now)
+		if err != nil {
+			return nil, err
+		}
+		inputs = append(inputs, in)
+	}
+
+	ranked := score.Rank(inputs, now)
+	best, ok := score.Pick(ranked)
+	if !ok {
+		return &SelectResult{Ranked: ranked, byID: byID}, ErrNoneAvailable
+	}
+	return &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked, byID: byID}, nil
+}
+
+// sampleStale concurrently refreshes usage for accounts whose latest sample is
+// older than freshFor. Accounts with a live session are sampled WITHOUT
+// refreshing their token (that session owns refresh).
+func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessions []procscan.Session, freshFor time.Duration) {
+	if freshFor <= 0 {
+		freshFor = DefaultFreshFor
+	}
+	now := time.Now()
+	var wg sync.WaitGroup
+	for _, a := range accts {
+		if s, ok, _ := m.Store.LatestUsageSample(a.ID); ok && now.Sub(s.TS) < freshFor {
+			continue // fresh enough
+		}
+		a := a
+		allowRefresh := procscan.CountByConfigDir(sessions, a.ConfigDir, m.DefaultDir) == 0
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			defer cancel()
+			_, _, _ = m.SampleUsage(cctx, a, allowRefresh)
+		}()
+	}
+	wg.Wait()
+}
+
+// scoreInput assembles a score.Input for one account from cached state.
+func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, error) {
+	in := score.Input{AccountID: a.ID}
+	if s, ok, err := m.Store.LatestUsageSample(a.ID); err != nil {
+		return in, err
+	} else if ok {
+		in.HasUsage = true
+		in.SampleTS = s.TS
+		in.Util5h = s.Util5h
+		in.Util7d = s.Util7d
+		in.Resets5h = s.Resets5h
+		in.RateLimited = s.RateLimited
+	}
+	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir, m.DefaultDir)
+	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && !r.OK {
+		in.RefreshFailed = true
+	}
+	return in, nil
+}
+
+// PreflightRefresh refreshes the chosen account's token if it expires within
+// RefreshLeadTime and the account is idle, so the launched session starts with
+// a healthy token. Errors are returned but non-fatal to the caller.
+func (m *Manager) PreflightRefresh(ctx context.Context, a store.Account) error {
+	sessions, _ := procscan.Scan()
+	idle := procscan.CountByConfigDir(sessions, a.ConfigDir, m.DefaultDir) == 0
+	if !idle {
+		return nil
+	}
+	_, _, err := m.EnsureFreshToken(ctx, a, RefreshLeadTime, true)
+	if err != nil && !errors.Is(err, ErrNeedsLogin) {
+		return fmt.Errorf("preflight refresh: %w", err)
+	}
+	return err
+}
+
+// SoonestReset returns the earliest 5h reset across the pool, for `--wait`.
+func (sr *SelectResult) SoonestReset() (time.Time, bool) {
+	return score.SoonestReset(sr.Ranked)
+}

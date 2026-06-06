@@ -1,0 +1,66 @@
+package keychain
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// OAuth is the inner object Claude Code stores under the "claudeAiOauth" key.
+// Field names and the wrapper key are reverse-engineered from the v2.1.x
+// binary and MUST match exactly, byte-for-byte, or Claude will not recognize
+// the credential.
+type OAuth struct {
+	AccessToken      string   `json:"accessToken"`
+	RefreshToken     string   `json:"refreshToken"`
+	ExpiresAt        int64    `json:"expiresAt"` // Unix epoch MILLISECONDS
+	Scopes           []string `json:"scopes,omitempty"`
+	SubscriptionType string   `json:"subscriptionType,omitempty"`
+	RateLimitTier    string   `json:"rateLimitTier,omitempty"`
+	ClientID         string   `json:"clientId,omitempty"`
+}
+
+// Credential is the full JSON blob stored as the Keychain secret:
+//
+//	{"claudeAiOauth": { ...OAuth... }}
+type Credential struct {
+	ClaudeAiOauth OAuth `json:"claudeAiOauth"`
+}
+
+// Expiry returns the access-token expiry as a time.Time.
+func (c *Credential) Expiry() time.Time {
+	return time.UnixMilli(c.ClaudeAiOauth.ExpiresAt)
+}
+
+// ExpiresWithin reports whether the access token expires within d from now.
+func (c *Credential) ExpiresWithin(d time.Duration) bool {
+	return time.Until(c.Expiry()) <= d
+}
+
+// HasRefreshToken reports whether a usable refresh token is present. Claude
+// clears the refresh token to "" when it detects a dead token, so an empty
+// value means re-login is required.
+func (c *Credential) HasRefreshToken() bool {
+	return c.ClaudeAiOauth.RefreshToken != ""
+}
+
+// Marshal renders the credential as the exact JSON bytes Claude expects.
+func (c *Credential) Marshal() ([]byte, error) {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("marshal credential: %w", err)
+	}
+	return b, nil
+}
+
+// parseCredential decodes the Keychain secret bytes into a Credential.
+func parseCredential(b []byte) (*Credential, error) {
+	var c Credential
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, fmt.Errorf("parse credential blob: %w", err)
+	}
+	if c.ClaudeAiOauth.AccessToken == "" {
+		return nil, fmt.Errorf("credential blob has no accessToken")
+	}
+	return &c, nil
+}
