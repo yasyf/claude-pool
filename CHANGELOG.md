@@ -6,8 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-06
+
 ### Changed
+- Homebrew installs now ship the prebuilt universal binary from GitHub
+  Releases — no Go toolchain download or compile. The formula picks the fuse
+  (live-mirror) build when fuse-t is present at install time; `brew install
+  --HEAD` still builds from source.
 - Relicensed from MIT to PolyForm Noncommercial 1.0.0.
+
+## [0.2.0] - 2026-06-06
+
+### Fixed
+- Concurrency hardening: serialized each account's credential
+  read→refresh→write cycle, made idle polling reservation-aware, tracked
+  handler/preflight goroutines in daemon shutdown, and threaded the daemon
+  lifecycle ctx into request handlers.
 
 ## [0.1.0] - 2026-06-06
 
@@ -27,5 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mount lifecycle.
 - Homebrew formula with `clp` symlink; CI and release workflows.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/yasyf/cc-pool/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/yasyf/cc-pool/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yasyf/cc-pool/releases/tag/v0.1.0

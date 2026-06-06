@@ -10,6 +10,9 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
+    outputs:
+      pure_sha256: ${{ steps.shas.outputs.pure }}
+      fuse_sha256: ${{ steps.shas.outputs.fuse }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,21 +21,57 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Build universal binary (pure Go, arm64 + amd64 via lipo)
+      - name: Install fuse-t (build-time headers for the -tags fuse variant)
+        run: brew install macos-fuse-t/cask/fuse-t
+
+      - name: Build universal binaries (pure Go + fuse, arm64 + amd64 via lipo)
         run: |
           VERSION="${GITHUB_REF_NAME}"
           COMMIT="$(git rev-parse --short HEAD)"
           LDFLAGS="-s -w -X github.com/yasyf/cc-pool/internal/version.Version=${VERSION} -X github.com/yasyf/cc-pool/internal/version.Commit=${COMMIT}"
-          mkdir -p dist
-          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/cc-pool-arm64 ./cmd/cc-pool
-          CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/cc-pool-amd64 ./cmd/cc-pool
-          lipo -create -output dist/cc-pool dist/cc-pool-arm64 dist/cc-pool-amd64
+          mkdir -p dist/pure dist/fuse dist/arm64
+
+          # Pure Go (symlink overlay; the default install).
+          CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/pure-arm64 ./cmd/cc-pool
+          CGO_ENABLED=0 GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/pure-amd64 ./cmd/cc-pool
+          lipo -create -output dist/pure/cc-pool dist/pure-arm64 dist/pure-amd64
+
+          # Fuse variant (live-mirror overlay): cgo, dlopens libfuse-t at
+          # runtime. The amd64 slice cross-compiles — the macOS SDK is fat.
+          export CGO_CFLAGS="-mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0"
+          CGO_ENABLED=1 GOARCH=arm64 go build -tags fuse -ldflags "$LDFLAGS" -o dist/fuse-arm64 ./cmd/cc-pool
+          CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" go build -tags fuse -ldflags "$LDFLAGS" -o dist/fuse-amd64 ./cmd/cc-pool
+          lipo -create -output dist/fuse/cc-pool dist/fuse-arm64 dist/fuse-amd64
+
+          # Re-apply ad-hoc signatures post-lipo (mandatory on arm64), then
+          # smoke-test that the native slices load and report the right version.
+          codesign --force -s - dist/pure/cc-pool dist/fuse/cc-pool
+          dist/pure/cc-pool --version | grep -q "${VERSION}"
+          dist/fuse/cc-pool --version | grep -q "${VERSION}"
+
+          # Every tarball contains a binary named exactly `cc-pool`.
+          cp dist/pure-arm64 dist/arm64/cc-pool
+          tar -czf "dist/cc-pool-${VERSION}-darwin-universal.tar.gz" -C dist/pure cc-pool
+          tar -czf "dist/cc-pool-${VERSION}-darwin-universal-fuse.tar.gz" -C dist/fuse cc-pool
+          tar -czf "dist/cc-pool-${VERSION}-darwin-arm64.tar.gz" -C dist/arm64 cc-pool
           cd dist
-          tar -czf cc-pool-${VERSION}-darwin-universal.tar.gz cc-pool
-          tar -czf cc-pool-${VERSION}-darwin-arm64.tar.gz -s '/cc-pool-arm64/cc-pool/' cc-pool-arm64 2>/dev/null || \
-            { cp cc-pool-arm64 cc-pool && tar -czf cc-pool-${VERSION}-darwin-arm64.tar.gz cc-pool && rm cc-pool; }
-          shasum -a 256 *.tar.gz > SHA256SUMS.txt
+          shasum -a 256 -- *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      - name: Export tarball checksums for the formula bump
+        id: shas
+        run: |
+          cd dist
+          PURE="$(grep -E 'darwin-universal\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
+          FUSE="$(grep -E 'darwin-universal-fuse\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
+          test -n "$PURE" && test -n "$FUSE"
+          echo "pure=${PURE}" >> "$GITHUB_OUTPUT"
+          echo "fuse=${FUSE}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarballs
+          path: dist/*.tar.gz
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -41,28 +80,58 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS.txt
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  smoke-no-fuse:
+    # The fuse binary dlopens libfuse-t.dylib lazily and must run cleanly on a
+    # Mac WITHOUT fuse-t. A fresh runner has none — prove it before release.
+    runs-on: macos-15
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarballs
+
+      - name: Run the fuse binary without fuse-t installed
+        run: |
+          test ! -f /usr/local/lib/libfuse-t.dylib
+          tar -xzf "cc-pool-${GITHUB_REF_NAME}-darwin-universal-fuse.tar.gz"
+          ./cc-pool --version
+          ./cc-pool --help | grep -q "emptiest account"
 
   bump-formula:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, smoke-no-fuse]
+    # Prerelease tags (v1.2.3-rc.1) publish assets but never touch the formula.
+    if: ${{ !contains(github.ref_name, '-') }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Bump Formula to tagged source tarball
+      - name: Bump Formula to the release binary tarballs
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          TARBALL_URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
-          # The tag tarball is immutable; its sha256 is stable.
-          curl -fsSL "$TARBALL_URL" -o /tmp/src.tar.gz
-          SHA="$(shasum -a 256 /tmp/src.tar.gz | awk '{print $1}')"
+          PURE_SHA="${{ needs.build.outputs.pure_sha256 }}"
+          FUSE_SHA="${{ needs.build.outputs.fuse_sha256 }}"
+          test -n "$PURE_SHA" && test -n "$FUSE_SHA"
           F=Formula/cc-pool.rb
-          sed -i -E "s|url \".*\"|url \"${TARBALL_URL}\"|" "$F"
-          sed -i -E "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${SHA}\"|" "$F"
+          # Rewrite the release version embedded in both download urls (brew
+          # infers the formula version from the /vX.Y.Z/ path segment).
+          sed -i -E "/releases\/download/ s|v[0-9]+\.[0-9]+\.[0-9]+|v${VERSION}|g" "$F"
+          sed -i -E "s|sha256 \"[0-9a-f]{64}\" # pure|sha256 \"${PURE_SHA}\" # pure|" "$F"
+          sed -i -E "s|sha256 \"[0-9a-f]{64}\" # fuse|sha256 \"${FUSE_SHA}\" # fuse|" "$F"
+          # Fail loud if a sed anchor stopped matching; allow idempotent re-runs.
+          grep -q "releases/download/v${VERSION}/" "$F"
+          grep -q "${PURE_SHA}\" # pure" "$F"
+          grep -q "${FUSE_SHA}\" # fuse" "$F"
+          if git diff --quiet; then
+            echo "formula already at ${GITHUB_REF_NAME}; nothing to push"
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$F"
-          git commit -m "Formula: bump to ${GITHUB_REF_NAME} (${SHA})" || echo "no formula change"
+          git commit -m "Formula: bump to ${GITHUB_REF_NAME}"
           git push origin main
