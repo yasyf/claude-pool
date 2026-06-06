@@ -22,17 +22,21 @@ func newAddCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "add",
 		Short: "Pool one or more Claude subscriptions (interactive login)",
-		Long: `add allocates a new account dir, sets up its overlay onto ~/.claude, then
-walks you through logging that account in. After login it discovers the
-account's Keychain item, takes over its ACL for prompt-free refresh, validates
-with one usage call, and records it.
+		Long: `add allocates a new account dir, sets up its overlay onto ~/.claude, seeds
+the account's .claude.json from ~/.claude.json (so the session inherits your
+settings and skips first-run onboarding), then walks you through logging that
+account in. After login it discovers the account's Keychain item, takes over
+its ACL for prompt-free refresh, validates with one usage call, and records it.
+
+On a fresh machine it also initializes the pool (~/.cc-pool) and starts the
+background daemon automatically — no separate ` + "`clp init`" + ` needed.
 
 Run interactively it loops, offering to add another account after each one. Use
 --count to add a fixed number, or -y to add a single account without prompts.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
-				if err := requireInit(m); err != nil {
+				if err := ensureReady(cmd, m); err != nil {
 					return err
 				}
 				var added []store.Account
@@ -66,6 +70,24 @@ Run interactively it loops, offering to add another account after each one. Use
 	return cmd
 }
 
+// ensureReady auto-initializes the pool and starts the daemon, so `clp add`
+// works from a fresh machine with no prior `clp init`.
+func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
+	ok, err := m.Initialized()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		res, err := m.Init()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "✓ Pool initialized (~/.cc-pool, overlay: %s)\n", res.OverlayKind)
+	}
+	ensureDaemon(cmd)
+	return nil
+}
+
 // addOne runs the full prepare → login → finalize flow for a single account.
 func addOne(cmd *cobra.Command, m *pool.Manager, label string, runNow bool) (*store.Account, error) {
 	out := cmd.OutOrStdout()
@@ -75,6 +97,15 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, runNow bool) (*st
 	}
 	fmt.Fprintf(out, "Allocated acct-%02d → %s (overlay: %s)\n",
 		pending.Index, pending.ConfigDir, pending.OverlayKind)
+	switch pending.ClaudeJSONSeed {
+	case pool.SeedCopied:
+		fmt.Fprintln(out, dimStyle.Render("  seeded .claude.json (settings + onboarding inherited; login sets the account)"))
+	case pool.SeedNoSource:
+		fmt.Fprintln(out, "  note: no ~/.claude.json found — claude will run first-run onboarding for this account")
+	case pool.SeedKeptExisting:
+		fmt.Fprintln(out, "  note: this dir already holds a logged-in .claude.json from an earlier attempt;")
+		fmt.Fprintln(out, "  logging in again is safe — or pick the manual option and just continue to reuse it")
+	}
 
 	doRun := runNow
 	if isTTY() && !runNow {

@@ -39,15 +39,18 @@ func TestParse(t *testing.T) {
 
 func TestCountByConfigDir(t *testing.T) {
 	sessions := parse(sample)
-	defaultDir := "/Users/me/.claude"
-	// acct-00: matched by empty env (pid 777) AND explicit ~/.claude (pid 1010).
-	if n := CountByConfigDir(sessions, defaultDir, defaultDir); n != 2 {
-		t.Errorf("acct-00 count = %d, want 2", n)
+	cases := map[string]struct {
+		configDir string
+		want      int
+	}{
+		"exact match":           {"/Users/me/.cc-pool/accounts/acct-01", 1},
+		"no sessions for dir":   {"/Users/me/.cc-pool/accounts/acct-99", 0},
+		"explicit ~/.claude":    {"/Users/me/.claude", 1}, // pid 1010 only; never a pool account
+		"empty matches nothing": {"", 0},                  // plain claude (pid 777) maps to no pool account
 	}
-	if n := CountByConfigDir(sessions, "/Users/me/.cc-pool/accounts/acct-01", defaultDir); n != 1 {
-		t.Errorf("acct-01 count = %d, want 1", n)
-	}
-	if n := CountByConfigDir(sessions, "/Users/me/.cc-pool/accounts/acct-99", defaultDir); n != 0 {
-		t.Errorf("acct-99 count = %d, want 0", n)
+	for name, tc := range cases {
+		if n := CountByConfigDir(sessions, tc.configDir); n != tc.want {
+			t.Errorf("%s: CountByConfigDir(%q) = %d, want %d", name, tc.configDir, n, tc.want)
+		}
 	}
 }

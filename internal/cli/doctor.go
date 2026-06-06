@@ -92,27 +92,6 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 		report(prefix+" keychain", true, "")
 	}
 
-	// acct-00 mirror must stay in sync with the canonical default item.
-	if a.IsZero {
-		canon, cerr := keychain.Read(keychain.DefaultServiceName(), a.KeychainAccount)
-		mirror, merr := keychain.Read(a.KeychainService, a.KeychainAccount)
-		inSync := cerr == nil && merr == nil && canon.ClaudeAiOauth.AccessToken == mirror.ClaudeAiOauth.AccessToken
-		if !inSync && fix && cerr == nil {
-			if werr := keychain.Write(a.KeychainService, a.KeychainAccount, canon); werr == nil {
-				report(prefix+" mirror", true, "re-synced from canonical")
-			} else {
-				report(prefix+" mirror", false, werr.Error())
-			}
-		} else {
-			detail := ""
-			if !inSync {
-				detail = "drifted from ~/.claude credential"
-			}
-			report(prefix+" mirror", inSync, detail)
-		}
-		return // acct-00 has no overlay to check
-	}
-
 	// Overlay health.
 	prov := overlay.For(overlay.Kind(a.OverlayKind))
 	if err := prov.Health(pool.ClaudeDir(), a.ConfigDir); err != nil {

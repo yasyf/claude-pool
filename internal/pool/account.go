@@ -12,63 +12,39 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// ErrNotLoggedIn means plain `claude` has no stored credential, so there is
-// nothing to register as acct-00.
-var ErrNotLoggedIn = errors.New("no Claude credential found — run `claude` and log in first")
+// ErrNotInitialized means the pool has not been set up yet (`clp init` or
+// `clp add`'s auto-init).
+var ErrNotInitialized = errors.New("pool not initialized")
 
 // InitResult summarizes what `clp init` did.
 type InitResult struct {
-	OverlayKind   overlay.Kind
-	MirrorService string
-	Account       store.Account
+	OverlayKind overlay.Kind
+	Already     bool // the pool was already initialized
 }
 
-// Init registers ~/.claude as acct-00 without moving it. It confirms a
-// credential exists, mirrors that credential into a suffixed Keychain item so
-// acct-00 is launchable via CLAUDE_CONFIG_DIR=~/.claude, picks an overlay
-// provider, and records the account. Idempotent.
-func (m *Manager) Init(ctx context.Context) (*InitResult, error) {
+// Init prepares the pool: ~/.cc-pool state dirs, the overlay provider choice
+// for new accounts, and the initialized marker. It never touches ~/.claude or
+// the Keychain — accounts (including the user's main subscription) join via
+// Add with their own independent login. Idempotent.
+func (m *Manager) Init() (*InitResult, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err
 	}
 	if err := EnsureAccountsDir(); err != nil {
 		return nil, err
 	}
-
-	defaultSvc := keychain.DefaultServiceName()
-	account, err := keychain.DiscoverAccount(defaultSvc)
-	if errors.Is(err, keychain.ErrNotFound) {
-		return nil, ErrNotLoggedIn
-	} else if err != nil {
-		return nil, fmt.Errorf("discover default keychain item: %w", err)
-	}
-
-	// Read the canonical credential and mirror it into the suffixed item keyed
-	// on the literal path clp will emit for acct-00.
-	canonical, err := keychain.Read(defaultSvc, account)
+	already, err := m.Initialized()
 	if err != nil {
-		return nil, fmt.Errorf("read default credential: %w", err)
-	}
-	mirrorSvc := keychain.ServiceName(ClaudeDir())
-	if err := keychain.Write(mirrorSvc, account, canonical); err != nil {
-		return nil, fmt.Errorf("write acct-00 mirror item: %w", err)
-	}
-
-	kind := overlay.Detect()
-	acct := store.Account{
-		ID:              AcctZero,
-		ConfigDir:       ClaudeDir(),
-		KeychainService: mirrorSvc,
-		KeychainAccount: account,
-		Label:           "acct-00 (~/.claude)",
-		OverlayKind:     string(kind),
-		IsZero:          true,
-		CreatedAt:       time.Now(),
-	}
-	if err := m.Store.UpsertAccount(acct); err != nil {
 		return nil, err
 	}
-	return &InitResult{OverlayKind: kind, MirrorService: mirrorSvc, Account: acct}, nil
+	kind, err := m.ensureOverlayKind()
+	if err != nil {
+		return nil, err
+	}
+	if err := m.Store.SetMeta(metaInitialized, "1"); err != nil {
+		return nil, err
+	}
+	return &InitResult{OverlayKind: kind, Already: already}, nil
 }
 
 // PendingAdd describes a half-created account awaiting interactive login.
@@ -78,28 +54,39 @@ type PendingAdd struct {
 	KeychainService string
 	OverlayKind     overlay.Kind
 	LoginCommand    string
+	ClaudeJSONSeed  SeedOutcome
 }
 
-// PrepareAdd allocates the next account dir and establishes its overlay, then
-// returns the login command the user must run. No account row or Keychain item
-// is created yet — FinalizeAdd does that once the login lands.
+// PrepareAdd allocates the next account dir, establishes its overlay, and
+// seeds its private .claude.json from plain claude's (~/.claude.json) so the
+// login session inherits onboarding state and settings instead of running the
+// first-run wizard. It returns the login command the user must run. No account
+// row or Keychain item is created yet — FinalizeAdd does that once the login
+// lands.
 func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	ok, err := m.Initialized()
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, errors.New("run `clp init` first")
+		return nil, ErrNotInitialized
 	}
 	n, err := m.Store.NextAccountIndex()
 	if err != nil {
 		return nil, err
 	}
 	acctDir := AccountDir(n)
-	kind := m.overlayKind()
+	kind, err := m.ensureOverlayKind()
+	if err != nil {
+		return nil, err
+	}
 	prov := overlay.For(kind)
 	if err := prov.Setup(ClaudeDir(), acctDir); err != nil {
 		return nil, fmt.Errorf("set up overlay for %s: %w", acctDir, err)
+	}
+	seed, err := seedClaudeJSON(prov, acctDir, ClaudeJSONPath())
+	if err != nil {
+		return nil, fmt.Errorf("seed .claude.json for %s: %w", acctDir, err)
 	}
 	svc := keychain.ServiceName(acctDir)
 	return &PendingAdd{
@@ -108,6 +95,7 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		KeychainService: svc,
 		OverlayKind:     kind,
 		LoginCommand:    fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude /login", acctDir),
+		ClaudeJSONSeed:  seed,
 	}, nil
 }
 
@@ -135,7 +123,6 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 		KeychainAccount: account,
 		Label:           label,
 		OverlayKind:     string(p.OverlayKind),
-		IsZero:          false,
 		CreatedAt:       time.Now(),
 	}
 	if err := m.Store.UpsertAccount(acct); err != nil {
@@ -153,59 +140,68 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 // AbandonAdd cleans up a prepared-but-not-finalized account dir. p must be a
 // non-nil PendingAdd returned by PrepareAdd.
 func (m *Manager) AbandonAdd(p *PendingAdd) error {
-	if p.Index == AcctZero {
-		return nil
-	}
-	prov := overlay.For(p.OverlayKind)
-	if err := prov.Teardown(ClaudeDir(), p.ConfigDir); err != nil {
-		return err
-	}
-	return os.RemoveAll(p.ConfigDir)
+	return m.removeAccountDir(overlay.For(p.OverlayKind), p.ConfigDir)
 }
 
 // Remove deletes an account from the pool: tears down its overlay, removes its
-// suffixed Keychain item, and deletes its rows. acct-00's canonical ~/.claude
-// and its default Keychain item are NEVER touched (only its mirror item).
+// Keychain item, and deletes its rows. ~/.claude is never touched (it is not
+// an account).
 func (m *Manager) Remove(id int, deleteCredential bool) error {
 	a, err := m.Store.GetAccount(id)
 	if err != nil {
 		return err
 	}
-	if a.IsZero {
-		// Only remove the mirror item; never the canonical default item or dir.
-		_ = keychain.Delete(a.KeychainService, a.KeychainAccount)
-		return m.Store.DeleteAccount(id)
-	}
 	prov := overlay.For(overlay.Kind(a.OverlayKind))
-	if err := prov.Teardown(ClaudeDir(), a.ConfigDir); err != nil {
-		return fmt.Errorf("teardown overlay: %w", err)
-	}
-	if err := os.RemoveAll(a.ConfigDir); err != nil {
-		return fmt.Errorf("remove account dir: %w", err)
+	if err := m.removeAccountDir(prov, a.ConfigDir); err != nil {
+		return err
 	}
 	if deleteCredential {
-		_ = keychain.Delete(a.KeychainService, a.KeychainAccount)
+		if err := m.Keychain.Delete(a.KeychainService, a.KeychainAccount); err != nil {
+			return fmt.Errorf("delete keychain item %q: %w", a.KeychainService, err)
+		}
 	}
 	return m.Store.DeleteAccount(id)
 }
 
+// removeAccountDir tears down an account dir's overlay and removes the dir and
+// its private backing (when the provider keeps one beside the dir, as fuse
+// does). Teardown refusing to operate (e.g. a wedged unmount) aborts the
+// removal so we never RemoveAll through a live mount into the base.
+func (m *Manager) removeAccountDir(prov overlay.Provider, configDir string) error {
+	if err := prov.Teardown(ClaudeDir(), configDir); err != nil {
+		return fmt.Errorf("teardown overlay: %w", err)
+	}
+	if err := os.RemoveAll(configDir); err != nil {
+		return fmt.Errorf("remove account dir: %w", err)
+	}
+	if priv := prov.PrivateRoot(configDir); priv != configDir {
+		if err := os.RemoveAll(priv); err != nil {
+			return fmt.Errorf("remove private backing dir: %w", err)
+		}
+	}
+	return nil
+}
+
 // SyncOverlay re-asserts an account's overlay so it reflects the current
 // ~/.claude (the symlink provider links any new top-level entry; the fuse
-// provider is a live mirror, so this just health-checks). acct-00 IS the base,
-// so it is a no-op. Called at launch time and periodically by the daemon, which
-// is why explicit `clp sync` is unnecessary.
+// provider is a live mirror, so this just health-checks). Called at launch
+// time and periodically by the daemon, which is why explicit `clp sync` is
+// unnecessary.
 func (m *Manager) SyncOverlay(a store.Account) error {
-	if a.IsZero {
-		return nil
-	}
 	return overlay.For(overlay.Kind(a.OverlayKind)).Sync(ClaudeDir(), a.ConfigDir)
 }
 
-// overlayKind returns the provider kind to use for new accounts, taken from
-// acct-00's recorded kind (set at init), defaulting to a fresh detection.
-func (m *Manager) overlayKind() overlay.Kind {
-	if a, err := m.Store.GetAccount(AcctZero); err == nil && a.OverlayKind != "" {
-		return overlay.Kind(a.OverlayKind)
+// ensureOverlayKind returns the overlay provider kind for new accounts: the
+// kind recorded at init, detecting and recording one first if absent.
+func (m *Manager) ensureOverlayKind() (overlay.Kind, error) {
+	if v, ok, err := m.Store.GetMeta(metaOverlayKind); err != nil {
+		return "", err
+	} else if ok {
+		return overlay.Kind(v), nil
 	}
-	return overlay.Detect()
+	kind := overlay.Detect()
+	if err := m.Store.SetMeta(metaOverlayKind, string(kind)); err != nil {
+		return "", err
+	}
+	return kind, nil
 }

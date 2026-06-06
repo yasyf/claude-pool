@@ -2,8 +2,7 @@ package store
 
 import "time"
 
-// Account is one pool account. ID is the account index; ID 0 is acct-00
-// (~/.claude, the canonical dir plain `claude` uses).
+// Account is one pool account. ID is the account index (>= 1).
 type Account struct {
 	ID              int
 	ConfigDir       string // exact string exported as CLAUDE_CONFIG_DIR
@@ -11,7 +10,6 @@ type Account struct {
 	KeychainAccount string
 	Label           string // human note, e.g. an email or alias
 	OverlayKind     string // "symlink" | "fuse"
-	IsZero          bool   // true for acct-00
 	CreatedAt       time.Time
 }
 

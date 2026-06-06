@@ -20,7 +20,8 @@ session on the emptiest account:
 
     CLAUDE_CONFIG_DIR=$(clp select) claude
 
-Plain ` + "`claude`" + ` keeps working untouched on ~/.claude (acct-00).`,
+Plain ` + "`claude`" + ` keeps working untouched on ~/.claude — it is never part
+of the pool.`,
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -60,7 +61,7 @@ func requireInit(m *pool.Manager) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("pool not initialized — run `clp init` first")
+		return fmt.Errorf("pool not initialized — run `clp add` to set it up and add your first account")
 	}
 	return nil
 }

@@ -44,12 +44,6 @@ const fallbackAccount = "claude-code-user"
 // ErrNotFound is returned when the requested Keychain item does not exist.
 var ErrNotFound = errors.New("keychain item not found")
 
-// DefaultServiceName is the service for the canonical ~/.claude item, i.e. the
-// item plain `claude` uses when CLAUDE_CONFIG_DIR is unset.
-func DefaultServiceName() string {
-	return baseService
-}
-
 // ServiceName derives the Keychain service name Claude Code uses for a given
 // explicit CLAUDE_CONFIG_DIR value. The derivation, verbatim from the binary:
 //

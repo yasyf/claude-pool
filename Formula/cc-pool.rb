@@ -91,12 +91,11 @@ class CcPool < Formula
   def caveats
     <<~EOS
       Get started:
-        clp init        # register ~/.claude as acct-00 (plain `claude` keeps working)
-        clp add         # pool another Claude subscription
+        clp add         # pool a Claude subscription (auto-inits; plain `claude` keeps working)
         CLAUDE_CONFIG_DIR=$(clp select) claude
 
-      Enable the background daemon (keeps idle tokens fresh, scores live):
-        brew services start cc-pool
+      The background daemon (keeps idle tokens fresh, scores live) starts
+      automatically on `clp add`, managed via `brew services`.
 
       Optional live-mirror overlay (instead of per-entry symlinks): install
       fuse-t, then reinstall so the fuse-enabled build is selected:

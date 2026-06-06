@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS accounts (
   keychain_account TEXT NOT NULL,
   label            TEXT NOT NULL DEFAULT '',
   overlay_kind     TEXT NOT NULL DEFAULT 'symlink',
-  is_zero          INTEGER NOT NULL DEFAULT 0,
   created_at       INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS usage_samples (
@@ -78,14 +77,14 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1) // serialize writes; sqlite + WAL is fine for our load
 	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
+	if err := s.applySchema(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) migrate() error {
+func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
@@ -96,30 +95,49 @@ func (s *Store) migrate() error {
 	return err
 }
 
+// GetMeta returns the meta value for key, ok=false if absent.
+func (s *Store) GetMeta(key string) (string, bool, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get meta %q: %w", key, err)
+	}
+	return v, true, nil
+}
+
+// SetMeta upserts a meta key.
+func (s *Store) SetMeta(key, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO meta(key,value) VALUES(?,?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	if err != nil {
+		return fmt.Errorf("set meta %q: %w", key, err)
+	}
+	return nil
+}
+
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
 // UpsertAccount inserts or replaces an account row by id.
 func (s *Store) UpsertAccount(a Account) error {
-	zero := 0
-	if a.IsZero {
-		zero = 1
-	}
 	created := a.CreatedAt
 	if created.IsZero() {
 		created = time.Now()
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,is_zero,created_at)
-		 VALUES(?,?,?,?,?,?,?,?)
+		`INSERT INTO accounts(id,config_dir,keychain_service,keychain_account,label,overlay_kind,created_at)
+		 VALUES(?,?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   config_dir=excluded.config_dir,
 		   keychain_service=excluded.keychain_service,
 		   keychain_account=excluded.keychain_account,
 		   label=excluded.label,
-		   overlay_kind=excluded.overlay_kind,
-		   is_zero=excluded.is_zero`,
-		a.ID, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, zero, created.Unix())
+		   overlay_kind=excluded.overlay_kind`,
+		a.ID, a.ConfigDir, a.KeychainService, a.KeychainAccount, a.Label, a.OverlayKind, created.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert account %d: %w", a.ID, err)
 	}
@@ -130,18 +148,16 @@ func (s *Store) UpsertAccount(a Account) error {
 // *sql.Row and *sql.Rows.
 func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
 	var a Account
-	var zero int
 	var created int64
 	if err := rows.Scan(&a.ID, &a.ConfigDir, &a.KeychainService, &a.KeychainAccount,
-		&a.Label, &a.OverlayKind, &zero, &created); err != nil {
+		&a.Label, &a.OverlayKind, &created); err != nil {
 		return a, err
 	}
-	a.IsZero = zero != 0
 	a.CreatedAt = time.Unix(created, 0)
 	return a, nil
 }
 
-const accountCols = `id,config_dir,keychain_service,keychain_account,label,overlay_kind,is_zero,created_at`
+const accountCols = `id,config_dir,keychain_service,keychain_account,label,overlay_kind,created_at`
 
 // ListAccounts returns all accounts ordered by id.
 func (s *Store) ListAccounts() ([]Account, error) {

@@ -31,14 +31,17 @@ The binary installs as `cc-pool` with a `clp` symlink.
 ## Quickstart
 
 ```sh
-clp init                                   # register ~/.claude as acct-00 (does NOT move it)
-clp add                                    # log in another subscription (acct-01)
+clp add                                    # log in your first subscription (auto-inits the pool)
 clp add                                    # ...and another (acct-02)
 clp status                                 # live table: per-account 5h/7d remaining, score, sessions
 
 CLAUDE_CONFIG_DIR=$(clp select) claude     # launch on the emptiest account
-claude                                     # plain claude STILL works (acct-00 / ~/.claude)
+claude                                     # plain claude STILL works, fully decoupled (~/.claude)
 ```
+
+Your main subscription joins the pool like any other account: `clp add` gives
+it its own login in its own account dir. Plain `claude` stays fully decoupled —
+the pool can never log it out.
 
 Make it the default in your shell:
 
@@ -50,9 +53,10 @@ alias cl='CLAUDE_CONFIG_DIR=$(clp select) claude'
 
 ### `~/.claude` is sacred
 
-`~/.claude` is **never moved**. It stays the canonical config dir, so plain
-`claude` keeps working exactly as before. It doubles as **acct-00** and as the
-**shared base** every pooled account mirrors.
+`~/.claude` is **never moved** and never registered as a pool account. It stays
+the canonical config dir — plain `claude` keeps working exactly as before — and
+serves as the **shared base** every pooled account mirrors. The pool never
+reads or writes plain claude's credential or state.
 
 ### One real config dir per account
 
@@ -60,14 +64,12 @@ Claude Code namespaces its Keychain credential **per config dir**: the default
 `~/.claude` uses the item `Claude Code-credentials`; a custom `CLAUDE_CONFIG_DIR`
 gets a suffixed item `Claude Code-credentials-<hash>`. cc-pool gives each
 account a real, unique dir (`~/.cc-pool/accounts/acct-NN`) so each gets its own
-Keychain item and runs on its own **subscription** (never API billing).
-
-> **acct-00 nuance.** Plain `claude` uses the *un-suffixed* default item.
-> Because `CLAUDE_CONFIG_DIR=$(clp select)` *sets* the variable, selecting
-> acct-00 would otherwise make Claude look for a *suffixed* item that doesn't
-> exist. `clp init` therefore mirrors acct-00's credential into a suffixed item
-> and the daemon keeps the two in lockstep, so acct-00 is selectable like any
-> other account while plain `claude` stays untouched.
+Keychain item, its own independent OAuth grant (its own refresh-token chain),
+and runs on its own **subscription** (never API billing). Each account dir is
+also seeded with a copy of your `~/.claude.json` (identity stripped — login
+writes the account's own), so pooled sessions inherit your settings, MCP
+servers, and per-project tool approvals instead of running first-run
+onboarding.
 
 ### Shared overlay
 
@@ -84,9 +86,11 @@ every session shares the same workspace. Two providers:
   no root). Auto-includes new entries with no re-sync. Requires a
   `-tags fuse` build and a one-time *Network Volumes* privacy grant.
 
-A small set of instance-local entries (`daemon/`, `ide/`) are **not** shared —
-they hold Claude's own PID-keyed supervisor and IDE lock/socket files, which
-would conflict across concurrent sessions. Each account gets its own.
+A small set of per-account entries are **not** shared — `daemon/` and `ide/`
+(Claude's PID-keyed supervisor and IDE lock/socket files, which would conflict
+across concurrent sessions), `backups/` (rotating backups of each account's
+`.claude.json`), and `.claude.json` itself (per-account identity). Each account
+gets its own.
 
 ### Scoring
 
@@ -111,9 +115,9 @@ own `/api/oauth/usage` endpoint.
 login Keychain). It polls usage every ~3 min with exponential backoff, refreshes
 **idle** accounts' tokens before they expire (a checked-out session owns its own
 refresh; the daemon re-reads and adopts whatever token it rotated to on
-check-in — and it never refreshes acct-00, whose token plain `claude` owns),
-caches scores, and — with the fuse overlay — owns the mount lifecycle. If the
-daemon isn't running, `clp select` auto-spawns it (≤2s) or samples live.
+check-in), caches scores, and — with the fuse overlay — owns the mount
+lifecycle. `clp add` and `clp init` start it automatically; if it isn't
+running, `clp select` auto-spawns it (≤2s) or samples live.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the
 only secret store.
@@ -122,8 +126,8 @@ only secret store.
 
 | Command | What it does |
 |---|---|
-| `clp init` | Register `~/.claude` as acct-00; set up the pool; offer to install the daemon |
-| `clp add` | Pool another subscription (interactive `claude /login`) |
+| `clp add` | Pool a subscription (interactive `claude /login`; auto-inits the pool and starts the daemon) |
+| `clp init` | Prepare the pool state dir and start the daemon (optional — `clp add` does this automatically) |
 | `clp select` | Print the emptiest account's config dir (stdout only) — the hot path |
 | `clp run -- <args>` | Select an account and exec `claude`, owning the session lifecycle |
 | `clp status [-w]` | Live table of usage / score / sessions |

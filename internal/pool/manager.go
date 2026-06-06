@@ -18,10 +18,11 @@ type Refresher interface {
 }
 
 // CredentialStore is the slice of package keychain the Manager needs for
-// credential reads and writes.
+// credential reads, writes, and deletes.
 type CredentialStore interface {
 	Read(service, account string) (*keychain.Credential, error)
 	Write(service, account string, cred *keychain.Credential) error
+	Delete(service, account string) error
 }
 
 // sysKeychain adapts package keychain's process-global functions to
@@ -36,14 +37,17 @@ func (sysKeychain) Write(service, account string, cred *keychain.Credential) err
 	return keychain.Write(service, account, cred)
 }
 
+func (sysKeychain) Delete(service, account string) error {
+	return keychain.Delete(service, account)
+}
+
 // Manager is the high-level façade over the store, the OAuth client, and the
 // Keychain/overlay machinery. CLI commands, the TUI wizards, and the daemon all
 // go through it.
 type Manager struct {
-	Store      *store.Store
-	OAuth      Refresher
-	Keychain   CredentialStore
-	DefaultDir string // ~/.claude (acct-00)
+	Store    *store.Store
+	OAuth    Refresher
+	Keychain CredentialStore
 
 	// muMap guards locks; locks holds one mutex per account ID serializing that
 	// account's credential read→refresh→write cycle. These per-account mutexes
@@ -80,10 +84,9 @@ func Open() (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{
-		Store:      st,
-		OAuth:      oauth.New(),
-		Keychain:   sysKeychain{},
-		DefaultDir: ClaudeDir(),
+		Store:    st,
+		OAuth:    oauth.New(),
+		Keychain: sysKeychain{},
 	}, nil
 }
 
@@ -95,16 +98,24 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-// Initialized reports whether `clp init` has registered acct-00 yet.
+// Meta keys recording pool-level state in the store's meta table.
+const (
+	// metaInitialized marks that the pool was set up via `clp init` (or add's
+	// auto-init) — deliberately distinct from "the DB file exists", which any
+	// read-only command creates as a side effect of opening the Manager.
+	metaInitialized = "initialized"
+	// metaOverlayKind records the overlay provider chosen at init, so new
+	// accounts keep using it and a re-init never flips providers under live
+	// accounts.
+	metaOverlayKind = "overlay_kind"
+)
+
+// Initialized reports whether the pool has been set up (`clp init` or `clp
+// add`'s auto-init).
 func (m *Manager) Initialized() (bool, error) {
-	accts, err := m.Store.ListAccounts()
+	_, ok, err := m.Store.GetMeta(metaInitialized)
 	if err != nil {
 		return false, err
 	}
-	for _, a := range accts {
-		if a.IsZero {
-			return true, nil
-		}
-	}
-	return false, nil
+	return ok, nil
 }

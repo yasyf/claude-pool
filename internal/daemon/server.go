@@ -369,7 +369,6 @@ func toStatuses(snaps []pool.Snapshot) []AccountStatus {
 			ID:             sn.Account.ID,
 			ConfigDir:      sn.Account.ConfigDir,
 			Label:          sn.Account.Label,
-			IsZero:         sn.Account.IsZero,
 			OverlayKind:    sn.Account.OverlayKind,
 			Score:          sn.Score,
 			Remaining5h:    sn.Remaining5h,
@@ -391,7 +390,7 @@ func (s *Server) establishMounts() {
 		return
 	}
 	for _, a := range accts {
-		if a.IsZero || a.OverlayKind != string(overlay.KindFuse) {
+		if a.OverlayKind != string(overlay.KindFuse) {
 			continue
 		}
 		prov := overlay.For(overlay.KindFuse)
@@ -409,7 +408,7 @@ func (s *Server) teardownMounts() {
 		return
 	}
 	for _, a := range accts {
-		if a.IsZero || a.OverlayKind != string(overlay.KindFuse) {
+		if a.OverlayKind != string(overlay.KindFuse) {
 			continue
 		}
 		_ = overlay.For(overlay.KindFuse).Teardown(pool.ClaudeDir(), a.ConfigDir)

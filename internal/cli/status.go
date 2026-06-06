@@ -96,7 +96,6 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 		s.Account.ID = a.ID
 		s.Account.ConfigDir = a.ConfigDir
 		s.Account.Label = a.Label
-		s.Account.IsZero = a.IsZero
 		s.Account.OverlayKind = a.OverlayKind
 		out = append(out, s)
 	}
@@ -105,6 +104,9 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 
 // renderTable produces a styled fixed-width table, best account highlighted.
 func renderTable(snaps []pool.Snapshot, source string) string {
+	if len(snaps) == 0 {
+		return "no accounts — run `clp add`\n"
+	}
 	// Sort by score desc for display; best first.
 	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].Score > snaps[j].Score })
 

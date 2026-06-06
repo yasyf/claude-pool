@@ -34,7 +34,6 @@ type AccountStatus struct {
 	ID             int       `json:"id"`
 	ConfigDir      string    `json:"config_dir"`
 	Label          string    `json:"label"`
-	IsZero         bool      `json:"is_zero"`
 	OverlayKind    string    `json:"overlay_kind"`
 	Score          float64   `json:"score"`
 	Remaining5h    float64   `json:"remaining_5h"`

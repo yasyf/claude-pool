@@ -52,6 +52,13 @@ func (f *fakeKeychain) Write(service, account string, cred *keychain.Credential)
 	return nil
 }
 
+func (f *fakeKeychain) Delete(service, account string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.items, f.key(service, account))
+	return nil
+}
+
 func (f *fakeKeychain) writeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -125,10 +132,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0"}
 
 	s := &Server{
-		m: &pool.Manager{
-			Store: st, OAuth: fo, Keychain: fk,
-			DefaultDir: filepath.Join(t.TempDir(), "claude"),
-		},
+		m:            &pool.Manager{Store: st, OAuth: fo, Keychain: fk},
 		log:          log.New(io.Discard, "", 0),
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},

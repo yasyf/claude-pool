@@ -3,6 +3,7 @@ package keychain
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -20,9 +21,26 @@ func TestServiceNameGoldenVectors(t *testing.T) {
 	}
 }
 
-func TestDefaultServiceName(t *testing.T) {
-	if got := DefaultServiceName(); got != "Claude Code-credentials" {
-		t.Errorf("DefaultServiceName() = %q", got)
+// TestServiceNameAlwaysSuffixed pins the structural enforcement of safety
+// rule 1: every service name this package can produce carries a hash suffix,
+// so no caller can ever name the canonical unsuffixed item plain `claude`
+// owns ("Claude Code-credentials").
+func TestServiceNameAlwaysSuffixed(t *testing.T) {
+	re := regexp.MustCompile(`^Claude Code-credentials-[0-9a-f]{8}$`)
+	for _, dir := range []string{
+		"",
+		"/Users/x/.claude",
+		"/Users/x/.cc-pool/accounts/acct-01",
+		"/Users/x/.claude/", // trailing slash hashes differently but still suffixed
+		"/Users/é/.claude",  // non-ASCII path (NFC-normalized before hashing)
+	} {
+		got := ServiceName(dir)
+		if got == "Claude Code-credentials" {
+			t.Fatalf("ServiceName(%q) produced the canonical unsuffixed service", dir)
+		}
+		if !re.MatchString(got) {
+			t.Errorf("ServiceName(%q) = %q, want match for %v", dir, got, re)
+		}
 	}
 }
 

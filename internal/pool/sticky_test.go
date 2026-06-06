@@ -17,9 +17,7 @@ func openTestManager(t *testing.T) *Manager {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	// DefaultDir is a temp path so procscan can never attribute a real claude
-	// process to a test account.
-	return &Manager{Store: st, DefaultDir: filepath.Join(t.TempDir(), "claude")}
+	return &Manager{Store: st}
 }
 
 func TestStickyPick(t *testing.T) {

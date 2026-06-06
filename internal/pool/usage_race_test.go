@@ -14,10 +14,14 @@ import (
 )
 
 // fakeKeychain is an in-memory CredentialStore. It is internally locked so any
-// race the detector reports is in the code under test, not the fake.
+// race the detector reports is in the code under test, not the fake. Every
+// operation's service is recorded in touched, so tests can pin which Keychain
+// items the pool is willing to name.
 type fakeKeychain struct {
-	mu    sync.Mutex
-	items map[string]*keychain.Credential
+	mu      sync.Mutex
+	items   map[string]*keychain.Credential
+	touched []string // service of every Read/Write/Delete, in order
+	deleted []string // service of every Delete, in order
 }
 
 func newFakeKeychain() *fakeKeychain {
@@ -29,6 +33,7 @@ func (f *fakeKeychain) key(service, account string) string { return service + "\
 func (f *fakeKeychain) Read(service, account string) (*keychain.Credential, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.touched = append(f.touched, service)
 	c, ok := f.items[f.key(service, account)]
 	if !ok {
 		return nil, keychain.ErrNotFound
@@ -40,9 +45,31 @@ func (f *fakeKeychain) Read(service, account string) (*keychain.Credential, erro
 func (f *fakeKeychain) Write(service, account string, cred *keychain.Credential) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.touched = append(f.touched, service)
 	cp := *cred
 	f.items[f.key(service, account)] = &cp
 	return nil
+}
+
+func (f *fakeKeychain) Delete(service, account string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.touched = append(f.touched, service)
+	f.deleted = append(f.deleted, service)
+	delete(f.items, f.key(service, account))
+	return nil
+}
+
+func (f *fakeKeychain) touchedServices() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.touched...)
+}
+
+func (f *fakeKeychain) deletedServices() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deleted...)
 }
 
 // fakeOAuth simulates the provider's single-use refresh-token rotation: only
@@ -106,7 +133,7 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Keychain: fk, DefaultDir: t.TempDir()}
+	m := &Manager{Store: st, OAuth: fo, Keychain: fk}
 
 	const goroutines = 16
 	const iterations = 25

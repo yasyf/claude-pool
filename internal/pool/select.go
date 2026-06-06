@@ -12,8 +12,8 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// ErrNoAccounts means the pool is empty (run `clp init`/`clp add`).
-var ErrNoAccounts = errors.New("no accounts in the pool")
+// ErrNoAccounts means the pool is empty.
+var ErrNoAccounts = errors.New("no accounts in the pool — run `clp add`")
 
 // ErrNoneAvailable means every account is currently rate-limited.
 var ErrNoneAvailable = errors.New("no account is currently available (all rate-limited)")
@@ -99,7 +99,7 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 			continue // fresh enough
 		}
 		a := a
-		allowRefresh := procscan.CountByConfigDir(sessions, a.ConfigDir, m.DefaultDir) == 0
+		allowRefresh := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -126,7 +126,7 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 		in.RateLimited = s.RateLimited
 		in.Burn5hPerHour = m.burnRate5h(a.ID)
 	}
-	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir, m.DefaultDir)
+	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir)
 	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && !r.OK {
 		in.RefreshFailed = true
 	}
@@ -159,7 +159,7 @@ func (m *Manager) burnRate5h(accountID int) float64 {
 // a healthy token. Errors are returned but non-fatal to the caller.
 func (m *Manager) PreflightRefresh(ctx context.Context, a store.Account) error {
 	sessions, _ := procscan.Scan()
-	idle := procscan.CountByConfigDir(sessions, a.ConfigDir, m.DefaultDir) == 0
+	idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0
 	if !idle {
 		return nil
 	}

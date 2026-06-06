@@ -3,9 +3,10 @@
 //
 // Two distinct trees exist and must not be confused:
 //
-//   - ~/.claude      The canonical Claude Code config dir. NEVER moved.
-//     It is the shared base AND acct-00, so plain `claude`
-//     keeps working untouched.
+//   - ~/.claude      The canonical Claude Code config dir: plain `claude`'s
+//     home and the shared overlay base. NEVER moved, never
+//     registered as a pool account — the pool never touches
+//     plain claude's credential or state.
 //   - ~/.cc-pool/    cc-pool's OWN state (sqlite db, daemon socket, logs),
 //     plus accounts/ holding the pool account dirs
 //     (acct-01, acct-02, ...). Each account dir is a real,
@@ -17,9 +18,6 @@ import (
 	"os"
 	"path/filepath"
 )
-
-// AcctZero is the account index of ~/.claude itself.
-const AcctZero = 0
 
 // Home returns the current user's home directory.
 func Home() (string, error) {
@@ -38,14 +36,21 @@ func mustHome() string {
 	return h
 }
 
-// ClaudeDir is the canonical Claude config dir (~/.claude). It is acct-00 and
-// the shared base. It is returned as an absolute, symlink-resolved path so the
-// value is stable and matches what we hash for the Keychain mirror item.
+// ClaudeDir is the canonical Claude config dir (~/.claude): plain `claude`'s
+// home and the shared overlay base — never a pool account.
 func ClaudeDir() string {
 	return filepath.Join(mustHome(), ".claude")
 }
 
-// AccountsDir is the parent of all non-zero account dirs (~/.cc-pool/accounts).
+// ClaudeJSONPath is plain claude's primary state file (~/.claude.json — in
+// $HOME, NOT inside ~/.claude). With CLAUDE_CONFIG_DIR set, claude reads and
+// writes $CONFIG_DIR/.claude.json instead; new accounts are seeded from this
+// file so they inherit onboarding state and settings.
+func ClaudeJSONPath() string {
+	return filepath.Join(mustHome(), ".claude.json")
+}
+
+// AccountsDir is the parent of all account dirs (~/.cc-pool/accounts).
 func AccountsDir() string {
 	return filepath.Join(StateDir(), "accounts")
 }
@@ -75,17 +80,14 @@ func AccountDirName(n int) string {
 	return fmt.Sprintf("acct-%02d", n)
 }
 
-// AccountDir returns the config-dir path for account index n.
-//
-//   - n == 0 maps to ~/.claude (acct-00, canonical).
-//   - n >= 1 maps to ~/.cc-pool/accounts/acct-NN.
+// AccountDir returns the config-dir path for account index n (n >= 1).
 //
 // The returned path is exactly the string clp emits for CLAUDE_CONFIG_DIR and
 // the string we hash for the per-dir Keychain service name; the two MUST stay
 // byte-identical, so do not realpath or normalize divergently elsewhere.
 func AccountDir(n int) string {
-	if n == AcctZero {
-		return ClaudeDir()
+	if n < 1 {
+		panic(fmt.Sprintf("AccountDir(%d): account indexes start at 1", n))
 	}
 	return filepath.Join(AccountsDir(), AccountDirName(n))
 }

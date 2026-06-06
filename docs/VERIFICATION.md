@@ -22,19 +22,26 @@ clp --version          # prints the version
 cc-pool --version  # same binary, both names work
 ```
 
-## 2. init keeps plain claude working; add a second account; status; daemon refresh
+## 2. add auto-inits; plain claude untouched; status; daemon refresh
 ```sh
-clp init               # registers acct-00; mirrors its credential; points at the daemon
-claude                 # (human) plain claude STILL launches on ~/.claude, untouched
-clp add                # (human) interactive: logs in an account, then loops ("Add another?")
-                       #         so you can onboard several subscriptions in one run
+clp add                # (human) interactive: auto-inits the pool, auto-starts the daemon,
+                       #         seeds .claude.json, logs in an account, then loops
+                       #         ("Add another?") so you can onboard several subscriptions
 clp status             # all accounts shown with live 5h/7d remaining + score
-brew services start cc-pool   # brew install: enable the daemon (or `clp service install` on a source build)
 clp service status     # shows "Homebrew (brew services)" or self-managed, + Daemon: running
+claude                 # (human) plain claude STILL launches on ~/.claude, untouched
 ```
-Verify in `Keychain Access` that there is now `Claude Code-credentials`
-(canonical) plus suffixed `Claude Code-credentials-<hash>` items — distinct per
-account, and that daemon refreshes do not raise a prompt.
+Verify during `clp add`:
+- the `claude /login` session does NOT show the first-run theme wizard
+  (onboarding state was seeded from ~/.claude.json), and no
+  "configuration file not found / backup file exists" messages appear;
+- after login, `~/.cc-pool/accounts/acct-NN/.claude.json` contains the NEW
+  account's `oauthAccount` (not your main account's);
+- in `Keychain Access`, each account has its own suffixed
+  `Claude Code-credentials-<hash>` item; the canonical un-suffixed
+  `Claude Code-credentials` item is never modified by the pool;
+- daemon refreshes do not raise a prompt, and plain `claude` never gets
+  logged out.
 
 ## 3. Drive one account up → select returns the other (stdout = path only)
 ```sh
@@ -57,10 +64,12 @@ diff <(ls ~/.claude/skills) <(ls "$(clp env --account 1 2>/dev/null | sed -n 's/
 ```sh
 # symlink provider (default):
 ls -la ~/.cc-pool/accounts/acct-01            # top-level entries are symlinks into ~/.claude
-#                                          except daemon/ and ide/ (private dirs)
+#                                          except daemon/, ide/, backups/ (private dirs)
+#                                          and .claude.json (private per-account file)
 echo hi > ~/.cc-pool/accounts/acct-01/projects/_clp_probe && \
   cat ~/.claude/projects/_clp_probe       # write through the overlay lands in ~/.claude
 rm ~/.claude/projects/_clp_probe
+ls ~/.cc-pool/accounts/acct-01/backups        # private: never shows ~/.claude/backups content
 
 # fuse provider (only with a -tags fuse build + fuse-t + Network Volumes grant):
 mount | grep cc-pool                  # account dir is a fuse-t mirror mount

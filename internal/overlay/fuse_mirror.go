@@ -14,10 +14,12 @@ import (
 
 // mirrorFS is a passthrough filesystem: most operations are applied directly to
 // the corresponding path under root (~/.claude), so reads and writes are shared
-// with plain `claude`. There is NO copy-up. The exception is the instance-local
-// ExcludedEntries (daemon/, ide/): their whole subtrees are redirected to a
-// private per-account backing dir so concurrent sessions don't fight over one
-// supervisor/IDE registry — matching the symlink provider's invariant.
+// with plain `claude`. There is NO copy-up. The exception is the account-local
+// PrivateEntry names (daemon/, ide/, backups/, .claude.json and its atomic-write
+// temp files): their whole subtrees are redirected to a private per-account
+// backing dir so concurrent sessions don't fight over one supervisor/IDE
+// registry and per-account state never lands in the shared base — matching the
+// symlink provider's invariant.
 type mirrorFS struct {
 	fuse.FileSystemBase
 	root        string // ~/.claude
@@ -31,10 +33,10 @@ func newMirrorFS(root, privateRoot string) *mirrorFS {
 }
 
 // real maps a fuse path ("/foo/bar") to its backing path: under privateRoot for
-// an excluded top-level component, else under root.
+// a private top-level component, else under root.
 func (fs *mirrorFS) real(path string) string {
 	rel := filepath.FromSlash(path)
-	if ExcludedEntries[topComponent(path)] {
+	if PrivateEntry(topComponent(path)) {
 		return filepath.Join(fs.privateRoot, rel)
 	}
 	return filepath.Join(fs.root, rel)
@@ -161,9 +163,27 @@ func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 	}
 	fill(".", nil, 0)
 	fill("..", nil, 0)
+	seen := map[string]bool{}
 	for _, name := range names {
+		seen[name] = true
 		if !fill(name, nil, 0) {
-			break
+			return 0
+		}
+	}
+	if path == "/" {
+		// Private files (e.g. a seeded .claude.json) live only in privateRoot;
+		// merge them into the root listing or they'd be stat-able but unlisted.
+		priv, err := os.ReadDir(fs.privateRoot)
+		if err != nil {
+			return 0 // listing base succeeded; a missing private root is not an error
+		}
+		for _, e := range priv {
+			if seen[e.Name()] || !PrivateEntry(e.Name()) {
+				continue
+			}
+			if !fill(e.Name(), nil, 0) {
+				return 0
+			}
 		}
 	}
 	return 0

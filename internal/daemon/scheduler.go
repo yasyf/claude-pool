@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 )
@@ -96,21 +97,32 @@ func (s *Server) pollOnce(ctx context.Context) {
 		}
 		// Re-assert the overlay so long-lived setups pick up new top-level
 		// ~/.claude entries without an explicit sync (symlink relinks; fuse
-		// health-checks). acct-00 is a no-op.
+		// health-checks).
 		if err := s.m.SyncOverlay(a); err != nil {
 			s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
+			// The daemon is the only process that can host fuse mounts; an
+			// unhealthy fuse overlay here usually means the account was added
+			// (by a CLI that cannot mount) after this daemon started — bring
+			// the mount up now instead of leaving the dir dead until restart.
+			// A mount that cannot come up falls back to symlink, exactly like
+			// establishMounts at startup.
+			if a.OverlayKind == string(overlay.KindFuse) {
+				if merr := overlay.For(overlay.KindFuse).Setup(pool.ClaudeDir(), a.ConfigDir); merr != nil {
+					s.log.Printf("acct-%02d mount failed, falling back to symlink: %v", a.ID, merr)
+					s.fallbackToSymlink(a)
+				}
+			}
 		}
 
 		// A reserved account was just handed out by handleSelect but its claude
 		// is not yet visible to procscan — treat it as busy so we don't refresh
 		// the token out from under the launching session.
-		idle := procscan.CountByConfigDir(sessions, a.ConfigDir, s.m.DefaultDir) == 0 &&
+		idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
 			s.reservedCount(a.ID) == 0
 
 		// A previously checked-out account that is now idle may carry a token
-		// rotated by its live session — adopt it before sampling. (For acct-00
-		// this propagates plain claude's rotated token; SampleUsage never
-		// POST-refreshes acct-00.)
+		// rotated by its live session — adopt it (re-asserting our ACL) before
+		// sampling.
 		if idle {
 			if err := s.m.AdoptRotatedToken(a); err != nil {
 				s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)

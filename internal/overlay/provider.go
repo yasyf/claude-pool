@@ -12,6 +12,8 @@
 // conflict across concurrent sessions; see ExcludedEntries.
 package overlay
 
+import "strings"
+
 // Kind identifies an overlay provider.
 type Kind string
 
@@ -24,19 +26,32 @@ const (
 // across accounts. Each excluded entry becomes a private, empty per-account
 // directory instead.
 //
-//   - daemon: Claude Code's own PID-keyed worker supervisor (daemon/roster.json
+//   - daemon:  Claude Code's own PID-keyed worker supervisor (daemon/roster.json
 //     records a supervisorPid + worker registry). Sharing it makes two sessions
 //     fight over one supervisor.
-//   - ide:    per-process IDE lock/socket files; a pooled session must not
-//     advertise itself on acct-00's IDE registry.
+//   - ide:     per-process IDE lock/socket files; a pooled session must not
+//     advertise itself on another account's IDE registry.
+//   - backups: claude's rotating backups of $CONFIG_DIR/.claude.json. Sharing
+//     it surfaces one account's config backups inside another's restore prompt
+//     (cross-account contamination) and commingles every account's backups.
 var ExcludedEntries = map[string]bool{
-	"daemon": true,
-	"ide":    true,
+	"daemon":  true,
+	"ide":     true,
+	"backups": true,
 }
 
 // skipEntries are never linked or mirrored (noise / OS cruft).
 var skipEntries = map[string]bool{
 	".DS_Store": true,
+}
+
+// PrivateEntry reports whether a top-level entry name is per-account private:
+// the excluded dirs above, plus claude's primary state file .claude.json and
+// its atomic-write temp files (.claude.json.tmp.XXXX), which hold per-account
+// identity (oauthAccount) and must never be shared or land in the base.
+func PrivateEntry(name string) bool {
+	return ExcludedEntries[name] || name == ".claude.json" ||
+		strings.HasPrefix(name, ".claude.json.")
 }
 
 // Provider establishes and maintains an overlay of base at accountDir.
@@ -55,6 +70,12 @@ type Provider interface {
 
 	// Teardown removes the overlay from accountDir. It must never touch base.
 	Teardown(base, accountDir string) error
+
+	// PrivateRoot returns the directory where account-local (private) files
+	// physically live. For the symlink provider that is accountDir itself; for
+	// fuse it is the private backing dir beside the mountpoint. Writing there
+	// is correct whether or not a mount is currently up.
+	PrivateRoot(accountDir string) string
 }
 
 // For returns the provider for a given kind. Unknown/empty kinds fall back to

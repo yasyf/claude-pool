@@ -60,9 +60,21 @@ type FuseProvider struct{}
 
 func (p *FuseProvider) Kind() Kind { return KindFuse }
 
+// PrivateRoot is the per-account backing dir beside the mountpoint. Private
+// files written there are visible through the mount (mirrorFS redirects
+// PrivateEntry names) and survive whether or not the mount is currently up.
+func (p *FuseProvider) PrivateRoot(accountDir string) string {
+	return privateRootFor(accountDir)
+}
+
 // Setup mounts a passthrough mirror of base at accountDir. It blocks only until
 // the mount is live (or a timeout). The serving loop runs in a goroutine.
+// Like Teardown, it refuses to operate on base itself — mounting over
+// ~/.claude would shadow the user's real config dir.
 func (p *FuseProvider) Setup(base, accountDir string) error {
+	if accountDir == base || accountDir == "" {
+		return fmt.Errorf("refusing to mount over base dir %q", accountDir)
+	}
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
 		return err
 	}
@@ -86,8 +98,8 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 
 	// fuse-t mount options (its NFS backend has NO soft/timeout/retrans knobs;
 	// the coherence lever is noattrcache). The backing ~/.claude is written
-	// directly by plain `claude` (acct-00) while a pooled session reads through
-	// this mirror, so disable attribute caching to avoid stale reads. nobrowse
+	// directly by plain `claude` while a pooled session reads through this
+	// mirror, so disable attribute caching to avoid stale reads. nobrowse
 	// keeps the mount out of Finder sidebars.
 	opts := []string{
 		"-o", "volname=cc-pool-" + filepath.Base(accountDir),

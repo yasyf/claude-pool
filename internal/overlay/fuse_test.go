@@ -53,4 +53,39 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(mnt, "newdir")); err != nil {
 		t.Fatalf("new base entry not visible through mount: %v", err)
 	}
+
+	// Writing .claude.json through the mount lands in the private backing dir,
+	// never in base (per-account identity must not pollute the shared base).
+	if err := os.WriteFile(filepath.Join(mnt, ".claude.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write .claude.json through mount: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, ".claude.json")); !os.IsNotExist(err) {
+		t.Fatalf(".claude.json leaked into base")
+	}
+	if _, err := os.Stat(filepath.Join(privateRootFor(mnt), ".claude.json")); err != nil {
+		t.Fatalf(".claude.json not in private backing dir: %v", err)
+	}
+}
+
+// TestMirrorRealRedirectsLocalEntries pins the path-mapping table without
+// needing a live mount: every PrivateEntry top component (and its subtree)
+// must back onto privateRoot; everything else onto root.
+func TestMirrorRealRedirectsLocalEntries(t *testing.T) {
+	fs := newMirrorFS("/base", "/priv")
+	cases := map[string]string{
+		"/.claude.json":              "/priv/.claude.json",
+		"/.claude.json.tmp.ab12cd34": "/priv/.claude.json.tmp.ab12cd34",
+		"/backups":                   "/priv/backups",
+		"/backups/x.bak":             "/priv/backups/x.bak",
+		"/daemon/roster.json":        "/priv/daemon/roster.json",
+		"/ide/lock":                  "/priv/ide/lock",
+		"/projects/p.json":           "/base/projects/p.json",
+		"/settings.json":             "/base/settings.json",
+		"/":                          "/base",
+	}
+	for in, want := range cases {
+		if got := fs.real(in); got != want {
+			t.Errorf("real(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

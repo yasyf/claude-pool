@@ -18,15 +18,15 @@ func openTest(t *testing.T) *Store {
 
 func TestAccountCRUD(t *testing.T) {
 	s := openTest(t)
-	a := Account{ID: 0, ConfigDir: "/home/.claude", KeychainService: "svc0", KeychainAccount: "me", IsZero: true, Label: "acct-00"}
+	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "work"}
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.GetAccount(0)
+	got, err := s.GetAccount(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.IsZero || got.ConfigDir != a.ConfigDir {
+	if got.ConfigDir != a.ConfigDir || got.Label != "work" {
 		t.Fatalf("got %+v", got)
 	}
 	// Update label.
@@ -34,7 +34,7 @@ func TestAccountCRUD(t *testing.T) {
 	if err := s.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.GetAccount(0)
+	got, _ = s.GetAccount(1)
 	if got.Label != "renamed" {
 		t.Fatalf("label not updated: %q", got.Label)
 	}
@@ -49,15 +49,36 @@ func TestNextAccountIndex(t *testing.T) {
 	if n, _ := s.NextAccountIndex(); n != 1 {
 		t.Fatalf("first index = %d, want 1", n)
 	}
-	s.UpsertAccount(Account{ID: 0, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u", IsZero: true})
-	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	if n, _ := s.NextAccountIndex(); n != 2 {
-		t.Fatalf("next index = %d, want 2", n)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "a", KeychainService: "s", KeychainAccount: "u"})
+	s.UpsertAccount(Account{ID: 2, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	if n, _ := s.NextAccountIndex(); n != 3 {
+		t.Fatalf("next index = %d, want 3", n)
 	}
 	// Remove 1 -> reused.
 	s.DeleteAccount(1)
 	if n, _ := s.NextAccountIndex(); n != 1 {
 		t.Fatalf("reused index = %d, want 1", n)
+	}
+}
+
+func TestMetaRoundTrip(t *testing.T) {
+	s := openTest(t)
+	if _, ok, err := s.GetMeta("initialized"); ok || err != nil {
+		t.Fatalf("absent key: ok=%v err=%v", ok, err)
+	}
+	if err := s.SetMeta("initialized", "1"); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := s.GetMeta("initialized")
+	if err != nil || !ok || v != "1" {
+		t.Fatalf("get after set: v=%q ok=%v err=%v", v, ok, err)
+	}
+	// Upsert overwrites.
+	if err := s.SetMeta("initialized", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _, _ := s.GetMeta("initialized"); v != "2" {
+		t.Fatalf("overwrite failed: %q", v)
 	}
 }
 

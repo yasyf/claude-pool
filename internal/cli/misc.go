@@ -23,7 +23,7 @@ func newListCmd() *cobra.Command {
 					return err
 				}
 				if len(accts) == 0 {
-					fmt.Fprintln(cmd.ErrOrStderr(), "no accounts — run `clp init` then `clp add`")
+					fmt.Fprintln(cmd.ErrOrStderr(), "no accounts — run `clp add`")
 					return nil
 				}
 				tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
@@ -62,9 +62,7 @@ func newRemoveCmd() *cobra.Command {
 	return cmd
 }
 
-// newEnvCmd prints shell export lines to launch a chosen account, including the
-// acct-00 escape hatch (CLAUDE_SECURESTORAGE_CONFIG_DIR="" forces the canonical
-// un-suffixed Keychain item while CLAUDE_CONFIG_DIR points at ~/.claude).
+// newEnvCmd prints shell export lines to launch a chosen account.
 func newEnvCmd() *cobra.Command {
 	var account int
 	cmd := &cobra.Command{
@@ -72,9 +70,7 @@ func newEnvCmd() *cobra.Command {
 		Short: "Print shell export lines for an account (eval-friendly)",
 		Long: `env prints the environment needed to launch a specific account:
 
-    eval "$(clp env --account 1)"; claude
-
-For acct-00 it emits the escape-hatch var so the canonical credential is used.`,
+    eval "$(clp env --account 1)"; claude`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -97,10 +93,6 @@ For acct-00 it emits the escape-hatch var so the canonical credential is used.`,
 				}
 				out := cmd.OutOrStdout()
 				fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
-				if a.IsZero {
-					// Force the canonical un-suffixed item for ~/.claude.
-					fmt.Fprintln(out, `export CLAUDE_SECURESTORAGE_CONFIG_DIR=''`)
-				}
 				return nil
 			})
 		},

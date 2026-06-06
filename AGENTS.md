@@ -36,14 +36,16 @@ cc-pool/
 
 Two filesystem trees, never confused:
 
-- `~/.claude` — canonical Claude Code config dir. **NEVER moved or modified structurally.** It is acct-00 and the shared base; plain `claude` must keep working untouched.
-- `~/.cc-pool/` — cc-pool's own state (sqlite db, daemon socket, logs) plus `accounts/acct-NN` pool config dirs.
+- `~/.claude` — canonical Claude Code config dir. **NEVER moved, modified structurally, or registered as a pool account.** It is plain `claude`'s home and the shared overlay base; plain `claude` must keep working untouched.
+- `~/.cc-pool/` — cc-pool's own state (sqlite db, daemon socket, logs) plus `accounts/acct-NN` pool config dirs (ids start at 1).
 
 Safety rules baked into the architecture — do not regress them:
 
-1. **The daemon NEVER POST-refreshes acct-00's OAuth token** (shared single-use refresh token with plain `claude`; refreshing it races and logs the user out).
+1. **The pool NEVER touches the canonical unsuffixed Keychain item (`Claude Code-credentials`) or plain claude's OAuth state.** Every pool account — including the user's main subscription — has its own config dir, its own independent OAuth grant (own refresh-token chain, created by its own `claude /login`), and its own suffixed Keychain item. `keychain.ServiceName` always emits a suffixed name, so no code path can even name the canonical item.
 2. **No secrets in SQLite** — the macOS Keychain is the sole secret store.
 3. **Account dir strings are hashed for Keychain service names** — the path string `clp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
+
+Known follow-up (documented, test-pinned in `TestConcurrentPrepareAddIndexRace`): two concurrent `clp add`s can be handed the same account index because no row exists until FinalizeAdd; fixing it needs a pending-row reservation.
 
 ## Ask Before Assuming
 

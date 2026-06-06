@@ -13,6 +13,10 @@ type SymlinkProvider struct{}
 
 func (p *SymlinkProvider) Kind() Kind { return KindSymlink }
 
+// PrivateRoot is accountDir itself: private files live directly in the
+// account dir alongside the symlinks.
+func (p *SymlinkProvider) PrivateRoot(accountDir string) string { return accountDir }
+
 // Setup creates accountDir and asserts all links. Idempotent.
 func (p *SymlinkProvider) Setup(base, accountDir string) error {
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
@@ -23,7 +27,12 @@ func (p *SymlinkProvider) Setup(base, accountDir string) error {
 
 // Sync walks base's top-level entries and asserts the correct shape in
 // accountDir: a symlink for shared entries, a private dir for excluded ones.
+// Like Teardown, it refuses to operate on base itself — overlaying base onto
+// itself would replace the user's real entries with self-referential links.
 func (p *SymlinkProvider) Sync(base, accountDir string) error {
+	if accountDir == base || accountDir == "" {
+		return fmt.Errorf("refusing to overlay base dir %q onto itself", accountDir)
+	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return fmt.Errorf("read base dir: %w", err)
@@ -42,6 +51,9 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 				return err
 			}
 			continue
+		}
+		if PrivateEntry(name) {
+			continue // private file (e.g. .claude.json): never linked into accounts
 		}
 		if err := assertSymlink(filepath.Join(base, name), dst); err != nil {
 			return err
@@ -68,6 +80,9 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 				return fmt.Errorf("excluded entry %q is missing or a symlink", name)
 			}
 			continue
+		}
+		if PrivateEntry(name) {
+			continue // private files are account-local; nothing to verify against base
 		}
 		target, err := os.Readlink(dst)
 		if err != nil {
@@ -136,7 +151,9 @@ func assertPrivateDir(dst string) error {
 	fi, err := os.Lstat(dst)
 	if err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
-			if err := os.Remove(dst); err != nil {
+			// Tolerate a concurrent Sync (daemon vs CLI) racing to convert
+			// the same stale link: losing the Remove race is success.
+			if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 				return err
 			}
 		} else if fi.IsDir() {

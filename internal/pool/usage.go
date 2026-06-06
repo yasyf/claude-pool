@@ -19,56 +19,6 @@ const RefreshLeadTime = 10 * time.Minute
 // account must be re-logged-in interactively.
 var ErrNeedsLogin = errors.New("account needs re-login (refresh token missing or revoked)")
 
-// ErrRefuseAcctZeroRefresh is returned by refresh when asked to POST-refresh
-// acct-00, whose single-use refresh token is owned by plain `claude`.
-var ErrRefuseAcctZeroRefresh = errors.New("refusing to POST-refresh acct-00 (shared single-use token owned by plain claude)")
-
-// credServices returns the Keychain services that must be kept in sync for an
-// account, primary first. acct-00 has two: the canonical un-suffixed item plain
-// `claude` uses (source of truth) and a suffixed mirror that makes
-// `CLAUDE_CONFIG_DIR=~/.claude claude` work.
-func (m *Manager) credServices(a store.Account) []string {
-	if a.IsZero {
-		return []string{keychain.DefaultServiceName(), a.KeychainService}
-	}
-	return []string{a.KeychainService}
-}
-
-// readCredential reads the freshest credential across an account's services.
-// Caller must hold acctLock(a.ID).
-func (m *Manager) readCredential(a store.Account) (*keychain.Credential, string, error) {
-	var best *keychain.Credential
-	var bestSvc string
-	for _, svc := range m.credServices(a) {
-		c, err := m.Keychain.Read(svc, a.KeychainAccount)
-		if err != nil {
-			if errors.Is(err, keychain.ErrNotFound) {
-				continue
-			}
-			return nil, "", err
-		}
-		if best == nil || c.ClaudeAiOauth.ExpiresAt > best.ClaudeAiOauth.ExpiresAt {
-			best, bestSvc = c, svc
-		}
-	}
-	if best == nil {
-		return nil, "", keychain.ErrNotFound
-	}
-	return best, bestSvc, nil
-}
-
-// writeCredentialAll writes cred to every service in the account's sync set, so
-// acct-00's canonical item and mirror never diverge. Caller must hold
-// acctLock(a.ID).
-func (m *Manager) writeCredentialAll(a store.Account, cred *keychain.Credential) error {
-	for _, svc := range m.credServices(a) {
-		if err := m.Keychain.Write(svc, a.KeychainAccount, cred); err != nil {
-			return fmt.Errorf("write credential to %q: %w", svc, err)
-		}
-	}
-	return nil
-}
-
 // EnsureFreshToken returns the account's credential, refreshing it if the access
 // token expires within `within` and allowRefresh is true. A successful refresh
 // is written back to all of the account's services and logged. allowRefresh
@@ -84,15 +34,7 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 // compose it with fetchUsage's 401-retry under ONE continuous critical section
 // (sync.Mutex is not reentrant). Caller must hold acctLock(a.ID).
 func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, bool, error) {
-	// acct-00's refresh token is the one plain `claude` uses (the canonical and
-	// mirror items share it). Refreshing it here would consume that single-use
-	// token out from under a possibly-live plain claude → forced re-login. So we
-	// NEVER POST-refresh acct-00; plain claude (or a pooled acct-00 session)
-	// owns its lifecycle, and we only propagate whatever token it rotates to.
-	if a.IsZero {
-		allowRefresh = false
-	}
-	cred, _, err := m.readCredential(a)
+	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
 	if err != nil {
 		return nil, false, err
 	}
@@ -118,16 +60,9 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 
 // refresh performs the OAuth refresh and persists the new blob, preserving the
 // non-token fields from the prior credential. Caller must hold acctLock(a.ID).
-//
-// acct-00's refresh token is the single-use token plain `claude` owns; POST-
-// refreshing it here would log the user out. This is the linchpin guard: every
-// refresh path (EnsureFreshToken's pre-flight AND fetchUsage's 401 retry) funnels
-// through here, so refusing acct-00 at this chokepoint is what actually upholds
-// the invariant regardless of caller.
+// Every account's refresh token is its own independent grant (created by its
+// own `claude /login`), so refreshing here can never affect plain claude.
 func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.Credential) (*keychain.Credential, error) {
-	if a.IsZero {
-		return nil, ErrRefuseAcctZeroRefresh
-	}
 	tr, err := m.OAuth.Refresh(ctx, fmt.Sprintf("acct-%d", a.ID), prev.ClaudeAiOauth.RefreshToken)
 	if err != nil {
 		return nil, err
@@ -138,25 +73,28 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.C
 		next.ClaudeAiOauth.RefreshToken = tr.RefreshToken
 	}
 	next.ClaudeAiOauth.ExpiresAt = tr.Expiry(time.Now()).UnixMilli()
-	if err := m.writeCredentialAll(a, next); err != nil {
-		return nil, err
+	if err := m.Keychain.Write(a.KeychainService, a.KeychainAccount, next); err != nil {
+		return nil, fmt.Errorf("write credential to %q: %w", a.KeychainService, err)
 	}
 	return next, nil
 }
 
 // AdoptRotatedToken re-reads an account's credential from the Keychain (where a
-// live claude session may have rotated it) and propagates it across the
-// account's services, keeping acct-00's mirror in lockstep with the canonical
-// item. Used by the daemon on session check-in.
+// live claude session may have rotated it) and writes it straight back,
+// re-asserting our `security`-trusted ACL over the rotated item. Used by the
+// daemon on session check-in.
 func (m *Manager) AdoptRotatedToken(a store.Account) error {
 	mu := m.acctLock(a.ID)
 	mu.Lock()
 	defer mu.Unlock()
-	cred, _, err := m.readCredential(a)
+	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
 	if err != nil {
 		return err
 	}
-	return m.writeCredentialAll(a, cred)
+	if err := m.Keychain.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
+		return fmt.Errorf("write credential to %q: %w", a.KeychainService, err)
+	}
+	return nil
 }
 
 // SampleUsage fetches the account's usage windows, refreshing once on 401, and

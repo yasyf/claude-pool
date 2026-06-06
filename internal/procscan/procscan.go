@@ -3,9 +3,8 @@
 // environment of same-user processes (verified on the target machine), which
 // exposes CLAUDE_CONFIG_DIR.
 //
-// A claude process with no CLAUDE_CONFIG_DIR in its environment is using the
-// canonical ~/.claude dir, i.e. acct-00 (this is how plain `claude` sessions
-// are attributed).
+// A claude process with no CLAUDE_CONFIG_DIR in its environment is plain
+// `claude` on ~/.claude — not a pool session; it maps to no pool account.
 package procscan
 
 import (
@@ -19,7 +18,7 @@ import (
 // Session is a discovered live claude process.
 type Session struct {
 	PID       int
-	ConfigDir string // value of CLAUDE_CONFIG_DIR, or "" for the default dir
+	ConfigDir string // value of CLAUDE_CONFIG_DIR, or "" for plain claude
 }
 
 // psBin and its args are overridable in tests.
@@ -81,17 +80,16 @@ func isClaudeProcess(cmd string) bool {
 	return base == "claude"
 }
 
-// CountByConfigDir counts sessions whose ConfigDir matches configDir. The
-// empty/default account (acct-00) is matched by both an empty ConfigDir and one
-// equal to defaultDir (~/.claude), since launching acct-00 via a mirror sets
-// CLAUDE_CONFIG_DIR=~/.claude while plain `claude` leaves it unset.
-func CountByConfigDir(sessions []Session, configDir, defaultDir string) int {
+// CountByConfigDir counts sessions whose ConfigDir exactly matches configDir.
+// An empty configDir matches nothing: no pool account has an empty dir, and
+// plain-claude sessions (empty ConfigDir) belong to no pool account.
+func CountByConfigDir(sessions []Session, configDir string) int {
+	if configDir == "" {
+		return 0
+	}
 	n := 0
 	for _, s := range sessions {
-		switch {
-		case configDir == defaultDir && (s.ConfigDir == "" || s.ConfigDir == defaultDir):
-			n++
-		case s.ConfigDir == configDir && configDir != "":
+		if s.ConfigDir == configDir {
 			n++
 		}
 	}
