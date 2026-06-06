@@ -14,7 +14,7 @@ class CcPool < Formula
   homepage "https://github.com/yasyf/cc-pool"
   url "https://github.com/yasyf/cc-pool/archive/refs/tags/v0.2.0.tar.gz"
   sha256 "a19b49c0baff315bd488a0568f54579a1da6995c8f90531f4616b01176ad56cf"
-  license "MIT"
+  license "PolyForm-Noncommercial-1.0.0"
   head "https://github.com/yasyf/cc-pool.git", branch: "main"
 
   depends_on "go" => :build

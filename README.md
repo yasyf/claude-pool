@@ -1,7 +1,7 @@
 # cc-pool
 
 [![CI](https://img.shields.io/github/actions/workflow/status/yasyf/cc-pool/ci.yml?branch=main&label=CI)](https://github.com/yasyf/cc-pool/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/yasyf/cc-pool/blob/main/LICENSE)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/cc-pool/blob/main/LICENSE)
 
 **Predictive, start-of-session load-balancing across multiple Claude subscriptions — for macOS.**
 
@@ -150,4 +150,4 @@ build is pure Go; the optional fuse overlay needs cgo + fuse-t.
 
 ## License
 
-MIT © Yasyf Mohamedali
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) © Yasyf Mohamedali — free for noncommercial use; see [LICENSE](https://github.com/yasyf/cc-pool/blob/main/LICENSE).

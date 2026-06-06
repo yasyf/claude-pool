@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Relicensed from MIT to PolyForm Noncommercial 1.0.0.
+
 ## [0.1.0] - 2026-06-06
 
 ### Added
