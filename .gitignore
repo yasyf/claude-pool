@@ -22,3 +22,8 @@ coverage.txt
 
 # Go
 /vendor/
+
+# Claude Code
+.claude/settings.local.json
+.context/
+.env*

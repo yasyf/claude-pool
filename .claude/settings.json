@@ -1,0 +1,85 @@
+{
+  "effortLevel": "max",
+  "ultracode": true,
+  "alwaysThinkingEnabled": true,
+  "showThinkingSummaries": true,
+  "includeGitInstructions": false,
+  "env": {
+    "ENABLE_TOOL_SEARCH": "true",
+    "ENABLE_LSP_TOOL": "1",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1",
+    "JJ_CONFIG": ".claude/jj-config.toml"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(find:*)",
+      "Bash(gh api:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr view:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(head:*)",
+      "Bash(jq:*)",
+      "Bash(ls:*)",
+      "Bash(rg:*)",
+      "Bash(wc:*)"
+    ],
+    "defaultMode": "auto"
+  },
+  "extraKnownMarketplaces": {
+    "skills": {
+      "source": {
+        "source": "github",
+        "repo": "yasyf/skills"
+      },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "codex@skills": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run PreToolUse"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run PostToolUse"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run PostToolUseFailure"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uvx capt-hook run Stop"
+          }
+        ]
+      }
+    ]
+  }
+}

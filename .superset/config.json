@@ -1,0 +1,10 @@
+{
+  "setup": [
+    "CGO_ENABLED=0 go build ./cmd/cc-pool",
+    "jj git init --git-repo .",
+    "jj config set --user user.name \"Yasyf Mohamedali\"",
+    "jj config set --user user.email \"yasyfm@gmail.com\""
+  ],
+  "teardown": [],
+  "run": []
+}
