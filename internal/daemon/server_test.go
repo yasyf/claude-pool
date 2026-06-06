@@ -20,7 +20,7 @@ import (
 // newTestServer builds a Server over a temp-dir store with two accounts:
 // acct-1 emptier (util 10) than acct-2 (util 50), both freshly sampled. The
 // temp DefaultDir and config dirs guarantee procscan can never attribute a
-// real claude process to them, and the nonexistent keychain services make any
+// real claude process to them, and the empty fake keychain makes any
 // best-effort preflight refresh a harmless miss.
 func newTestServer(t *testing.T) (*Server, map[int]string) {
 	t.Helper()
@@ -46,7 +46,10 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		}
 	}
 	return &Server{
-		m:            &pool.Manager{Store: st, DefaultDir: filepath.Join(t.TempDir(), "claude")},
+		m: &pool.Manager{
+			Store: st, OAuth: &fakeOAuth{}, Keychain: newFakeKeychain(),
+			DefaultDir: filepath.Join(t.TempDir(), "claude"),
+		},
 		log:          log.New(io.Discard, "", 0),
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},
