@@ -133,21 +133,56 @@ func TestSyncRepairsBackupsSymlink(t *testing.T) {
 // atomic-write temp files.
 func TestPrivateEntry(t *testing.T) {
 	cases := map[string]bool{
-		".claude.json":              true,
-		".claude.json.tmp.ab12cd34": true,
-		".claude.json.backup.123":   true,
-		"daemon":                    true,
-		"ide":                       true,
-		"backups":                   true,
-		"projects":                  false,
-		"settings.json":             false,
-		".claude":                   false,
-		"claude.json":               false,
+		".claude.json":                   true,
+		".claude.json.tmp.ab12cd34":      true,
+		".claude.json.backup.123":        true,
+		".last-update-result.json":       true,
+		".last-update-result.json.tmp.x": true,
+		"daemon":                         true,
+		"ide":                            true,
+		"backups":                        true,
+		"projects":                       false,
+		"settings.json":                  false,
+		".claude":                        false,
+		"claude.json":                    false,
 	}
 	for name, want := range cases {
 		if got := PrivateEntry(name); got != want {
 			t.Errorf("PrivateEntry(%q) = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// TestSyncSkipsPreexistingLastUpdateResult reproduces the recurring daemon-log
+// error: claude rewrites .last-update-result.json atomically, replacing the
+// overlay's symlink with a real file. Because it is a PrivateEntry, Sync must
+// skip it and never error on the pre-existing real file.
+func TestSyncSkipsPreexistingLastUpdateResult(t *testing.T) {
+	base := makeBase(t)
+	// Base (~/.claude) has its own copy, so Sync iterates over the name.
+	if err := os.WriteFile(filepath.Join(base, ".last-update-result.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	acct := filepath.Join(t.TempDir(), "acct-01")
+	p := &SymlinkProvider{}
+	if err := p.Setup(base, acct); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate claude's atomic write: a real (non-symlink) file in the account dir.
+	if err := os.WriteFile(filepath.Join(acct, ".last-update-result.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A re-sync (what the daemon poll does) must not error on the real file.
+	if err := p.Sync(base, acct); err != nil {
+		t.Fatalf("Sync must skip the private .last-update-result.json, got: %v", err)
+	}
+	// It stays a private real file, never symlinked.
+	fi, err := os.Lstat(filepath.Join(acct, ".last-update-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error(".last-update-result.json should stay a private real file, not a symlink")
 	}
 }
 

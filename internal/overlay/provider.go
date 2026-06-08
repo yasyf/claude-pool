@@ -48,10 +48,14 @@ var skipEntries = map[string]bool{
 // PrivateEntry reports whether a top-level entry name is per-account private:
 // the excluded dirs above, plus claude's primary state file .claude.json and
 // its atomic-write temp files (.claude.json.tmp.XXXX), which hold per-account
-// identity (oauthAccount) and must never be shared or land in the base.
+// identity (oauthAccount) and must never be shared or land in the base; plus
+// .last-update-result.json (claude's auto-update result, instance-local), which
+// claude rewrites atomically — replacing the overlay's symlink with a real file
+// that Sync would otherwise refuse to relink on every poll.
 func PrivateEntry(name string) bool {
 	return ExcludedEntries[name] || name == ".claude.json" ||
-		strings.HasPrefix(name, ".claude.json.")
+		strings.HasPrefix(name, ".claude.json.") ||
+		strings.HasPrefix(name, ".last-update-result")
 }
 
 // Provider establishes and maintains an overlay of base at accountDir.
