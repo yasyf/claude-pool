@@ -20,11 +20,42 @@ session on the emptiest account:
 
     CLAUDE_CONFIG_DIR=$(clp select) claude
 
+Run bare ` + "`clp`" + ` to get started: on an empty pool it walks you through adding
+your subscriptions (offering to adopt your current login — a read-only copy);
+once accounts exist it shows the status table.
+
 Plain ` + "`claude`" + ` keeps working untouched on ~/.claude — it is never part
 of the pool.`,
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// Args deliberately left nil: cobra's legacyArgs already rejects
+		// unknown subcommands on a root that has children (with suggestions),
+		// so RunE only ever runs for bare `clp`.
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return withManager(func(m *pool.Manager) error {
+				initialized, err := m.Initialized()
+				if err != nil {
+					return err
+				}
+				accounts := 0
+				if initialized {
+					accts, err := m.Store.ListAccounts()
+					if err != nil {
+						return err
+					}
+					accounts = len(accts)
+				}
+				switch bareAction(initialized, accounts, isTTY()) {
+				case actionStatus:
+					return runStatus(cmd, m, false, false)
+				case actionAdd:
+					return runAdd(cmd, m, addOptions{})
+				default:
+					return fmt.Errorf("no accounts — run `clp add` to pool your first subscription")
+				}
+			})
+		},
 	}
 	root.SetVersionTemplate("{{.Version}}\n")
 
@@ -42,6 +73,28 @@ of the pool.`,
 		newDaemonCmd(),
 	)
 	return root
+}
+
+// rootAction is what bare `clp` does for a given pool state.
+type rootAction int
+
+const (
+	actionStatus rootAction = iota // pool has accounts → show status
+	actionAdd                      // empty pool on a TTY → interactive onboarding
+	actionErr                      // empty pool, no TTY → fail loud
+)
+
+// bareAction routes bare `clp`: a populated pool shows status; an empty or
+// uninitialized one onboards interactively, or errors when no TTY is attached.
+func bareAction(initialized bool, accounts int, tty bool) rootAction {
+	switch {
+	case initialized && accounts > 0:
+		return actionStatus
+	case tty:
+		return actionAdd
+	default:
+		return actionErr
+	}
 }
 
 // withManager opens a Manager, runs fn, and closes it.

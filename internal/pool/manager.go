@@ -18,11 +18,25 @@ type Refresher interface {
 }
 
 // CredentialStore is the slice of package keychain the Manager needs for
-// credential reads, writes, and deletes.
+// credential reads, writes, and deletes. Discover resolves the account (-a)
+// label actually stored on a service's item — items written by `claude /login`
+// carry whatever label claude derived at the time, which may not match a label
+// recomputed later, so deletions of claude-written items must discover first.
 type CredentialStore interface {
 	Read(service, account string) (*keychain.Credential, error)
 	Write(service, account string, cred *keychain.Credential) error
 	Delete(service, account string) error
+	Discover(service string) (string, error)
+}
+
+// CanonicalReader is the read-only seam onto plain claude's canonical
+// unsuffixed Keychain item, used solely by `clp add` adoption. It is kept
+// separate from CredentialStore on purpose: the seam has no write or delete
+// methods, so mutating the canonical item is impossible to express through it
+// (safety rule 1's read-only exception, enforced by the type system).
+type CanonicalReader interface {
+	CanonicalExists() bool
+	ReadCanonical() (*keychain.Credential, error)
 }
 
 // sysKeychain adapts package keychain's process-global functions to
@@ -41,13 +55,30 @@ func (sysKeychain) Delete(service, account string) error {
 	return keychain.Delete(service, account)
 }
 
+func (sysKeychain) Discover(service string) (string, error) {
+	return keychain.DiscoverAccount(service)
+}
+
+// sysCanonical adapts package keychain's canonical accessors to
+// CanonicalReader.
+type sysCanonical struct{}
+
+func (sysCanonical) CanonicalExists() bool {
+	return keychain.CanonicalExists()
+}
+
+func (sysCanonical) ReadCanonical() (*keychain.Credential, error) {
+	return keychain.ReadCanonical()
+}
+
 // Manager is the high-level façade over the store, the OAuth client, and the
 // Keychain/overlay machinery. CLI commands, the TUI wizards, and the daemon all
 // go through it.
 type Manager struct {
-	Store    *store.Store
-	OAuth    Refresher
-	Keychain CredentialStore
+	Store     *store.Store
+	OAuth     Refresher
+	Keychain  CredentialStore
+	Canonical CanonicalReader
 
 	// muMap guards locks; locks holds one mutex per account ID serializing that
 	// account's credential read→refresh→write cycle. These per-account mutexes
@@ -84,9 +115,10 @@ func Open() (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{
-		Store:    st,
-		OAuth:    oauth.New(),
-		Keychain: sysKeychain{},
+		Store:     st,
+		OAuth:     oauth.New(),
+		Keychain:  sysKeychain{},
+		Canonical: sysCanonical{},
 	}, nil
 }
 

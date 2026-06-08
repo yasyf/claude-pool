@@ -7,6 +7,10 @@
 // `security` PROMPT-FREE, because the item ACL trusts that signed Apple binary
 // rather than ours. This sidesteps every ad-hoc-signing / TCC concern. Claude
 // Code itself reads and writes via `security`, so we share its trust domain.
+//
+// The canonical unsuffixed item plain `claude` owns is reachable only through
+// the read-only accessors CanonicalExists and ReadCanonical (used by `clp add`
+// adoption); no code path in cc-pool names it for a write or a delete.
 package keychain
 
 import (
@@ -152,15 +156,27 @@ func Delete(service, account string) error {
 	return nil
 }
 
-// Exists reports whether an item exists under (service, account) without
-// reading the secret (no -w, so no value is fetched).
-func Exists(service, account string) bool {
-	if account == "" {
-		account = AccountLabel()
+// CanonicalExists reports whether plain `claude`'s canonical credential item —
+// the unsuffixed "Claude Code-credentials" service used when CLAUDE_CONFIG_DIR
+// is unset — exists. Attribute-only: the secret is never fetched, so this is
+// safe to call before the user has consented to adoption.
+func CanonicalExists() bool {
+	_, err := DiscoverAccount(baseService)
+	return err == nil
+}
+
+// ReadCanonical reads plain `claude`'s canonical credential item. READ-ONLY
+// contract: together with CanonicalExists this is the only code path in
+// cc-pool that can name the canonical item, and nothing may ever write or
+// delete it. `clp add` adoption uses it to copy the user's current login into
+// a pool account's own suffixed item. Returns ErrNotFound when plain claude
+// has no stored login.
+func ReadCanonical() (*Credential, error) {
+	account, err := DiscoverAccount(baseService)
+	if err != nil {
+		return nil, err
 	}
-	cmd := exec.Command(securityBin,
-		"find-generic-password", "-a", account, "-s", service)
-	return cmd.Run() == nil
+	return Read(baseService, account)
 }
 
 // Reassert reads the item under (service, account) and writes it straight back

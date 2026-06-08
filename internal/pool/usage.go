@@ -60,8 +60,9 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 
 // refresh performs the OAuth refresh and persists the new blob, preserving the
 // non-token fields from the prior credential. Caller must hold acctLock(a.ID).
-// Every account's refresh token is its own independent grant (created by its
-// own `claude /login`), so refreshing here can never affect plain claude.
+// Every account runs its own token chain — created by its own `claude /login`,
+// or copied at adopt time and immediately refreshed onto its own chain — and
+// refreshing a pool account's credential never affects plain claude.
 func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.Credential) (*keychain.Credential, error) {
 	tr, err := m.OAuth.Refresh(ctx, fmt.Sprintf("acct-%d", a.ID), prev.ClaudeAiOauth.RefreshToken)
 	if err != nil {

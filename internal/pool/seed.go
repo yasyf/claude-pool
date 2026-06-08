@@ -69,27 +69,34 @@ func seedClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (SeedOutc
 		return "", fmt.Errorf("encode seeded config: %w", err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return "", err
+	if err := writeAtomic0600(dst, out); err != nil {
+		return "", fmt.Errorf("install seeded config: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".claude.json.seed.*")
+	return SeedCopied, nil
+}
+
+// writeAtomic0600 writes data to dst via temp+rename in dst's directory, so a
+// concurrent reader never sees a partial file. Creates the directory if
+// missing.
+func writeAtomic0600(dst string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp.*")
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer os.Remove(tmp.Name()) // no-op after a successful rename
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return "", err
+		return err
 	}
-	if _, err := tmp.Write(out); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		return "", err
+		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return "", err
+		return err
 	}
-	if err := os.Rename(tmp.Name(), dst); err != nil {
-		return "", fmt.Errorf("install seeded config: %w", err)
-	}
-	return SeedCopied, nil
+	return os.Rename(tmp.Name(), dst)
 }

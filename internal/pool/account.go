@@ -25,7 +25,8 @@ type InitResult struct {
 // Init prepares the pool: ~/.cc-pool state dirs, the overlay provider choice
 // for new accounts, and the initialized marker. It never touches ~/.claude or
 // the Keychain — accounts (including the user's main subscription) join via
-// Add with their own independent login. Idempotent.
+// Add, by adopting your current login or with their own independent login.
+// Idempotent.
 func (m *Manager) Init() (*InitResult, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err
@@ -55,13 +56,19 @@ type PendingAdd struct {
 	OverlayKind     overlay.Kind
 	LoginCommand    string
 	ClaudeJSONSeed  SeedOutcome
+
+	// PurgedStaleCredential reports that PrepareAdd found and deleted a
+	// leftover Keychain item from a previous abandoned add at this index.
+	PurgedStaleCredential bool
 }
 
 // PrepareAdd allocates the next account dir, establishes its overlay, and
 // seeds its private .claude.json from plain claude's (~/.claude.json) so the
 // login session inherits onboarding state and settings instead of running the
-// first-run wizard. It returns the login command the user must run. No account
-// row or Keychain item is created yet — FinalizeAdd does that once the login
+// first-run wizard. It returns the login command the user must run. Unless the
+// dir is being reused (SeedKeptExisting), any stale Keychain item left under
+// the dir's service by an earlier dead attempt is deleted. No account row or
+// new Keychain item is created yet — FinalizeAdd does that once the login
 // lands.
 func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	ok, err := m.Initialized()
@@ -89,13 +96,35 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		return nil, fmt.Errorf("seed .claude.json for %s: %w", acctDir, err)
 	}
 	svc := keychain.ServiceName(acctDir)
+	purged := false
+	if seed != SeedKeptExisting {
+		// A leftover item under this service is garbage from a dead attempt
+		// (an abandoned add, or `clp remove --keep-credential` followed by
+		// index reuse); left in place, FinalizeAdd would register the stale
+		// credential. Probe by service alone (Discover), not a recomputed
+		// account label — the item carries whatever -a label claude stored at
+		// its login. SeedKeptExisting keeps it — the documented reuse path.
+		account, err := m.Keychain.Discover(svc)
+		switch {
+		case errors.Is(err, keychain.ErrNotFound):
+			// nothing to purge
+		case err != nil:
+			return nil, fmt.Errorf("probe stale credential for %s: %w", acctDir, err)
+		default:
+			if derr := m.Keychain.Delete(svc, account); derr != nil {
+				return nil, fmt.Errorf("purge stale credential for %s: %w", acctDir, derr)
+			}
+			purged = true
+		}
+	}
 	return &PendingAdd{
-		Index:           n,
-		ConfigDir:       acctDir,
-		KeychainService: svc,
-		OverlayKind:     kind,
-		LoginCommand:    fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude /login", acctDir),
-		ClaudeJSONSeed:  seed,
+		Index:                 n,
+		ConfigDir:             acctDir,
+		KeychainService:       svc,
+		OverlayKind:           kind,
+		LoginCommand:          fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude /login", acctDir),
+		ClaudeJSONSeed:        seed,
+		PurgedStaleCredential: purged,
 	}, nil
 }
 
@@ -137,10 +166,23 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 	return &acct, nil
 }
 
-// AbandonAdd cleans up a prepared-but-not-finalized account dir. p must be a
-// non-nil PendingAdd returned by PrepareAdd.
+// AbandonAdd cleans up a prepared-but-not-finalized account dir (no store row
+// exists at this stage), including any credential a completed-but-unfinalized
+// login wrote to its Keychain item. The item's account label is discovered,
+// not recomputed — claude wrote it. p must be a non-nil PendingAdd returned by
+// PrepareAdd.
 func (m *Manager) AbandonAdd(p *PendingAdd) error {
-	return m.removeAccountDir(overlay.For(p.OverlayKind), p.ConfigDir)
+	var credErr error
+	account, err := m.Keychain.Discover(p.KeychainService)
+	switch {
+	case errors.Is(err, keychain.ErrNotFound):
+		// no credential to roll back
+	case err != nil:
+		credErr = fmt.Errorf("probe credential for %s: %w", p.ConfigDir, err)
+	default:
+		credErr = m.Keychain.Delete(p.KeychainService, account)
+	}
+	return errors.Join(credErr, m.removeAccountDir(overlay.For(p.OverlayKind), p.ConfigDir))
 }
 
 // Remove deletes an account from the pool: tears down its overlay, removes its

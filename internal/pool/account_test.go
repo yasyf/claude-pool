@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -98,7 +99,7 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	}
 
 	st := openTestStore(t)
-	m := &Manager{Store: st}
+	m := &Manager{Store: st, Keychain: newFakeKeychain()}
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +149,138 @@ func TestPrepareAddRequiresInit(t *testing.T) {
 	}
 }
 
+// TestPrepareAddPurgesStaleKeychainItem pins the stale-item fix: an abandoned
+// add (or `clp remove --keep-credential`) can leave a credential under a
+// service name a later add at the same index reuses; PrepareAdd must purge it
+// (else the login watcher false-positives and FinalizeAdd registers a stale
+// credential) — EXCEPT for SeedKeptExisting, the documented reuse path.
+func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
+	setup := func(t *testing.T) (*Manager, *fakeKeychain, string) {
+		t.Helper()
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv("USER", "tester")
+		if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fk := newFakeKeychain()
+		m := &Manager{Store: openTestStore(t), Keychain: fk}
+		if _, err := m.Init(); err != nil {
+			t.Fatal(err)
+		}
+		svc := keychain.ServiceName(AccountDir(1))
+		stale := &keychain.Credential{}
+		stale.ClaudeAiOauth.AccessToken = "at-stale"
+		if err := fk.Write(svc, "tester", stale); err != nil {
+			t.Fatal(err)
+		}
+		return m, fk, svc
+	}
+
+	t.Run("fresh dir purges the leftover", func(t *testing.T) {
+		m, fk, svc := setup(t)
+		pending, err := m.PrepareAdd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pending.PurgedStaleCredential {
+			t.Error("PurgedStaleCredential not reported")
+		}
+		if _, err := fk.Read(svc, "tester"); err != keychain.ErrNotFound {
+			t.Errorf("stale item survived: %v", err)
+		}
+		if del := fk.deletedServices(); len(del) != 1 || del[0] != svc {
+			t.Errorf("deletes = %v, want exactly [%q]", del, svc)
+		}
+	})
+
+	t.Run("purges an item stored under a different -a label", func(t *testing.T) {
+		// The stale item carries whatever label claude derived at ITS login
+		// (USER drift, fallback label); the purge must discover it by service,
+		// like every consumer does, not recompute today's label.
+		m, fk, svc := setup(t)
+		if err := fk.Delete(svc, "tester"); err != nil {
+			t.Fatal(err)
+		}
+		stale := &keychain.Credential{}
+		stale.ClaudeAiOauth.AccessToken = "at-stale"
+		if err := fk.Write(svc, "someone-else", stale); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := m.PrepareAdd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pending.PurgedStaleCredential {
+			t.Error("PurgedStaleCredential not reported")
+		}
+		if _, err := fk.Read(svc, "someone-else"); err != keychain.ErrNotFound {
+			t.Errorf("label-mismatched stale item survived: %v", err)
+		}
+	})
+
+	t.Run("kept-existing dir keeps the credential", func(t *testing.T) {
+		m, fk, svc := setup(t)
+		// A logged-in .claude.json from a prior attempt → SeedKeptExisting.
+		acct := AccountDir(1)
+		if err := os.MkdirAll(acct, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		loggedIn := `{"oauthAccount": {"accountUuid": "u-prior"}}`
+		if err := os.WriteFile(filepath.Join(acct, ".claude.json"), []byte(loggedIn), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := m.PrepareAdd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending.ClaudeJSONSeed != SeedKeptExisting {
+			t.Fatalf("seed outcome = %q, want %q", pending.ClaudeJSONSeed, SeedKeptExisting)
+		}
+		if pending.PurgedStaleCredential {
+			t.Error("reuse path must not purge")
+		}
+		if _, err := fk.Read(svc, "tester"); err != nil {
+			t.Errorf("kept credential was purged: %v", err)
+		}
+	})
+}
+
+// TestAbandonAddDeletesKeychainItem pins that rolling back a half-added
+// account also rolls back the credential its login wrote.
+func TestAbandonAddDeletesKeychainItem(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USER", "tester")
+	if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fk := newFakeKeychain()
+	m := &Manager{Store: openTestStore(t), Keychain: fk}
+	if _, err := m.Init(); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := m.PrepareAdd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the interactive login landing a credential — under a label that
+	// differs from today's AccountLabel(), which the rollback must discover.
+	cred := &keychain.Credential{}
+	cred.ClaudeAiOauth.AccessToken = "at-login"
+	if err := fk.Write(pending.KeychainService, "claude-wrote-this", cred); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.AbandonAdd(pending); err != nil {
+		t.Fatalf("AbandonAdd: %v", err)
+	}
+	if _, err := fk.Read(pending.KeychainService, "claude-wrote-this"); err != keychain.ErrNotFound {
+		t.Errorf("credential survived the rollback: %v", err)
+	}
+	if _, err := os.Stat(pending.ConfigDir); !os.IsNotExist(err) {
+		t.Errorf("account dir survived the rollback: %v", err)
+	}
+}
+
 // TestConcurrentPrepareAddIndexRace documents the known index-reservation gap:
 // two concurrent PrepareAdds (no row until FinalizeAdd) are handed the same
 // index and thus the same dir + derived Keychain service. Fixing it needs a
@@ -159,7 +292,7 @@ func TestConcurrentPrepareAddIndexRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := openTestStore(t)
-	m := &Manager{Store: st}
+	m := &Manager{Store: st, Keychain: newFakeKeychain()}
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}

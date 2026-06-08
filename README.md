@@ -56,7 +56,9 @@ alias cl='CLAUDE_CONFIG_DIR=$(clp select) claude'
 `~/.claude` is **never moved** and never registered as a pool account. It stays
 the canonical config dir — plain `claude` keeps working exactly as before — and
 serves as the **shared base** every pooled account mirrors. The pool never
-reads or writes plain claude's credential or state.
+writes plain claude's credential or state (`clp add` can adopt your current
+login when it isn't pooled yet: a read-only copy, immediately refreshed onto
+its own independent token chain).
 
 ### One real config dir per account
 
@@ -66,8 +68,8 @@ gets a suffixed item `Claude Code-credentials-<hash>`. cc-pool gives each
 account a real, unique dir (`~/.cc-pool/accounts/acct-NN`) so each gets its own
 Keychain item, its own independent OAuth grant (its own refresh-token chain),
 and runs on its own **subscription** (never API billing). Each account dir is
-also seeded with a copy of your `~/.claude.json` (identity stripped — login
-writes the account's own), so pooled sessions inherit your settings, MCP
+also seeded with a copy of your `~/.claude.json` (identity stripped — login or
+adoption writes the account's own), so pooled sessions inherit your settings, MCP
 servers, and per-project tool approvals instead of running first-run
 onboarding.
 

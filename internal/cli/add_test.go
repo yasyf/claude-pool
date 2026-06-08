@@ -1,0 +1,44 @@
+package cli
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/yasyf/cc-pool/internal/overlay"
+)
+
+func TestDefaultLabel(t *testing.T) {
+	withIdentity := func(t *testing.T, oauthJSON string) string {
+		t.Helper()
+		dir := t.TempDir()
+		if oauthJSON != "" {
+			body := `{"oauthAccount": ` + oauthJSON + `}`
+			if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+
+	t.Run("explicit label wins over the account email", func(t *testing.T) {
+		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me@example.com"}`)
+		if got := defaultLabel("work", overlay.KindSymlink, dir); got != "work" {
+			t.Errorf("defaultLabel = %q, want the explicit %q", got, "work")
+		}
+	})
+
+	t.Run("empty label prefills the account email", func(t *testing.T) {
+		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me@example.com"}`)
+		if got := defaultLabel("", overlay.KindSymlink, dir); got != "me@example.com" {
+			t.Errorf("defaultLabel = %q, want the account email", got)
+		}
+	})
+
+	t.Run("unreadable identity stays empty", func(t *testing.T) {
+		dir := withIdentity(t, "")
+		if got := defaultLabel("", overlay.KindSymlink, dir); got != "" {
+			t.Errorf("defaultLabel = %q, want empty", got)
+		}
+	})
+}

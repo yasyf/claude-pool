@@ -15,9 +15,9 @@ func newInitCmd() *cobra.Command {
 		Short: "Prepare the pool state dir and start the daemon (optional — `clp add` does this automatically)",
 		Long: `init prepares ~/.cc-pool (state db, account dirs), records the overlay
 provider, and starts the background daemon. It never touches ~/.claude or any
-credential — accounts (including your main subscription) join via ` + "`clp add`" + `
-with their own independent login. Running it explicitly is optional: ` + "`clp add`" + `
-performs the same setup automatically.`,
+credential — accounts (including your main subscription) join via ` + "`clp add`" + `,
+by adopting your current login or with their own independent login. Running it
+explicitly is optional: ` + "`clp add`" + ` performs the same setup automatically.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {

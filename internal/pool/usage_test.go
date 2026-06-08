@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,12 +11,17 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// TestPoolNeverTouchesDefaultKeychainItem pins the #1 safety invariant: the
-// pool must never read, write, or delete the canonical unsuffixed item plain
-// `claude` owns ("Claude Code-credentials"). Every credential op is driven
-// through a fake that logs the services named; the canonical name must never
-// appear, and every op must use exactly the account's own suffixed service.
+// TestPoolNeverTouchesDefaultKeychainItem pins the #1 safety invariant: no
+// CredentialStore op — read, write, or delete — ever names the canonical
+// unsuffixed item plain `claude` owns ("Claude Code-credentials"). The sole
+// sanctioned canonical access is the read-only CanonicalReader seam used by
+// adoption (pinned separately in adopt_test.go). Every credential op,
+// including a full AdoptCredential, is driven through a fake that logs the
+// services named; the canonical name must never appear, and every op must use
+// exactly the involved account's own suffixed service.
 func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USER", "user")
 	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -53,6 +59,29 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 		t.Fatalf("Remove: %v", err)
 	}
 
+	// Drive a full adoption of plain claude's login into a second account. The
+	// canonical credential arrives through the read-only CanonicalReader seam;
+	// every CredentialStore op it triggers must still name only the pending
+	// account's own suffixed service.
+	if err := os.WriteFile(ClaudeJSONPath(),
+		[]byte(`{"oauthAccount": {"accountUuid": "u-main", "emailAddress": "me@example.com"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canonical := &keychain.Credential{}
+	canonical.ClaudeAiOauth.AccessToken = "at-canon"
+	canonical.ClaudeAiOauth.RefreshToken = fo.currentRT // accepted by the fake provider
+	m.Canonical = &fakeCanonical{cred: canonical}
+	dir2 := filepath.Join(t.TempDir(), "acct-02")
+	if err := os.MkdirAll(dir2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	svc2 := keychain.ServiceName(dir2)
+	p := &PendingAdd{Index: 2, ConfigDir: dir2, KeychainService: svc2, OverlayKind: "symlink"}
+	want := Identity{AccountUUID: "u-main", EmailAddress: "me@example.com"}
+	if err := m.AdoptCredential(context.Background(), p, want); err != nil {
+		t.Fatalf("AdoptCredential: %v", err)
+	}
+
 	touched := fk.touchedServices()
 	if len(touched) == 0 {
 		t.Fatal("no keychain ops recorded; the test exercised nothing")
@@ -61,8 +90,8 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 		if s == "Claude Code-credentials" {
 			t.Fatalf("op %d named the canonical unsuffixed item", i)
 		}
-		if s != svc {
-			t.Errorf("op %d named service %q, want %q", i, s, svc)
+		if s != svc && s != svc2 {
+			t.Errorf("op %d named service %q, want %q or %q", i, s, svc, svc2)
 		}
 	}
 	if del := fk.deletedServices(); len(del) != 1 || del[0] != svc {

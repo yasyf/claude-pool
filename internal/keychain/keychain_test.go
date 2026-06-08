@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -87,9 +88,6 @@ func TestSecurityRoundTrip(t *testing.T) {
 	if err := Write(svc, acct, cred); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if !Exists(svc, acct) {
-		t.Fatal("Exists should be true after Write")
-	}
 	got, err := Read(svc, acct)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -106,11 +104,89 @@ func TestSecurityRoundTrip(t *testing.T) {
 	if err := Delete(svc, acct); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if Exists(svc, acct) {
-		t.Fatal("Exists should be false after Delete")
+	if _, err := Read(svc, acct); err != ErrNotFound {
+		t.Fatalf("Read after Delete = %v, want ErrNotFound", err)
 	}
 	if err := Delete(svc, acct); err != nil {
 		t.Fatalf("Delete of missing should be nil, got %v", err)
+	}
+}
+
+// TestReadCanonical drives the read-only canonical accessors against the fake
+// `security` binary: they must find the unsuffixed item plain claude owns (via
+// its stored -a attribute, not a recomputed label), report ErrNotFound / false
+// when it is absent, and — the consent contract — CanonicalExists must never
+// fetch the secret (no -w invocation) while ReadCanonical fetches it exactly
+// once.
+func TestReadCanonical(t *testing.T) {
+	dir := t.TempDir()
+	storeDir := filepath.Join(dir, "items")
+	if err := os.MkdirAll(storeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fake := writeFakeSecurity(t, dir, storeDir)
+
+	old := securityBin
+	securityBin = fake
+	t.Cleanup(func() { securityBin = old })
+
+	// secretFetches counts `security ... -w` invocations since the last call.
+	callsLog := filepath.Join(storeDir, "calls.log")
+	seen := 0
+	secretFetches := func(t *testing.T) int {
+		t.Helper()
+		b, err := os.ReadFile(callsLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		for _, l := range lines[seen:] {
+			if strings.Contains(l, " -w") || strings.HasSuffix(l, "-w") {
+				n++
+			}
+		}
+		seen = len(lines)
+		return n
+	}
+
+	if CanonicalExists() {
+		t.Fatal("CanonicalExists should be false on an empty store")
+	}
+	if _, err := ReadCanonical(); err != ErrNotFound {
+		t.Fatalf("ReadCanonical on empty store = %v, want ErrNotFound", err)
+	}
+	if n := secretFetches(t); n != 0 {
+		t.Fatalf("empty-store probes fetched the secret %d time(s)", n)
+	}
+
+	// Seed the canonical item under an -a label that differs from $USER, to
+	// prove ReadCanonical discovers the stored attribute instead of recomputing.
+	t.Setenv("USER", "someone-else")
+	cred := &Credential{}
+	cred.ClaudeAiOauth.AccessToken = "at-canon"
+	cred.ClaudeAiOauth.RefreshToken = "rt-canon"
+	cred.ClaudeAiOauth.ExpiresAt = 1700000000000
+	if err := Write(baseService, "real-owner", cred); err != nil {
+		t.Fatalf("seed canonical: %v", err)
+	}
+	_ = secretFetches(t) // reset the cursor past the seed write
+
+	if !CanonicalExists() {
+		t.Fatal("CanonicalExists should be true after seeding")
+	}
+	if n := secretFetches(t); n != 0 {
+		t.Fatalf("CanonicalExists fetched the secret %d time(s); it must be attribute-only (pre-consent)", n)
+	}
+	got, err := ReadCanonical()
+	if err != nil {
+		t.Fatalf("ReadCanonical: %v", err)
+	}
+	if n := secretFetches(t); n != 1 {
+		t.Fatalf("ReadCanonical fetched the secret %d time(s), want exactly 1", n)
+	}
+	if got.ClaudeAiOauth.AccessToken != "at-canon" || got.ClaudeAiOauth.RefreshToken != "rt-canon" {
+		t.Fatalf("ReadCanonical round-trip mismatch: %+v", got.ClaudeAiOauth)
 	}
 }
 
@@ -121,6 +197,7 @@ func writeFakeSecurity(t *testing.T, dir, storeDir string) string {
 	script := `#!/bin/bash
 set -e
 STORE="` + storeDir + `"
+printf '%s\n' "$*" >> "$STORE/calls.log"
 op="$1"; shift
 acct=""; svc=""; pw=""; want_pw=0
 while [ $# -gt 0 ]; do

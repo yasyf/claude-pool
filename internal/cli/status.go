@@ -33,37 +33,43 @@ func newStatusCmd() *cobra.Command {
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				render := func() error {
-					snaps, src, err := gatherStatus(cmd.Context(), m, live)
-					if err != nil {
-						return err
-					}
-					out := renderTable(snaps, src)
-					if watch {
-						fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
-					}
-					fmt.Fprintln(cmd.OutOrStdout(), out)
-					return nil
-				}
-				if !watch {
-					return render()
-				}
-				for {
-					if err := render(); err != nil {
-						return err
-					}
-					select {
-					case <-cmd.Context().Done():
-						return nil
-					case <-time.After(5 * time.Second):
-					}
-				}
+				return runStatus(cmd, m, watch, live)
 			})
 		},
 	}
 	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "refresh continuously")
 	cmd.Flags().BoolVar(&live, "live", false, "force live sampling even if the daemon is running")
 	return cmd
+}
+
+// runStatus renders the status table (once, or continuously with watch). Both
+// `clp status` and bare `clp` dispatch here.
+func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live bool) error {
+	render := func() error {
+		snaps, src, err := gatherStatus(cmd.Context(), m, live)
+		if err != nil {
+			return err
+		}
+		out := renderTable(snaps, src)
+		if watch {
+			fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), out)
+		return nil
+	}
+	if !watch {
+		return render()
+	}
+	for {
+		if err := render(); err != nil {
+			return err
+		}
+		select {
+		case <-cmd.Context().Done():
+			return nil
+		case <-time.After(5 * time.Second):
+		}
+	}
 }
 
 // gatherStatus prefers the daemon's cached view, falling back to live sampling.

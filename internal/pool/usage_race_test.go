@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -58,6 +59,21 @@ func (f *fakeKeychain) Delete(service, account string) error {
 	f.deleted = append(f.deleted, service)
 	delete(f.items, f.key(service, account))
 	return nil
+}
+
+// Discover mirrors keychain.DiscoverAccount: the stored account label for a
+// service, found by service alone.
+func (f *fakeKeychain) Discover(service string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.touched = append(f.touched, service)
+	prefix := service + "\x00"
+	for k := range f.items {
+		if strings.HasPrefix(k, prefix) {
+			return strings.TrimPrefix(k, prefix), nil
+		}
+	}
+	return "", keychain.ErrNotFound
 }
 
 func (f *fakeKeychain) touchedServices() []string {

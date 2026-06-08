@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,18 @@ func (f *fakeKeychain) Delete(service, account string) error {
 	defer f.mu.Unlock()
 	delete(f.items, f.key(service, account))
 	return nil
+}
+
+func (f *fakeKeychain) Discover(service string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prefix := service + "\x00"
+	for k := range f.items {
+		if strings.HasPrefix(k, prefix) {
+			return strings.TrimPrefix(k, prefix), nil
+		}
+	}
+	return "", keychain.ErrNotFound
 }
 
 func (f *fakeKeychain) writeCount() int {

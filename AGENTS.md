@@ -41,7 +41,7 @@ Two filesystem trees, never confused:
 
 Safety rules baked into the architecture — do not regress them:
 
-1. **The pool NEVER touches the canonical unsuffixed Keychain item (`Claude Code-credentials`) or plain claude's OAuth state.** Every pool account — including the user's main subscription — has its own config dir, its own independent OAuth grant (own refresh-token chain, created by its own `claude /login`), and its own suffixed Keychain item. `keychain.ServiceName` always emits a suffixed name, so no code path can even name the canonical item.
+1. **The pool NEVER writes or deletes the canonical unsuffixed Keychain item (`Claude Code-credentials`) and never mutates plain claude's OAuth state.** One read-only exception: `clp add` adoption may READ the canonical item via `keychain.ReadCanonical`/`CanonicalExists` — exposed to the pool only through the write-less `pool.CanonicalReader` seam, so mutation is impossible to express — to copy the user's current login into a pool account's own suffixed item, which is then immediately refreshed onto its own chain. Every pool account — including the user's main subscription — still has its own config dir, its own refresh-token chain, and its own suffixed Keychain item. `keychain.ServiceName` always emits a suffixed name; outside the canonical accessors, no code path can even name the canonical item.
 2. **No secrets in SQLite** — the macOS Keychain is the sole secret store.
 3. **Account dir strings are hashed for Keychain service names** — the path string `clp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
 
