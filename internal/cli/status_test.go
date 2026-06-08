@@ -75,9 +75,45 @@ func TestRenderTablePlain(t *testing.T) {
 	if !strings.Contains(lines[1], "best@example.com") || !strings.HasSuffix(strings.TrimRight(lines[1], " "), "-") {
 		t.Errorf("best row should end with '-' for an unknown reset\n%q", lines[1])
 	}
+	// The busy row's known reset now renders as an absolute clock (AM/PM), not a
+	// relative "2h03m" duration.
+	if !strings.Contains(lines[2], "AM") && !strings.Contains(lines[2], "PM") {
+		t.Errorf("busy row should show an absolute reset clock, got %q", lines[2])
+	}
 
 	if !strings.Contains(out, "next pick") || !strings.Contains(out, "% used") {
 		t.Errorf("missing legend line\n%s", out)
+	}
+}
+
+// TestHumanizeResetAt pins the absolute-reset formatter against a fixed now
+// (Monday 2026-06-08 10:00 local). Inputs are built in time.Local so the
+// formatter's .Local() is a no-op and the expected strings hold in any zone.
+func TestHumanizeResetAt(t *testing.T) {
+	now := time.Date(2026, 6, 8, 10, 0, 0, 0, time.Local) // Monday
+	at := func(mo, d, h, min int) time.Time {
+		return time.Date(2026, time.Month(mo), d, h, min, 0, 0, time.Local)
+	}
+	cases := map[string]struct {
+		in   time.Time
+		want string
+	}{
+		"zero / no window":      {time.Time{}, "-"},
+		"later today":           {at(6, 8, 15, 58), "3:58 PM"},
+		"earlier today (past)":  {at(6, 8, 8, 30), "8:30 AM"},
+		"yesterday (stale)":     {at(6, 7, 15, 58), "3:58 PM"},
+		"tomorrow":              {at(6, 9, 15, 58), "tomorrow 3:58 PM"},
+		"two days (weekday)":    {at(6, 10, 15, 58), "Wed 3:58 PM"},
+		"six days (edge in)":    {at(6, 14, 9, 5), "Sun 9:05 AM"},
+		"seven days (edge out)": {at(6, 15, 15, 58), "Jun 15, 3:58 PM"},
+		"far future":            {at(6, 20, 15, 58), "Jun 20, 3:58 PM"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := humanizeResetAt(tc.in, now); got != tc.want {
+				t.Errorf("humanizeResetAt(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -146,10 +182,10 @@ func TestRemainingSuffix(t *testing.T) {
 		eff5, eff7 float64
 		want       string
 	}{
-		"unknown usage":   {false, 87, 92, ""},
+		"unknown usage":       {false, 87, 92, ""},
 		"unknown ignores eff": {false, 0, 0, ""},
-		"rounds to whole": {true, 86.7, 91.4, " · 5h 87% · 7d 91% remaining"},
-		"drained pick":    {true, 0, 0, " · 5h 0% · 7d 0% remaining"},
+		"rounds to whole":     {true, 86.7, 91.4, " · 5h 87% · 7d 91% remaining"},
+		"drained pick":        {true, 0, 0, " · 5h 0% · 7d 0% remaining"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

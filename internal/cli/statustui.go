@@ -311,7 +311,7 @@ func (t statusTUI) renderDetail() string {
 func usageRow(label string, usedPct float64, resets time.Time) string {
 	when := "no active window"
 	if !resets.IsZero() {
-		when = "resets " + humanizeUntil(time.Until(resets))
+		when = "resets " + humanizeReset(resets)
 	}
 	return fmt.Sprintf("%-2s %s %3.0f%% used · %s", label, usageBar(usedPct, 16), usedPct, when)
 }

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -127,7 +128,7 @@ func renderTable(snaps []pool.Snapshot) string {
 
 	var b strings.Builder
 	// Two leading spaces align the header with the rows' marker gutter ("▸ "/"  ").
-	header := fmt.Sprintf("  %-24s %8s %8s %8s %5s %-8s",
+	header := fmt.Sprintf("  %-24s %8s %8s %8s %5s %-17s",
 		"ACCOUNT", "SCORE", "5h used", "7d used", "LIVE", "RESETS")
 	b.WriteString(hdrStyle.Render(header))
 	b.WriteByte('\n')
@@ -136,11 +137,8 @@ func renderTable(snaps []pool.Snapshot) string {
 		label := truncate(accountName(s.Account.Label), 24)
 		used5 := fmt.Sprintf("%.0f%%", s.Util5h)
 		used7 := fmt.Sprintf("%.0f%%", s.Util7d)
-		reset := "-"
-		if !s.Resets5h.IsZero() {
-			reset = humanizeUntil(time.Until(s.Resets5h))
-		}
-		row := fmt.Sprintf("%-24s %8.1f %8s %8s %5d %-8s",
+		reset := humanizeReset(s.Resets5h)
+		row := fmt.Sprintf("%-24s %8.1f %8s %8s %5d %-17s",
 			label, s.Score, used5, used7, s.ActiveSessions, reset)
 		if flags := snapshotFlags(s); flags != "" {
 			row += " " + flags
@@ -155,7 +153,7 @@ func renderTable(snaps []pool.Snapshot) string {
 	}
 	b.WriteString(dimStyle.Render("▸ = next pick · score higher = emptier · 5h/7d = % used"))
 	b.WriteByte('\n')
-	b.WriteString(dimStyle.Render(fmt.Sprintf("updated %s", time.Now().Format(time.Kitchen))))
+	b.WriteString(dimStyle.Render(fmt.Sprintf("updated %s", time.Now().Format(clockLayout))))
 	return b.String()
 }
 
@@ -207,14 +205,48 @@ func daemonAccountName(m *pool.Manager, id *int) string {
 	return "account"
 }
 
-func humanizeUntil(d time.Duration) string {
-	if d <= 0 {
-		return "now"
+// clockLayout is the shared spelling for every human-facing wall-clock time in
+// the status UI: 12-hour with AM/PM, e.g. "3:58 PM".
+const clockLayout = "3:04 PM"
+
+// humanizeReset renders an absolute rate-limit reset time in the user's local
+// zone with smart day context — "3:58 PM" today, "tomorrow 3:58 PM", "Tue 3:58
+// PM" within the week, "Jun 10, 3:58 PM" beyond. The zero time (no active
+// window) renders "-".
+func humanizeReset(t time.Time) string {
+	return humanizeResetAt(t, time.Now())
+}
+
+// humanizeResetAt is humanizeReset with an injectable now for deterministic
+// tests. Both ends are normalized to Local so the clock and day arithmetic match
+// the user's wall clock regardless of the zone the reset arrived in (the /usage
+// RFC3339 path and the daemon's JSON can carry a non-local offset).
+func humanizeResetAt(t, now time.Time) string {
+	if t.IsZero() {
+		return "-"
 	}
-	if d < time.Hour {
-		return fmt.Sprintf("%dm", int(d.Minutes()))
+	t, now = t.Local(), now.Local()
+	switch days := calendarDaysFrom(now, t); {
+	case days <= 0: // today, or a past reset from stale data
+		return t.Format(clockLayout)
+	case days == 1:
+		return "tomorrow " + t.Format(clockLayout)
+	case days < 7:
+		return t.Format("Mon " + clockLayout)
+	default:
+		return t.Format("Jan 2, " + clockLayout)
 	}
-	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+// calendarDaysFrom returns the count of whole local calendar days from now to t
+// (0 = same day, 1 = next day, negative = past). Anchoring both ends at local
+// midnight and rounding keeps it correct across DST (a 23h or 25h day).
+func calendarDaysFrom(now, t time.Time) int {
+	y0, m0, d0 := now.Date()
+	y1, m1, d1 := t.Date()
+	start := time.Date(y0, m0, d0, 0, 0, 0, 0, now.Location())
+	end := time.Date(y1, m1, d1, 0, 0, 0, 0, now.Location())
+	return int(math.Round(end.Sub(start).Hours() / 24))
 }
 
 func truncate(s string, n int) string {

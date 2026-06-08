@@ -107,7 +107,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 					return "", "", errors.New(resp.Error)
 				case req.wait:
 					if resp.SoonestReset != nil {
-						step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", resp.SoonestReset.Format(time.Kitchen))
+						step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", humanizeReset(*resp.SoonestReset))
 					}
 					// fall through to the live waiting loop
 				default:
@@ -130,7 +130,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 			reset, ok := sr.SoonestReset()
 			d := 15 * time.Second
 			if ok {
-				step(cmd.ErrOrStderr(), "All accounts are rate-limited; soonest reset at %s.", reset.Format(time.Kitchen))
+				step(cmd.ErrOrStderr(), "All accounts are rate-limited; soonest reset at %s.", humanizeReset(reset))
 				if until := time.Until(reset); until > 0 && until < d {
 					d = until
 				}
