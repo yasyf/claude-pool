@@ -30,7 +30,7 @@ jobs:
         run: go build ./...
 
       - name: Build amd64 (cross, pure Go)
-        run: CGO_ENABLED=0 GOARCH=amd64 go build -o /tmp/clp-amd64 ./cmd/cc-pool
+        run: CGO_ENABLED=0 GOARCH=amd64 go build -o /tmp/ccp-amd64 ./cmd/cc-pool
 
       - name: Vet + compile fuse variant (cgo + fuse-t headers)
         # fuse-t is not present on CI runners; install headers/lib so the cgo

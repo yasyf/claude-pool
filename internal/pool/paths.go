@@ -82,7 +82,7 @@ func AccountDirName(n int) string {
 
 // AccountDir returns the config-dir path for account index n (n >= 1).
 //
-// The returned path is exactly the string clp emits for CLAUDE_CONFIG_DIR and
+// The returned path is exactly the string ccp emits for CLAUDE_CONFIG_DIR and
 // the string we hash for the per-dir Keychain service name; the two MUST stay
 // byte-identical, so do not realpath or normalize divergently elsewhere.
 func AccountDir(n int) string {

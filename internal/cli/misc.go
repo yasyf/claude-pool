@@ -23,7 +23,7 @@ func newListCmd() *cobra.Command {
 					return err
 				}
 				if len(accts) == 0 {
-					step(cmd.ErrOrStderr(), "No accounts yet. Run `clp add` to add one.")
+					step(cmd.ErrOrStderr(), "No accounts yet. Run `ccp add` to add one.")
 					return nil
 				}
 				tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
@@ -70,7 +70,7 @@ func newEnvCmd() *cobra.Command {
 		Short: "Print shell export lines to launch an account",
 		Long: `env prints the environment needed to launch a specific account:
 
-    eval "$(clp env --account 1)"; claude`,
+    eval "$(ccp env --account 1)"; claude`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {

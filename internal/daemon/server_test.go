@@ -37,7 +37,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		dirs[id] = dir
 		if err := st.UpsertAccount(store.Account{
 			ID: id, ConfigDir: dir,
-			KeychainService: "clp-test-missing", KeychainAccount: "clp-test",
+			KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -143,7 +143,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	}
 	// macOS caps sun_path at 104 bytes; t.TempDir's /var/folders/... path plus
 	// the long test name exceeds it, so the socket gets its own short dir.
-	sockDir, err := os.MkdirTemp("/tmp", "clp-test")
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-test")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,7 +19,7 @@ func selectTestManager(t *testing.T) *pool.Manager {
 	t.Cleanup(func() { st.Close() })
 	if err := st.UpsertAccount(store.Account{
 		ID: 5, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
-		KeychainService: "clp-test-missing", KeychainAccount: "clp-test",
+		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestSelectedLine(t *testing.T) {
 }
 
 // TestAnnounceSelectedSilentWhenNotTTY is the core of the noise fix: when stdout
-// is not an interactive terminal (as in tests, and under $(clp select)), the
+// is not an interactive terminal (as in tests, and under $(ccp select)), the
 // success line is suppressed entirely — only the dir reaches stdout elsewhere.
 func TestAnnounceSelectedSilentWhenNotTTY(t *testing.T) {
 	m := selectTestManager(t)

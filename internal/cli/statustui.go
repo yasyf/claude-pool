@@ -49,7 +49,7 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	return nil
 }
 
-// statusTUI is the Bubble Tea model for `clp status`. It owns a sorted snapshot
+// statusTUI is the Bubble Tea model for `ccp status`. It owns a sorted snapshot
 // list, a cursor tracked by account id (so a re-sort on refresh never moves the
 // selection), and a gather closure that re-fetches state off the UI goroutine.
 type statusTUI struct {

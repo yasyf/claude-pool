@@ -24,7 +24,7 @@ Target Go 1.22+. `gofmt` is law; everything below is what `gofmt` can't decide f
 - **Godoc on every exported symbol** — full sentences, starting with the symbol name. This is the one mandated deviation from "no comments": Go tooling depends on it.
 - **Inside function bodies: no noise comments.** Code is self-documenting via names, types, and small functions. Comments only for:
   - TODOs (`// TODO: ...`)
-  - Non-obvious workarounds and invariants (e.g. the CLAUDE_CONFIG_DIR string hashed for the Keychain service name MUST stay byte-identical to what `clp` emits — that comment earns its place)
+  - Non-obvious workarounds and invariants (e.g. the CLAUDE_CONFIG_DIR string hashed for the Keychain service name MUST stay byte-identical to what `ccp` emits — that comment earns its place)
   - Disabled code that may be re-enabled
 - No section-marker comments (`// --- helpers ---`); split into files instead.
 - Don't restate the code (`// increment i`). Don't narrate history (`// previously this used X`) — git remembers.

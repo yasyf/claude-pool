@@ -12,7 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// addOptions carries `clp add`'s flags; bare `clp` reuses the flow with the
+// addOptions carries `ccp add`'s flags; bare `ccp` reuses the flow with the
 // zero value.
 type addOptions struct {
 	label   string
@@ -32,13 +32,13 @@ func newAddCmd() *cobra.Command {
 		Use:   "add",
 		Short: "Add a Claude subscription to the pool",
 		Long: `add pools a Claude subscription. It sets up a new account, logs it in, and
-records it so clp can route sessions to it.
+records it so ccp can route sessions to it.
 
 Each account logs in with its own ` + "`claude /login`" + `, so it gets its own token
 chain. Plain claude stays logged in and untouched.
 
 On a fresh machine, add also sets up the pool and starts the background daemon,
-so you do not need a separate ` + "`clp init`" + `.
+so you do not need a separate ` + "`ccp init`" + `.
 
 Run it without flags to add accounts one at a time; it offers to add another
 after each. Use --count to add a set number, or -y to add one and log in right
@@ -58,8 +58,8 @@ away.`,
 	return cmd
 }
 
-// runAdd is the full add flow: auto-init, then the addOne loop. Both `clp add`
-// and bare `clp` (on an empty pool) dispatch here.
+// runAdd is the full add flow: auto-init, then the addOne loop. Both `ccp add`
+// and bare `ccp` (on an empty pool) dispatch here.
 func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 	if err := ensureReady(cmd, m); err != nil {
 		return err
@@ -93,8 +93,8 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 	return nil
 }
 
-// ensureReady auto-initializes the pool and starts the daemon, so `clp add`
-// works from a fresh machine with no prior `clp init`.
+// ensureReady auto-initializes the pool and starts the daemon, so `ccp add`
+// works from a fresh machine with no prior `ccp init`.
 func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 	ok, err := m.Initialized()
 	if err != nil {
@@ -137,7 +137,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 			Title("Name for this account (optional)").
 			Placeholder("e.g. work@example.com").
 			Value(&label). // prefilled with the account email when known
-			WithTheme(clpTheme()).
+			WithTheme(ccpTheme()).
 			Run()
 	}
 
@@ -147,7 +147,7 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 			// The row is registered and the credential is live — only the
 			// best-effort usage check failed (e.g. a network blip). Keep the
 			// account and surface a soft warning rather than orphan the row.
-			warn(cmd.ErrOrStderr(), "added the account, but its first usage check failed; run `clp doctor` to retry")
+			warn(cmd.ErrOrStderr(), "added the account, but its first usage check failed; run `ccp doctor` to retry")
 		} else {
 			fail(cmd.ErrOrStderr(), "couldn't finish adding the account: %v", err)
 			if shouldAbandon(cmd) {
@@ -208,7 +208,7 @@ func checkDuplicate(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd, opt
 	_ = huh.NewConfirm().
 		Title("Add it again anyway?").
 		Value(&keep).
-		WithTheme(clpTheme()).
+		WithTheme(ccpTheme()).
 		Run()
 	return !keep
 }
@@ -228,7 +228,7 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 				huh.NewOption("I'll log in from another terminal", "manual"),
 			).
 			Value(&choice).
-			WithTheme(clpTheme()).
+			WithTheme(ccpTheme()).
 			Run()
 		doRun = choice == "run"
 	}
@@ -256,7 +256,7 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 		_ = huh.NewConfirm().
 			Title("Press enter when the login is done").
 			Value(&cont).
-			WithTheme(clpTheme()).
+			WithTheme(ccpTheme()).
 			Run()
 		return nil
 	}
@@ -278,7 +278,7 @@ func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
 	// Most people pool more than one subscription, so nudge toward a second
 	// account after the first; stop nudging once they have a few.
 	again := done == 1
-	if err := huh.NewConfirm().Title("Add another account?").Value(&again).WithTheme(clpTheme()).Run(); err != nil {
+	if err := huh.NewConfirm().Title("Add another account?").Value(&again).WithTheme(ccpTheme()).Run(); err != nil {
 		warn(cmd.ErrOrStderr(), "prompt failed: %v", err)
 		return false
 	}
@@ -306,7 +306,7 @@ func shouldAbandon(cmd *cobra.Command) bool {
 	_ = huh.NewConfirm().
 		Title("Roll back this incomplete account?").
 		Value(&abandon).
-		WithTheme(clpTheme()).
+		WithTheme(ccpTheme()).
 		Run()
 	return abandon
 }

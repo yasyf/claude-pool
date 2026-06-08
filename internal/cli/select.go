@@ -25,7 +25,7 @@ func newSelectCmd() *cobra.Command {
 		Long: `select scores every account and prints only the chosen account's config dir
 to stdout, so it composes as:
 
-    CLAUDE_CONFIG_DIR=$(clp select) claude
+    CLAUDE_CONFIG_DIR=$(ccp select) claude
 
 Diagnostics go to stderr. With the daemon running, select reads its cached
 scores; otherwise it samples usage live.`,
@@ -75,9 +75,9 @@ func selectViaDaemon(cmd *cobra.Command, m *pool.Manager, account *int, wait boo
 	if !cl.EnsureRunning(2 * time.Second) {
 		return "", false, nil
 	}
-	// pid 0: clp exits before `claude` starts, so its pid is useless for
+	// pid 0: ccp exits before `claude` starts, so its pid is useless for
 	// session tracking. We still want a reservation (anti-thundering-herd), but
-	// no session row — procscan attributes the real claude process. `clp run`
+	// no session row — procscan attributes the real claude process. `ccp run`
 	// is the path that records real-pid sessions.
 	resp, ok := cl.Select(account, 0, false, cwd)
 	if !ok {
@@ -146,13 +146,13 @@ func selectLive(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, fr
 // (and only its dir), and a diagnostic line to stderr.
 func emitChoice(cmd *cobra.Command, m *pool.Manager, a store.Account, reason string) error {
 	// Re-assert the overlay so the launched session sees any new top-level
-	// ~/.claude entries (replaces the old explicit `clp sync`).
+	// ~/.claude entries (replaces the old explicit `ccp sync`).
 	if err := m.SyncOverlay(a); err != nil {
 		warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
 	}
 	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
 		if errors.Is(err, pool.ErrNeedsLogin) {
-			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `clp add` or `claude /login`", accountName(a.Label))
+			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `ccp add` or `claude /login`", accountName(a.Label))
 		} else {
 			warn(cmd.ErrOrStderr(), "%v", err)
 		}
@@ -165,7 +165,7 @@ func emitChoice(cmd *cobra.Command, m *pool.Manager, a store.Account, reason str
 }
 
 // announceSelected prints a terse line naming the chosen account, but only when
-// stdout is an interactive terminal — captured/piped callers ($(clp select))
+// stdout is an interactive terminal — captured/piped callers ($(ccp select))
 // get the bare dir on stdout and nothing else.
 func announceSelected(cmd *cobra.Command, m *pool.Manager, id *int, sticky bool) {
 	if !stdoutIsTTY() {

@@ -13,7 +13,7 @@ import (
 )
 
 // ErrNoAccounts means the pool is empty.
-var ErrNoAccounts = errors.New("no accounts in the pool — run `clp add`")
+var ErrNoAccounts = errors.New("no accounts in the pool — run `ccp add`")
 
 // ErrNoneAvailable means every account is currently rate-limited.
 var ErrNoneAvailable = errors.New("no account is currently available (all rate-limited)")

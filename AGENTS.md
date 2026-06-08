@@ -4,7 +4,7 @@ Full style guide: [STYLEGUIDE.md](STYLEGUIDE.md)
 
 ## Project Basics
 
-cc-pool (`clp`) pools several Claude Max/Pro subscriptions and launches each Claude Code session on the emptiest account. Go, macOS-only, single binary.
+cc-pool (`ccp`) pools several Claude Max/Pro subscriptions and launches each Claude Code session on the emptiest account. Go, macOS-only, single binary.
 
 - **Build**: `CGO_ENABLED=0 go build ./cmd/cc-pool` (pure-Go default; `-tags fuse` needs cgo + fuse-t)
 - **Test**: `go test ./...` — must pass with no network, no Keychain, no daemon
@@ -39,9 +39,9 @@ git push origin vX.Y.Z               # push tag → triggers release.yml
 
 ```
 cc-pool/
-├── cmd/cc-pool/        # main: CLI entrypoint (installs as cc-pool, clp symlink)
+├── cmd/cc-pool/        # main: CLI entrypoint (installs as cc-pool, ccp symlink)
 ├── internal/
-│   ├── cli/            # clp subcommands (init, add, select, run, status, doctor, …)
+│   ├── cli/            # ccp subcommands (init, add, select, run, status, doctor, …)
 │   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol
 │   ├── keychain/       # macOS Keychain access for Claude Code credentials
 │   ├── oauth/          # Claude OAuth refresh + /api/oauth/usage client
@@ -68,9 +68,9 @@ Safety rules baked into the architecture — do not regress them:
 
 1. **The pool NEVER reads, writes, deletes, or even names the canonical unsuffixed Keychain item (`Claude Code-credentials`), and never mutates plain claude's OAuth state.** There is no exception: `keychain.ServiceName` always emits a hash-suffixed name, and no code path can name the canonical item. Every pool account — including the user's main subscription — gets its own config dir, its own refresh-token chain (from its own `claude /login`), and its own suffixed Keychain item. This is why there is no credential "adoption": forking a pool account off plain claude's login would require spending plain claude's single-use refresh token, which rotation invalidates — signing plain claude out. A fresh login per account is the only safe path.
 2. **No secrets in SQLite** — the macOS Keychain is the sole secret store.
-3. **Account dir strings are hashed for Keychain service names** — the path string `clp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
+3. **Account dir strings are hashed for Keychain service names** — the path string `ccp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
 
-Known follow-up (documented, test-pinned in `TestConcurrentPrepareAddIndexRace`): two concurrent `clp add`s can be handed the same account index because no row exists until FinalizeAdd; fixing it needs a pending-row reservation.
+Known follow-up (documented, test-pinned in `TestConcurrentPrepareAddIndexRace`): two concurrent `ccp add`s can be handed the same account index because no row exists until FinalizeAdd; fixing it needs a pending-row reservation.
 
 ## Ask Before Assuming
 

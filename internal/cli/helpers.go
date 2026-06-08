@@ -12,10 +12,10 @@ func isTTY() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 }
 
-// stdoutIsTTY reports whether stdout is an interactive terminal. `clp select`
+// stdoutIsTTY reports whether stdout is an interactive terminal. `ccp select`
 // uses it to print its human-facing "selected …" line only when a person is
 // looking at the bare output, staying silent when the dir is captured via
-// $(clp select) or piped onward.
+// $(ccp select) or piped onward.
 func stdoutIsTTY() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
 }

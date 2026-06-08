@@ -58,10 +58,10 @@ func plural(n int, noun string) string {
 	return fmt.Sprintf("%d %ss", n, noun)
 }
 
-// clpTheme is the huh form theme, applied to every interactive prompt so the
+// ccpTheme is the huh form theme, applied to every interactive prompt so the
 // forms share one look and sit consistently with the printed lines. It softens
 // the Charm base by dimming descriptions.
-func clpTheme() *huh.Theme {
+func ccpTheme() *huh.Theme {
 	t := huh.ThemeCharm()
 	t.Focused.Description = t.Focused.Description.Foreground(lipgloss.Color("245"))
 	t.Blurred.Description = t.Blurred.Description.Foreground(lipgloss.Color("245"))

@@ -1,5 +1,5 @@
 // Command cc-pool is the single binary behind both `cc-pool` and its
-// `clp` symlink.
+// `ccp` symlink.
 package main
 
 import (
@@ -18,9 +18,9 @@ func main() {
 	defer stop()
 
 	root := cli.NewRootCmd()
-	// Present the invoked name (clp or cc-pool) in help/usage.
-	if base := filepath.Base(os.Args[0]); base == "clp" {
-		root.Use = "clp"
+	// Present the invoked name (ccp or cc-pool) in help/usage.
+	if base := filepath.Base(os.Args[0]); base == "ccp" {
+		root.Use = "ccp"
 	}
 
 	if err := root.ExecuteContext(ctx); err != nil {

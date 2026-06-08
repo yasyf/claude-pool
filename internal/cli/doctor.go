@@ -46,7 +46,7 @@ func newDoctorCmd() *cobra.Command {
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					report("daemon", true, resp.Version)
 				} else {
-					report("daemon", false, "not running; run `clp service install`")
+					report("daemon", false, "not running; run `ccp service install`")
 				}
 
 				accts, err := m.Store.ListAccounts()
@@ -59,7 +59,7 @@ func newDoctorCmd() *cobra.Command {
 
 				if !ok {
 					if fix {
-						fmt.Fprintln(out, "\nApplied fixes where possible; re-run `clp doctor` to confirm.")
+						fmt.Fprintln(out, "\nApplied fixes where possible; re-run `ccp doctor` to confirm.")
 					} else {
 						fmt.Fprintln(out, "\nIssues found. Re-run with --fix to repair.")
 					}

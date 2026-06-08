@@ -10,10 +10,10 @@ session on the **emptiest** account, so you stop hitting 5-hour and weekly
 limits on one account while another sits idle:
 
 ```sh
-CLAUDE_CONFIG_DIR=$(clp select) claude
+CLAUDE_CONFIG_DIR=$(ccp select) claude
 ```
 
-Unlike reactive proxies or manual switchers, `clp select` predicts the best
+Unlike reactive proxies or manual switchers, `ccp select` predicts the best
 account *before* the session starts, from live 5-hour / 7-day usage. Plain
 `claude` keeps working, untouched.
 
@@ -26,36 +26,36 @@ brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool
 brew install yasyf/cc-pool/cc-pool
 ```
 
-The binary installs as `cc-pool` with a `clp` symlink.
+The binary installs as `cc-pool` with a `ccp` symlink.
 
 ## Quickstart
 
 ```sh
-clp add                                    # log in your first subscription (auto-inits the pool)
-clp add                                    # ...and another (acct-02)
-clp status                                 # live table: per-account 5h/7d remaining, score, sessions
+ccp add                                    # log in your first subscription (auto-inits the pool)
+ccp add                                    # ...and another (acct-02)
+ccp status                                 # live table: per-account 5h/7d remaining, score, sessions
 
-CLAUDE_CONFIG_DIR=$(clp select) claude     # launch on the emptiest account
+CLAUDE_CONFIG_DIR=$(ccp select) claude     # launch on the emptiest account
 claude                                     # plain claude STILL works, fully decoupled (~/.claude)
 ```
 
-Your main subscription joins the pool like any other account: `clp add` gives
+Your main subscription joins the pool like any other account: `ccp add` gives
 it its own login in its own account dir. Plain `claude` stays fully decoupled —
 the pool can never log it out.
 
-Make `claude` use the pool by default — `clp add` offers to do this for you, appending a
+Make `claude` use the pool by default — `ccp add` offers to do this for you, appending a
 `claude` alias to your shell (`~/.zshrc`, `~/.bash_profile`, or `~/.config/fish/config.fish`)
 that forwards every argument:
 
 ```sh
-alias claude='CLAUDE_CONFIG_DIR=$(clp select) command claude'
+alias claude='CLAUDE_CONFIG_DIR=$(ccp select) command claude'
 ```
 
 `command claude` keeps plain `claude` (on `~/.claude`) one keystroke away. Prefer a separate
 command and leave `claude` untouched? Add your own alias instead:
 
 ```sh
-alias cl='CLAUDE_CONFIG_DIR=$(clp select) claude'
+alias cl='CLAUDE_CONFIG_DIR=$(ccp select) claude'
 ```
 
 ## How it works
@@ -90,8 +90,8 @@ every session shares the same workspace. Two providers:
 
 - **symlink** (default, zero-dependency): symlinks each top-level entry of
   `~/.claude` into the account dir. New top-level entries are picked up
-  automatically at launch (`clp select`/`clp run`), by the daemon, and by
-  `clp doctor` — no manual step needed.
+  automatically at launch (`ccp select`/`ccp run`), by the daemon, and by
+  `ccp doctor` — no manual step needed.
 - **fuse** (optional, live mirror): an in-process passthrough mirror mounted via
   [fuse-t](https://github.com/macos-fuse-t/fuse-t) (kext-less, mounted as you,
   no root). Auto-includes new entries with no re-sync. Requires a
@@ -121,14 +121,14 @@ own `/api/oauth/usage` endpoint.
 
 ### The daemon
 
-`brew services start cc-pool` (Homebrew installs) or `clp service install`
+`brew services start cc-pool` (Homebrew installs) or `ccp service install`
 (source builds) runs a **user LaunchAgent** (a root daemon couldn't read your
 login Keychain). It polls usage every ~3 min with exponential backoff, refreshes
 **idle** accounts' tokens before they expire (a checked-out session owns its own
 refresh; the daemon re-reads and adopts whatever token it rotated to on
 check-in), caches scores, and — with the fuse overlay — owns the mount
-lifecycle. `clp add` and `clp init` start it automatically; if it isn't
-running, `clp select` auto-spawns it (≤2s) or samples live.
+lifecycle. `ccp add` and `ccp init` start it automatically; if it isn't
+running, `ccp select` auto-spawns it (≤2s) or samples live.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the
 only secret store.
@@ -137,22 +137,22 @@ only secret store.
 
 | Command | What it does |
 |---|---|
-| `clp add` | Pool a subscription (interactive `claude /login`; auto-inits the pool and starts the daemon) |
-| `clp init` | Prepare the pool state dir and start the daemon (optional — `clp add` does this automatically) |
-| `clp select` | Print the emptiest account's config dir (stdout only) — the hot path |
-| `clp run -- <args>` | Select an account and exec `claude`, owning the session lifecycle |
-| `clp status [-w]` | Live table of usage / score / sessions |
-| `clp list` | Static account list |
-| `clp env [--account N]` | Print `export` lines to launch a specific account |
-| `clp doctor [--fix]` | Re-validate Keychain items and overlays; repair drift |
-| `clp remove <id>` | Remove an account from the pool |
-| `clp service install\|uninstall\|status` | Manage the daemon (delegates to `brew services` on Homebrew installs) |
+| `ccp add` | Pool a subscription (interactive `claude /login`; auto-inits the pool and starts the daemon) |
+| `ccp init` | Prepare the pool state dir and start the daemon (optional — `ccp add` does this automatically) |
+| `ccp select` | Print the emptiest account's config dir (stdout only) — the hot path |
+| `ccp run -- <args>` | Select an account and exec `claude`, owning the session lifecycle |
+| `ccp status [-w]` | Live table of usage / score / sessions |
+| `ccp list` | Static account list |
+| `ccp env [--account N]` | Print `export` lines to launch a specific account |
+| `ccp doctor [--fix]` | Re-validate Keychain items and overlays; repair drift |
+| `ccp remove <id>` | Remove an account from the pool |
+| `ccp service install\|uninstall\|status` | Manage the daemon (delegates to `brew services` on Homebrew installs) |
 
 ## Uninstall
 
 ```sh
-clp service uninstall            # stop & remove the daemon, unmount fuse overlays
-clp service uninstall --purge    # ...and remove all pool accounts/dirs/state
+ccp service uninstall            # stop & remove the daemon, unmount fuse overlays
+ccp service uninstall --purge    # ...and remove all pool accounts/dirs/state
 brew uninstall cc-pool
 ```
 

@@ -18,7 +18,7 @@ import (
 // pool account; aliasMarker tags our rc-file block so re-runs are idempotent.
 const (
 	aliasName   = "claude"
-	aliasMarker = "# Added by cc-pool (clp)"
+	aliasMarker = "# Added by cc-pool (ccp)"
 )
 
 // shellKind is the user's interactive shell, parsed from $SHELL. shellUnknown
@@ -92,9 +92,9 @@ func fileExists(path string) bool {
 func aliasLine(kind shellKind) string {
 	switch kind {
 	case shellBash, shellZsh:
-		return `alias claude='CLAUDE_CONFIG_DIR=$(clp select) command claude'`
+		return `alias claude='CLAUDE_CONFIG_DIR=$(ccp select) command claude'`
 	case shellFish:
-		return `alias claude 'CLAUDE_CONFIG_DIR=(clp select) command claude'`
+		return `alias claude 'CLAUDE_CONFIG_DIR=(ccp select) command claude'`
 	default:
 		return ""
 	}
@@ -183,9 +183,9 @@ func appendAlias(kind shellKind, home string) (aliasResult, error) {
 // command substitution to the user's shell. It runs after at least one
 // successful add, on a TTY or not.
 func printNextSteps(w io.Writer, kind shellKind) {
-	sub := "$(clp select)"
+	sub := "$(ccp select)"
 	if kind == shellFish {
-		sub = "(clp select)"
+		sub = "(ccp select)"
 	}
 	step(w, "\nLaunch Claude on the emptiest account:\n\n    CLAUDE_CONFIG_DIR=%s claude\n", sub)
 }
@@ -193,7 +193,7 @@ func printNextSteps(w io.Writer, kind shellKind) {
 // offerAlias prints the next-steps hint and, when appropriate, wraps `claude`
 // so plain `claude` launches on the emptiest account. The hint always prints;
 // the write is gated: --no-alias suppresses it, -y writes without prompting,
-// otherwise we ask on a TTY. A write failure warns but never fails `clp add` —
+// otherwise we ask on a TTY. A write failure warns but never fails `ccp add` —
 // the accounts are already pooled.
 func offerAlias(cmd *cobra.Command, opts addOptions) {
 	out := cmd.OutOrStdout()
@@ -218,7 +218,7 @@ func offerAlias(cmd *cobra.Command, opts addOptions) {
 			Title("Wrap `claude` to always launch on the emptiest account?").
 			Description("Adds an alias so plain `claude` uses the pool.").
 			Value(&ok).
-			WithTheme(clpTheme()).
+			WithTheme(ccpTheme()).
 			Run()
 		write = ok
 	}

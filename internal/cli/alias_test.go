@@ -78,8 +78,8 @@ func TestRCPath(t *testing.T) {
 }
 
 func TestAliasLine(t *testing.T) {
-	const posix = `alias claude='CLAUDE_CONFIG_DIR=$(clp select) command claude'`
-	const fish = `alias claude 'CLAUDE_CONFIG_DIR=(clp select) command claude'`
+	const posix = `alias claude='CLAUDE_CONFIG_DIR=$(ccp select) command claude'`
+	const fish = `alias claude 'CLAUDE_CONFIG_DIR=(ccp select) command claude'`
 	cases := []struct {
 		name string
 		kind shellKind

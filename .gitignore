@@ -2,7 +2,7 @@
 /dist/
 /build/
 /cc-pool
-/clp
+/ccp
 *.test
 *.out
 coverage.txt

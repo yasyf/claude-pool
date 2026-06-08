@@ -12,11 +12,11 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// ErrNotInitialized means the pool has not been set up yet (`clp init` or
-// `clp add`'s auto-init).
+// ErrNotInitialized means the pool has not been set up yet (`ccp init` or
+// `ccp add`'s auto-init).
 var ErrNotInitialized = errors.New("pool not initialized")
 
-// InitResult summarizes what `clp init` did.
+// InitResult summarizes what `ccp init` did.
 type InitResult struct {
 	OverlayKind overlay.Kind
 	Already     bool // the pool was already initialized
@@ -120,7 +120,7 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 	purged := false
 	if seed != SeedKeptExisting {
 		// A leftover item under this service is garbage from a dead attempt
-		// (an abandoned add, or `clp remove --keep-credential` followed by
+		// (an abandoned add, or `ccp remove --keep-credential` followed by
 		// index reuse); left in place, FinalizeAdd would register the stale
 		// credential. Probe by service alone (Discover), not a recomputed
 		// account label — the item carries whatever -a label claude stored at
@@ -248,7 +248,7 @@ func (m *Manager) removeAccountDir(prov overlay.Provider, configDir string) erro
 // SyncOverlay re-asserts an account's overlay so it reflects the current
 // ~/.claude (the symlink provider links any new top-level entry; the fuse
 // provider is a live mirror, so this just health-checks). Called at launch
-// time and periodically by the daemon, which is why explicit `clp sync` is
+// time and periodically by the daemon, which is why explicit `ccp sync` is
 // unnecessary.
 func (m *Manager) SyncOverlay(a store.Account) error {
 	return overlay.For(overlay.Kind(a.OverlayKind)).Sync(ClaudeDir(), a.ConfigDir)

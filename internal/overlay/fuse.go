@@ -215,7 +215,7 @@ func mountLive(base, accountDir string) bool {
 // probeFuse attempts a throwaway mount to confirm fuse-t works on this machine
 // (and trips the one-time "Network Volumes" privacy grant). Used by Detect.
 func probeFuse() bool {
-	tmp, err := os.MkdirTemp("", "clp-fuse-probe-")
+	tmp, err := os.MkdirTemp("", "ccp-fuse-probe-")
 	if err != nil {
 		return false
 	}

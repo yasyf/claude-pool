@@ -71,7 +71,7 @@ type Manager struct {
 	// invalid_grant; a stale write-back clobbers the rotated token), so
 	// serializing the whole cycle is the point. muMap itself is only ever held
 	// for the map access, never across an op. Cross-process serialization (the
-	// daemon vs a concurrent `clp` invocation) is layered on top by lockAccount's
+	// daemon vs a concurrent `ccp` invocation) is layered on top by lockAccount's
 	// per-account flock — the mutex alone cannot span processes.
 	muMap sync.Mutex
 	locks map[int]*sync.Mutex
@@ -93,7 +93,7 @@ func (m *Manager) acctLock(id int) *sync.Mutex {
 
 // lockAccount serializes an account's credential read→refresh→write cycle both
 // in-process (the per-account mutex) and across processes (a per-account flock),
-// so the daemon and a concurrent `clp` invocation can never both refresh one
+// so the daemon and a concurrent `ccp` invocation can never both refresh one
 // account and double-spend its single-use refresh token. Acquire order is mutex
 // then flock; the returned release reverses it and must be called exactly once.
 // A flock that cannot be taken before ctx is done is returned as an error; the
@@ -140,7 +140,7 @@ func (m *Manager) Close() error {
 
 // Meta keys recording pool-level state in the store's meta table.
 const (
-	// metaInitialized marks that the pool was set up via `clp init` (or add's
+	// metaInitialized marks that the pool was set up via `ccp init` (or add's
 	// auto-init) — deliberately distinct from "the DB file exists", which any
 	// read-only command creates as a side effect of opening the Manager.
 	metaInitialized = "initialized"
@@ -150,7 +150,7 @@ const (
 	metaOverlayKind = "overlay_kind"
 )
 
-// Initialized reports whether the pool has been set up (`clp init` or `clp
+// Initialized reports whether the pool has been set up (`ccp init` or `ccp
 // add`'s auto-init).
 func (m *Manager) Initialized() (bool, error) {
 	_, ok, err := m.Store.GetMeta(metaInitialized)

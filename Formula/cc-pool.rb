@@ -54,7 +54,7 @@ class CcPool < Formula
     else
       bin.install "cc-pool"
     end
-    bin.install_symlink "cc-pool" => "clp"
+    bin.install_symlink "cc-pool" => "ccp"
   end
 
   # HEAD builds compile from source with the build-time fuse autodetect: cgo +
@@ -91,11 +91,11 @@ class CcPool < Formula
   def caveats
     <<~EOS
       Get started:
-        clp add         # pool a Claude subscription (auto-inits; plain `claude` keeps working)
-        CLAUDE_CONFIG_DIR=$(clp select) claude
+        ccp add         # pool a Claude subscription (auto-inits; plain `claude` keeps working)
+        CLAUDE_CONFIG_DIR=$(ccp select) claude
 
       The background daemon (keeps idle tokens fresh, scores live) starts
-      automatically on `clp add`, managed via `brew services`.
+      automatically on `ccp add`, managed via `brew services`.
 
       Optional live-mirror overlay (instead of per-entry symlinks): install
       fuse-t, then reinstall so the fuse-enabled build is selected:
@@ -107,6 +107,6 @@ class CcPool < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/cc-pool --version")
-    assert_match "emptiest account", shell_output("#{bin}/clp --help")
+    assert_match "emptiest account", shell_output("#{bin}/ccp --help")
   end
 end

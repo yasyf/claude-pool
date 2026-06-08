@@ -88,7 +88,7 @@ func newServiceUninstallCmd() *cobra.Command {
 			})
 
 			if !purge {
-				note(out, "Your accounts and state are preserved. Run `clp service install` to resume.")
+				note(out, "Your accounts and state are preserved. Run `ccp service install` to resume.")
 				return nil
 			}
 			return purgeAll(cmd)
@@ -129,7 +129,7 @@ func purgeAll(cmd *cobra.Command) error {
 func runServiceInstall(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	if service.IsBrewManaged() {
-		// A source-build `clp service install` leaves a self-rolled
+		// A source-build `ccp service install` leaves a self-rolled
 		// com.yasyf.cc-pool agent that would run alongside the brew one.
 		// Boot it out before delegating.
 		_ = service.Uninstall()
@@ -178,11 +178,11 @@ func ensureDaemon(cmd *cobra.Command) {
 			return
 		}
 		warn(cmd.ErrOrStderr(),
-			"couldn't start the daemon: %v; run `clp service install` from a GUI session to enable background polling", err)
+			"couldn't start the daemon: %v; run `ccp service install` from a GUI session to enable background polling", err)
 		return
 	}
 	if !waitDaemon(want, 3*time.Second) {
-		warn(cmd.ErrOrStderr(), "the daemon isn't responding yet; check `clp service status`")
+		warn(cmd.ErrOrStderr(), "the daemon isn't responding yet; check `ccp service status`")
 	}
 }
 

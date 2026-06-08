@@ -1,5 +1,5 @@
 // Package cli wires up the cobra command tree for cc-pool. The binary is
-// installed as `cc-pool` with a `clp` symlink; both dispatch here.
+// installed as `cc-pool` with a `ccp` symlink; both dispatch here.
 package cli
 
 import (
@@ -15,12 +15,12 @@ func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "cc-pool",
 		Short: "Predictive multi-account load-balancing for Claude Code",
-		Long: `cc-pool (clp) pools several Claude subscriptions and launches each session
+		Long: `cc-pool (ccp) pools several Claude subscriptions and launches each session
 on the emptiest account:
 
-    CLAUDE_CONFIG_DIR=$(clp select) claude
+    CLAUDE_CONFIG_DIR=$(ccp select) claude
 
-Run bare ` + "`clp`" + ` to get started. On an empty pool it walks you through adding
+Run bare ` + "`ccp`" + ` to get started. On an empty pool it walks you through adding
 your subscriptions; once accounts exist it shows the status table.
 
 Plain ` + "`claude`" + ` keeps working untouched on ~/.claude and is never part of the
@@ -30,7 +30,7 @@ pool.`,
 		SilenceErrors: true,
 		// Args deliberately left nil: cobra's legacyArgs already rejects
 		// unknown subcommands on a root that has children (with suggestions),
-		// so RunE only ever runs for bare `clp`.
+		// so RunE only ever runs for bare `ccp`.
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
 				initialized, err := m.Initialized()
@@ -51,7 +51,7 @@ pool.`,
 				case actionAdd:
 					return runAdd(cmd, m, addOptions{})
 				default:
-					return fmt.Errorf("no accounts yet; run `clp add` to pool your first subscription")
+					return fmt.Errorf("no accounts yet; run `ccp add` to pool your first subscription")
 				}
 			})
 		},
@@ -74,7 +74,7 @@ pool.`,
 	return root
 }
 
-// rootAction is what bare `clp` does for a given pool state.
+// rootAction is what bare `ccp` does for a given pool state.
 type rootAction int
 
 const (
@@ -83,7 +83,7 @@ const (
 	actionErr                      // empty pool, no TTY → fail loud
 )
 
-// bareAction routes bare `clp`: a populated pool shows status; an empty or
+// bareAction routes bare `ccp`: a populated pool shows status; an empty or
 // uninitialized one onboards interactively, or errors when no TTY is attached.
 func bareAction(initialized bool, accounts int, tty bool) rootAction {
 	switch {
@@ -113,7 +113,7 @@ func requireInit(m *pool.Manager) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("pool not initialized; run `clp add` to set it up and add your first account")
+		return fmt.Errorf("pool not initialized; run `ccp add` to set it up and add your first account")
 	}
 	return nil
 }

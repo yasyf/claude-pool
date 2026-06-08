@@ -13,8 +13,8 @@ func newInitCmd() *cobra.Command {
 		Short: "Set up the pool and start the daemon",
 		Long: `init prepares ~/.cc-pool with its state db and account dirs, records the
 overlay provider, and starts the background daemon. It never touches ~/.claude
-or any credential. Accounts, including your main subscription, join via ` + "`clp add`" + `,
-each with its own ` + "`claude /login`" + `. Running init is optional; ` + "`clp add`" + ` does the
+or any credential. Accounts, including your main subscription, join via ` + "`ccp add`" + `,
+each with its own ` + "`claude /login`" + `. Running init is optional; ` + "`ccp add`" + ` does the
 same setup automatically.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -38,11 +38,11 @@ same setup automatically.`,
 					ensureDaemon(cmd)
 				}
 
-				step(out, "\nNext, run `clp add` to pool your subscriptions, including your main one.")
+				step(out, "\nNext, run `ccp add` to pool your subscriptions, including your main one.")
 				return nil
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&noService, "no-service", false, "do not start the daemon now; `clp add` will start it")
+	cmd.Flags().BoolVar(&noService, "no-service", false, "do not start the daemon now; `ccp add` will start it")
 	return cmd
 }

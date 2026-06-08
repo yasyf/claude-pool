@@ -16,10 +16,10 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
-// clpAccountEnv forces a specific pool account for `clp run`. The command
+// ccpAccountEnv forces a specific pool account for `ccp run`. The command
 // parses no flags of its own (every argument passes through to claude), so the
 // account override travels out-of-band in the environment.
-const clpAccountEnv = "CLP_ACCOUNT"
+const ccpAccountEnv = "CCP_ACCOUNT"
 
 func newRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -30,13 +30,13 @@ with CLAUDE_CONFIG_DIR set, so once claude starts cc-pool is gone from the
 process tree — signals, the controlling terminal, and the exit code are all claude's.
 
 Every argument is forwarded verbatim, with no ` + "`--`" + ` separator (e.g.
-` + "`clp run --resume`" + `). Set ` + clpAccountEnv + `=<id> to force a specific account
+` + "`ccp run --resume`" + `). Set ` + ccpAccountEnv + `=<id> to force a specific account
 instead of auto-selecting.
 
 This is the imperative equivalent of:
 
-    CLAUDE_CONFIG_DIR=$(clp select) claude ...`,
-		// Pass every argument straight through to claude; clp owns no flags here.
+    CLAUDE_CONFIG_DIR=$(ccp select) claude ...`,
+		// Pass every argument straight through to claude; ccp owns no flags here.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -54,22 +54,22 @@ This is the imperative equivalent of:
 	return cmd
 }
 
-// resolveRunDir picks the account `clp run` launches on and returns its config
-// dir. CLP_ACCOUNT forces a specific account; otherwise it mirrors `clp select`:
-// ensure a daemon (so it can adopt any token claude rotates once clp has exec'd
+// resolveRunDir picks the account `ccp run` launches on and returns its config
+// dir. CCP_ACCOUNT forces a specific account; otherwise it mirrors `ccp select`:
+// ensure a daemon (so it can adopt any token claude rotates once ccp has exec'd
 // away), take its reserved pick, and fall back to a live selection only when the
 // daemon is unreachable.
 func resolveRunDir(cmd *cobra.Command, m *pool.Manager) (string, error) {
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
 
-	if v := os.Getenv(clpAccountEnv); v != "" {
+	if v := os.Getenv(ccpAccountEnv); v != "" {
 		id, err := strconv.Atoi(v)
 		if err != nil {
-			return "", fmt.Errorf("%s must be an account id, got %q: %w", clpAccountEnv, v, err)
+			return "", fmt.Errorf("%s must be an account id, got %q: %w", ccpAccountEnv, v, err)
 		}
 		a, err := m.Store.GetAccount(id)
 		if err != nil {
-			return "", fmt.Errorf("%s=%d: %w", clpAccountEnv, id, err)
+			return "", fmt.Errorf("%s=%d: %w", ccpAccountEnv, id, err)
 		}
 		_ = m.RecordSticky(cwd, a.ID, time.Now()) // anchor future selects here
 		return prepareAccount(cmd, m, a, accountName(a.Label))
@@ -120,7 +120,7 @@ func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, reason
 	}
 	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
 		if errors.Is(err, pool.ErrNeedsLogin) {
-			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `clp add` or `claude /login`", accountName(a.Label))
+			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `ccp add` or `claude /login`", accountName(a.Label))
 		} else {
 			warn(cmd.ErrOrStderr(), "%v", err)
 		}

@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `clp add` detects when a login is the same subscription already in the pool
+- `ccp add` detects when a login is the same subscription already in the pool
   (by accountUuid) and, on a TTY, asks before adding it again; non-interactive
   runs warn and proceed so automation is never blocked.
 
 ### Changed
+- Renamed the short command from `clp` to `ccp` (the symlink beside the
+  `cc-pool` binary), along with all help/error text, shell-alias generation,
+  and docs. Everything named `cc-pool` is unchanged — the binary, Go module,
+  Homebrew formula, launchd label, FUSE volname, and the `~/.cc-pool` state
+  dir — so account dirs, Keychain service names, and stored state need no
+  migration.
 - Trimmed the add flow to what the user can act on: dropped the seeding,
   overlay, and cleanup chatter and the redundant "closed claude" line. "Add
   another account?" now defaults to yes after the first account, and the closing
@@ -20,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.0] - 2026-06-08
 
 ### Removed
-- Credential adoption. `clp add` no longer copies plain claude's current login
+- Credential adoption. `ccp add` no longer copies plain claude's current login
   into a pool account. Adopting meant refreshing plain claude's single-use
   OAuth refresh token, which rotation invalidated — silently logging plain
   claude out. Every account now logs in with its own `claude /login`, so plain
@@ -37,12 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flush-left formatting and a single huh form theme. Human flows (`add`,
   `status`, `select`, `run`) no longer leak internal ids, Keychain service
   names, paths, or overlay kind; those stay in the inspection commands
-  (`clp list`, `clp doctor`). Copy across every command rewritten for clarity.
+  (`ccp list`, `ccp doctor`). Copy across every command rewritten for clarity.
 
 ## [0.4.0] - 2026-06-06
 
 ### Added
-- `clp add` — pool a Claude Max/Pro subscription (interactive `claude /login`),
+- `ccp add` — pool a Claude Max/Pro subscription (interactive `claude /login`),
   each account in its own `~/.cc-pool/accounts/acct-NN` config dir with its own
   independent OAuth grant and Keychain credential. Auto-initializes the pool
   and starts the background daemon on first run; loops to onboard several
@@ -52,22 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped; `claude /login` writes the account's own), so pooled sessions
   inherit settings, MCP servers, and per-project tool approvals instead of
   hitting the first-run onboarding wizard.
-- `clp select` — print the emptiest account's config dir, scored from live
+- `ccp select` — print the emptiest account's config dir, scored from live
   5-hour / 7-day usage with imminent-reset credit, low-headroom barrier, and
   burn-rate terms; cwd-keyed session stickiness for prompt-cache continuity.
-- `clp run` / `clp status` / `clp list` / `clp env` / `clp doctor` /
-  `clp remove` — session lifecycle, live usage table, account inspection,
+- `ccp run` / `ccp status` / `ccp list` / `ccp env` / `ccp doctor` /
+  `ccp remove` — session lifecycle, live usage table, account inspection,
   drift repair, and account removal.
 - Shared overlay so every account presents all of `~/.claude`: symlink
   provider (default, pure Go) and optional fuse-t live mirror (`-tags fuse`).
   Per-account private entries: `daemon/`, `ide/`, `backups/`, and
   `.claude.json`.
-- User LaunchAgent daemon (`clp service`, `brew services`): usage polling with
+- User LaunchAgent daemon (`ccp service`, `brew services`): usage polling with
   backoff, idle-account token refresh, score caching, fuse mount lifecycle.
-  `clp add`/`clp init` start it automatically and restart it after upgrades.
-- `clp init` — optional explicit pool setup (state dir + daemon); `clp add`
+  `ccp add`/`ccp init` start it automatically and restart it after upgrades.
+- `ccp init` — optional explicit pool setup (state dir + daemon); `ccp add`
   does the same automatically.
-- Homebrew formula with `clp` symlink (prebuilt universal binary; fuse build
+- Homebrew formula with `ccp` symlink (prebuilt universal binary; fuse build
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 

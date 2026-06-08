@@ -80,7 +80,7 @@ func TestRenderTablePlain(t *testing.T) {
 
 // TestRenderTableEmpty keeps the friendly empty-pool message.
 func TestRenderTableEmpty(t *testing.T) {
-	if got := renderTable(nil); !strings.Contains(got, "clp add") {
-		t.Errorf("empty pool should suggest `clp add`, got %q", got)
+	if got := renderTable(nil); !strings.Contains(got, "ccp add") {
+		t.Errorf("empty pool should suggest `ccp add`, got %q", got)
 	}
 }

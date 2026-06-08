@@ -96,8 +96,8 @@ func TestFlockRespectsContext(t *testing.T) {
 }
 
 const (
-	flockChildLockEnv  = "CLP_FLOCK_TEST_LOCK"
-	flockChildReadyEnv = "CLP_FLOCK_TEST_READY"
+	flockChildLockEnv  = "CCP_FLOCK_TEST_LOCK"
+	flockChildReadyEnv = "CCP_FLOCK_TEST_READY"
 	flockChildHold     = 700 * time.Millisecond
 )
 

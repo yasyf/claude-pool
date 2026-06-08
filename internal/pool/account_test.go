@@ -205,7 +205,7 @@ func TestPrepareAddRequiresInit(t *testing.T) {
 }
 
 // TestPrepareAddPurgesStaleKeychainItem pins the stale-item fix: an abandoned
-// add (or `clp remove --keep-credential`) can leave a credential under a
+// add (or `ccp remove --keep-credential`) can leave a credential under a
 // service name a later add at the same index reuses; PrepareAdd must purge it
 // (else the login watcher false-positives and FinalizeAdd registers a stale
 // credential) — EXCEPT for SeedKeptExisting, the documented reuse path.

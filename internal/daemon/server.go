@@ -251,7 +251,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}
 	// Record regardless of NoMark: cache continuity is established by
-	// `clp run`'s no-mark select too.
+	// `ccp run`'s no-mark select too.
 	s.recordSticky(req.Cwd, best.Account.ID)
 	if sticky {
 		s.log.Printf("sticky select: %s -> acct-%02d", req.Cwd, best.Account.ID)

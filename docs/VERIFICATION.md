@@ -9,7 +9,7 @@ cannot be automated. Run from a clean machine state where possible.
 ```sh
 # From source:
 CGO_ENABLED=0 go build -o /usr/local/bin/cc-pool ./cmd/cc-pool
-ln -sf /usr/local/bin/cc-pool /usr/local/bin/clp
+ln -sf /usr/local/bin/cc-pool /usr/local/bin/ccp
 
 # Or via the tap once released:
 brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool
@@ -18,20 +18,20 @@ brew install yasyf/cc-pool/cc-pool
 
 ## 1. Release installs and reports version
 ```sh
-clp --version          # prints the version
+ccp --version          # prints the version
 cc-pool --version  # same binary, both names work
 ```
 
 ## 2. add auto-inits; plain claude untouched; status; daemon refresh
 ```sh
-clp add                # (human) interactive: auto-inits the pool, auto-starts the daemon,
+ccp add                # (human) interactive: auto-inits the pool, auto-starts the daemon,
                        #         seeds .claude.json, logs in an account, then loops
                        #         ("Add another?") so you can onboard several subscriptions
-clp status             # all accounts shown with live 5h/7d remaining + score
-clp service status     # shows "Homebrew (brew services)" or self-managed, + Daemon: running
+ccp status             # all accounts shown with live 5h/7d remaining + score
+ccp service status     # shows "Homebrew (brew services)" or self-managed, + Daemon: running
 claude                 # (human) plain claude STILL launches on ~/.claude, untouched
 ```
-Verify during `clp add`:
+Verify during `ccp add`:
 - the `claude /login` session does NOT show the first-run theme wizard
   (onboarding state was seeded from ~/.claude.json), and no
   "configuration file not found / backup file exists" messages appear;
@@ -46,18 +46,18 @@ Verify during `clp add`:
 ## 3. Drive one account up → select returns the other (stdout = path only)
 ```sh
 # Burn 5h usage on acct-01 (human: run a heavy session), then:
-clp select                       # prints ONLY a config dir on stdout
-clp select 2>/dev/null           # stderr suppressed → still just the path
-test -n "$(clp select 2>/dev/null)"   # non-empty path
+ccp select                       # prints ONLY a config dir on stdout
+ccp select 2>/dev/null           # stderr suppressed → still just the path
+test -n "$(ccp select 2>/dev/null)"   # non-empty path
 # Expect the LESS-used account's dir.
 ```
 
 ## 4. Launch on the selected account → subscription, shared workspace, distinct keychain
 ```sh
-CLAUDE_CONFIG_DIR=$(clp select) claude   # (human)
+CLAUDE_CONFIG_DIR=$(ccp select) claude   # (human)
 #   In-session /status shows the expected account on its SUBSCRIPTION (not "Claude API").
-ls "$(clp select 2>/dev/null)/projects"  # shared projects identical to plain claude's
-diff <(ls ~/.claude/skills) <(ls "$(clp env --account 1 2>/dev/null | sed -n 's/.*CLAUDE_CONFIG_DIR=//p' | tr -d "'")/skills")
+ls "$(ccp select 2>/dev/null)/projects"  # shared projects identical to plain claude's
+diff <(ls ~/.claude/skills) <(ls "$(ccp env --account 1 2>/dev/null | sed -n 's/.*CLAUDE_CONFIG_DIR=//p' | tr -d "'")/skills")
 ```
 
 ## 5. Overlay parity (writes shared both ways)
@@ -66,9 +66,9 @@ diff <(ls ~/.claude/skills) <(ls "$(clp env --account 1 2>/dev/null | sed -n 's/
 ls -la ~/.cc-pool/accounts/acct-01            # top-level entries are symlinks into ~/.claude
 #                                          except daemon/, ide/, backups/ (private dirs)
 #                                          and .claude.json (private per-account file)
-echo hi > ~/.cc-pool/accounts/acct-01/projects/_clp_probe && \
-  cat ~/.claude/projects/_clp_probe       # write through the overlay lands in ~/.claude
-rm ~/.claude/projects/_clp_probe
+echo hi > ~/.cc-pool/accounts/acct-01/projects/_ccp_probe && \
+  cat ~/.claude/projects/_ccp_probe       # write through the overlay lands in ~/.claude
+rm ~/.claude/projects/_ccp_probe
 ls ~/.cc-pool/accounts/acct-01/backups        # private: never shows ~/.claude/backups content
 
 # fuse provider (only with a -tags fuse build + fuse-t + Network Volumes grant):
@@ -77,13 +77,13 @@ mount | grep cc-pool                  # account dir is a fuse-t mirror mount
 
 ## 6. End session → token adopted, checkout released; uninstall leaves ~/.claude intact
 ```sh
-# After a `clp run` session exits, the daemon re-reads any rotated token and
+# After a `ccp run` session exits, the daemon re-reads any rotated token and
 # closes the checkout:
-clp run -- -p "hello"                     # (human) owns the PID; adopts rotated token on exit
-clp status                                # active sessions for that account back to baseline
+ccp run -- -p "hello"                     # (human) owns the PID; adopts rotated token on exit
+ccp status                                # active sessions for that account back to baseline
 
-clp service uninstall                     # stops daemon, unmounts any fuse overlays
-clp service uninstall --purge             # also removes pool accounts/dirs/state
+ccp service uninstall                     # stops daemon, unmounts any fuse overlays
+ccp service uninstall --purge             # also removes pool accounts/dirs/state
 brew uninstall cc-pool                # (if installed via brew)
 test -d ~/.claude && claude --version     # (human) ~/.claude intact; plain claude still works
 ```

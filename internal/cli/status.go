@@ -37,7 +37,7 @@ func newStatusCmd() *cobra.Command {
 
 // runStatus shows account status. On an interactive terminal it launches the
 // TUI (which refreshes itself); piped or with --plain it prints the plain
-// table, once or continuously under --watch. Both `clp status` and bare `clp`
+// table, once or continuously under --watch. Both `ccp status` and bare `ccp`
 // dispatch here.
 func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) error {
 	if isTTY() && !plain {
@@ -110,7 +110,7 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 // renderTable produces a styled fixed-width table, best account highlighted.
 func renderTable(snaps []pool.Snapshot) string {
 	if len(snaps) == 0 {
-		return "No accounts yet. Run `clp add` to add one.\n"
+		return "No accounts yet. Run `ccp add` to add one.\n"
 	}
 	// Sort by score desc for display; best first.
 	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].Score > snaps[j].Score })
@@ -167,7 +167,7 @@ func snapshotFlags(s pool.Snapshot) string {
 }
 
 // accountName returns an account's display label, or a placeholder when it is
-// unnamed. The internal acct-NN id is shown only by `clp list` and `clp doctor`.
+// unnamed. The internal acct-NN id is shown only by `ccp list` and `ccp doctor`.
 func accountName(label string) string {
 	if label == "" {
 		return "(unnamed)"

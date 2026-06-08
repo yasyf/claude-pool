@@ -26,7 +26,7 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	svc := keychain.ServiceName("/tmp/clp-test/acct-01")
+	svc := keychain.ServiceName("/tmp/ccp-test/acct-01")
 	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: svc, KeychainAccount: "user", OverlayKind: "symlink"}
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)

@@ -38,16 +38,16 @@ func TestExecEnv(t *testing.T) {
 	})
 }
 
-// TestResolveRunDirClpAccount covers the two CLP_ACCOUNT error paths, which
+// TestResolveRunDirCcpAccount covers the two CCP_ACCOUNT error paths, which
 // return before any overlay/Keychain access. The valid-id path is exercised by
 // manual verification (it reaches SyncOverlay/PreflightRefresh, which need real
 // state and must not be touched here).
-func TestResolveRunDirClpAccount(t *testing.T) {
+func TestResolveRunDirCcpAccount(t *testing.T) {
 	m := &pool.Manager{Store: openTestStore(t)}
 	cmd := &cobra.Command{}
 
 	t.Run("non-integer is rejected", func(t *testing.T) {
-		t.Setenv(clpAccountEnv, "not-a-number")
+		t.Setenv(ccpAccountEnv, "not-a-number")
 		_, err := resolveRunDir(cmd, m)
 		if err == nil || !strings.Contains(err.Error(), "must be an account id") {
 			t.Fatalf("err = %v, want an 'account id' parse error", err)
@@ -55,7 +55,7 @@ func TestResolveRunDirClpAccount(t *testing.T) {
 	})
 
 	t.Run("unknown id is rejected", func(t *testing.T) {
-		t.Setenv(clpAccountEnv, "999")
+		t.Setenv(ccpAccountEnv, "999")
 		_, err := resolveRunDir(cmd, m)
 		if err == nil || !strings.Contains(err.Error(), "999") {
 			t.Fatalf("err = %v, want a not-found error mentioning account 999", err)
