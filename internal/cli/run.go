@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13,92 +16,144 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
+// clpAccountEnv forces a specific pool account for `clp run`. The command
+// parses no flags of its own (every argument passes through to claude), so the
+// account override travels out-of-band in the environment.
+const clpAccountEnv = "CLP_ACCOUNT"
+
 func newRunCmd() *cobra.Command {
-	var account int
 	cmd := &cobra.Command{
-		Use:   "run [-- claude args...]",
-		Short: "Select an account and run `claude`, owning the session",
-		Long: `run picks the best account, launches ` + "`claude`" + ` with CLAUDE_CONFIG_DIR set,
-and owns the resulting process, so the session is tracked precisely and any
-rotated token is re-asserted on exit. Best for automation.`,
-		DisableFlagParsing: false,
+		Use:   "run [claude args...]",
+		Short: "Select an account and exec `claude`, passing every arg through",
+		Long: `run picks the best account and replaces itself with ` + "`claude`" + ` (via exec)
+with CLAUDE_CONFIG_DIR set, so once claude starts cc-pool is gone from the
+process tree — signals, the controlling terminal, and the exit code are all claude's.
+
+Every argument is forwarded verbatim, with no ` + "`--`" + ` separator (e.g.
+` + "`clp run --resume`" + `). Set ` + clpAccountEnv + `=<id> to force a specific account
+instead of auto-selecting.
+
+This is the imperative equivalent of:
+
+    CLAUDE_CONFIG_DIR=$(clp select) claude ...`,
+		// Pass every argument straight through to claude; clp owns no flags here.
+		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withManager(func(m *pool.Manager) error {
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				// Best-effort: an unreadable cwd just disables stickiness.
-				cwd, _ := os.Getwd()
-				var a store.Account
-				var err error
-				if cmd.Flags().Changed("account") {
-					a, err = m.Store.GetAccount(account)
-					if err == nil {
-						_ = m.RecordSticky(cwd, a.ID, time.Now()) // anchor future selects here
-					}
-				} else {
-					a, err = chooseAccount(cmd, m, cwd)
-				}
+				dir, err := resolveRunDir(cmd, m)
 				if err != nil {
 					return err
 				}
-				if err := m.SyncOverlay(a); err != nil {
-					warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
-				}
-				if err := m.PreflightRefresh(cmd.Context(), a); err != nil && !errors.Is(err, pool.ErrNeedsLogin) {
-					warn(cmd.ErrOrStderr(), "%v", err)
-				}
-				return execClaude(cmd, m, a, args)
+				return execClaude(dir, args)
 			})
 		},
 	}
-	cmd.Flags().IntVar(&account, "account", 0, "force a specific account id")
 	return cmd
 }
 
-// chooseAccount prefers the daemon's pick, falling back to a live selection.
-func chooseAccount(cmd *cobra.Command, m *pool.Manager, cwd string) (store.Account, error) {
-	if resp, ok := daemon.NewClient().Select(nil, 0, true, cwd); ok && resp.OK && resp.SelectedID != nil {
-		return m.Store.GetAccount(*resp.SelectedID)
+// resolveRunDir picks the account `clp run` launches on and returns its config
+// dir. CLP_ACCOUNT forces a specific account; otherwise it mirrors `clp select`:
+// ensure a daemon (so it can adopt any token claude rotates once clp has exec'd
+// away), take its reserved pick, and fall back to a live selection only when the
+// daemon is unreachable.
+func resolveRunDir(cmd *cobra.Command, m *pool.Manager) (string, error) {
+	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
+
+	if v := os.Getenv(clpAccountEnv); v != "" {
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return "", fmt.Errorf("%s must be an account id, got %q: %w", clpAccountEnv, v, err)
+		}
+		a, err := m.Store.GetAccount(id)
+		if err != nil {
+			return "", fmt.Errorf("%s=%d: %w", clpAccountEnv, id, err)
+		}
+		_ = m.RecordSticky(cwd, a.ID, time.Now()) // anchor future selects here
+		return prepareAccount(cmd, m, a, accountName(a.Label))
 	}
+
+	// Fast path: the daemon's cached, reserved pick. EnsureRunning keeps a daemon
+	// alive to adopt any rotated token after we exec away. A daemon that responds
+	// is authoritative — only an unreachable one falls through to live selection.
+	cl := daemon.NewClient()
+	if cl.EnsureRunning(2 * time.Second) {
+		if resp, ok := cl.Select(nil, 0, false, cwd); ok {
+			switch {
+			case resp.OK && resp.Dir != "":
+				if resp.Sticky {
+					step(cmd.ErrOrStderr(), "Reusing the account pinned to this directory.")
+				} else {
+					step(cmd.ErrOrStderr(), "Selected the emptiest account.")
+				}
+				return resp.Dir, nil
+			case resp.Error != "":
+				return "", errors.New(resp.Error)
+			default:
+				return "", pool.ErrNoneAvailable
+			}
+		}
+	}
+
+	// Live fallback (no daemon): sample + score synchronously. Select records
+	// stickiness itself.
 	sr, err := m.Select(cmd.Context(), pool.SelectOptions{Live: true, Cwd: cwd})
 	if err != nil {
-		return store.Account{}, err
+		return "", err
 	}
-	return sr.Best, nil
+	reason := fmt.Sprintf("%s (score %.1f)", accountName(sr.Best.Label), sr.Result.Score)
+	if sr.Sticky {
+		reason = fmt.Sprintf("%s (pinned to this directory)", accountName(sr.Best.Label))
+	}
+	return prepareAccount(cmd, m, sr.Best, reason)
 }
 
-// execClaude launches claude as a child, records the session, waits, and on
-// exit adopts any rotated token (directly or via the daemon).
-func execClaude(cmd *cobra.Command, m *pool.Manager, a store.Account, args []string) error {
+// prepareAccount re-asserts the account's overlay and preflight-refreshes its
+// token before launch — the daemonless equivalent of what the daemon does for
+// its own picks — then returns the config dir. The choice is logged to stderr;
+// stdout is left clean for claude.
+func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, reason string) (string, error) {
+	if err := m.SyncOverlay(a); err != nil {
+		warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
+	}
+	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
+		if errors.Is(err, pool.ErrNeedsLogin) {
+			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `clp add` or `claude /login`", accountName(a.Label))
+		} else {
+			warn(cmd.ErrOrStderr(), "%v", err)
+		}
+	}
+	step(cmd.ErrOrStderr(), "selected %s", reason)
+	return a.ConfigDir, nil
+}
+
+// execClaude replaces this process with `claude`, forwarding args verbatim and
+// pointing it at configDir via CLAUDE_CONFIG_DIR. It does not return on success.
+func execClaude(configDir string, args []string) error {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
-	child := exec.Command(bin, args...)
-	child.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+a.ConfigDir)
-	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
-
-	if err := child.Start(); err != nil {
-		return err
+	argv := append([]string{"claude"}, args...)
+	if err := syscall.Exec(bin, argv, execEnv(os.Environ(), configDir)); err != nil {
+		return fmt.Errorf("exec claude: %w", err)
 	}
-	pid := child.Process.Pid
-	sessID, _ := m.Store.OpenSession(a.ID, pid, a.ConfigDir)
-	step(cmd.ErrOrStderr(), "Running claude as %s (pid %d).", accountName(a.Label), pid)
+	return nil // unreachable: a successful Exec never returns
+}
 
-	waitErr := child.Wait()
-
-	// Session check-in: prefer the daemon (event-driven adopt), else do it here.
-	if resp, err := daemon.NewClient().Checkin(pid); err != nil || resp == nil || !resp.OK {
-		_ = m.AdoptRotatedToken(cmd.Context(), a)
+// execEnv returns environ with any existing CLAUDE_CONFIG_DIR dropped and
+// CLAUDE_CONFIG_DIR=configDir appended, so the launched claude sees exactly one
+// (a duplicate key has platform-dependent getenv precedence).
+func execEnv(environ []string, configDir string) []string {
+	const key = "CLAUDE_CONFIG_DIR="
+	out := make([]string, 0, len(environ)+1)
+	for _, e := range environ {
+		if strings.HasPrefix(e, key) {
+			continue
+		}
+		out = append(out, e)
 	}
-	if sessID > 0 {
-		_ = m.Store.CloseSession(sessID)
-	}
-
-	var exitErr *exec.ExitError
-	if errors.As(waitErr, &exitErr) {
-		os.Exit(exitErr.ExitCode())
-	}
-	return waitErr
+	return append(out, key+configDir)
 }
