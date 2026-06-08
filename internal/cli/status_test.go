@@ -1,13 +1,16 @@
 package cli
 
 import (
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -82,5 +85,54 @@ func TestRenderTablePlain(t *testing.T) {
 func TestRenderTableEmpty(t *testing.T) {
 	if got := renderTable(nil); !strings.Contains(got, "ccp add") {
 		t.Errorf("empty pool should suggest `ccp add`, got %q", got)
+	}
+}
+
+// TestFromDaemonHasUsageIndependentOfStale: "no-data" means never-sampled, not
+// stale. A stale account that still has usage must not be mislabeled no-data
+// (the bug where every stale account showed both flags despite real util%).
+func TestFromDaemonHasUsageIndependentOfStale(t *testing.T) {
+	snaps := fromDaemon([]daemon.AccountStatus{
+		{ID: 1, Label: "stale-with-data", Stale: true, HasUsage: true, Remaining7d: 87},
+		{ID: 2, Label: "never-sampled", Stale: true, HasUsage: false},
+	})
+
+	if !snaps[0].HasUsage {
+		t.Fatal("a stale account with data must keep HasUsage=true")
+	}
+	if f := stripANSI(snapshotFlags(snaps[0])); strings.Contains(f, "no-data") || !strings.Contains(f, "stale") {
+		t.Fatalf("stale-with-data must be flagged stale but not no-data, got %q", f)
+	}
+	if snaps[1].HasUsage {
+		t.Fatal("a never-sampled account must have HasUsage=false")
+	}
+	if f := stripANSI(snapshotFlags(snaps[1])); !strings.Contains(f, "no-data") {
+		t.Fatalf("never-sampled must be flagged no-data, got %q", f)
+	}
+}
+
+// TestDaemonStatusUsable pins the version gate: only an OK response from a
+// daemon at the exact current binary version is rendered directly; anything
+// else (error, not-OK, empty/mismatched version) falls back to live sampling so
+// a pre-upgrade daemon can't feed the TUI a partial view.
+func TestDaemonStatusUsable(t *testing.T) {
+	cur := version.String()
+	cases := map[string]struct {
+		resp *daemon.Response
+		err  error
+		want bool
+	}{
+		"current version":  {&daemon.Response{OK: true, Version: cur}, nil, true},
+		"transport error":  {nil, errors.New("dial: no socket"), false},
+		"not ok":           {&daemon.Response{OK: false, Version: cur}, nil, false},
+		"empty version":    {&daemon.Response{OK: true, Version: ""}, nil, false},
+		"mismatch version": {&daemon.Response{OK: true, Version: cur + "-old"}, nil, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := daemonStatusUsable(tc.resp, tc.err); got != tc.want {
+				t.Errorf("daemonStatusUsable = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

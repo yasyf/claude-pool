@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 func newStatusCmd() *cobra.Command {
@@ -73,11 +74,20 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 // gatherStatus prefers the daemon's cached view, falling back to live sampling.
 func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, error) {
 	if !forceLive {
-		if resp, err := daemon.NewClient().Status(); err == nil && resp.OK {
+		resp, err := daemon.NewClient().Status()
+		if daemonStatusUsable(resp, err) {
 			return fromDaemon(resp.Accounts), nil
 		}
 	}
 	return m.Snapshots(ctx, true, pool.DefaultFreshFor)
+}
+
+// daemonStatusUsable reports whether a status response can be rendered directly.
+// A transport error, a not-OK reply, or a version-skewed (pre-upgrade) daemon —
+// which omits newer wire fields like Components — must fall back to live
+// sampling so the render is never partial.
+func daemonStatusUsable(resp *daemon.Response, err error) bool {
+	return err == nil && resp != nil && resp.OK && resp.Version == version.String()
 }
 
 // fromDaemon converts daemon account statuses into Snapshots for rendering.
@@ -86,7 +96,7 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 	for _, a := range accs {
 		s := pool.Snapshot{
 			Score:          a.Score,
-			HasUsage:       !a.Stale,
+			HasUsage:       a.HasUsage,
 			Remaining5h:    a.Remaining5h,
 			Remaining7d:    a.Remaining7d,
 			Util5h:         100 - a.Remaining5h,

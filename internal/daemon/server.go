@@ -199,7 +199,9 @@ func (s *Server) handleStatus(ctx context.Context) Response {
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
-	return Response{OK: true, Accounts: toStatuses(snaps)}
+	// Version lets the client detect a pre-upgrade daemon (which omits newer wire
+	// fields like Components) and fall back to live sampling.
+	return Response{OK: true, Version: version.String(), Accounts: toStatuses(snaps)}
 }
 
 // handleSelect picks the best available account from cached scores, applying
@@ -377,6 +379,7 @@ func toStatuses(snaps []pool.Snapshot) []AccountStatus {
 			Remaining7d:    sn.Remaining7d,
 			ActiveSessions: sn.ActiveSessions,
 			RateLimited:    sn.RateLimited,
+			HasUsage:       sn.HasUsage,
 			Stale:          sn.Stale,
 			Resets5h:       sn.Resets5h,
 			Resets7d:       sn.Resets7d,

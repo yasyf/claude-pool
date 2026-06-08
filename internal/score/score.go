@@ -17,7 +17,18 @@ var (
 	WSession     = 2.00
 	PenRateLimit = 100.0
 	PenStale     = 20.0
-	StaleAfter   = 90 * time.Second
+
+	// StaleAfter is the sample age past which the selection penalty engages. It
+	// is deliberately short so select prefers the freshest-sampled account; it is
+	// uniform across the pool between polls, so it does not skew ranking.
+	StaleAfter = 90 * time.Second
+
+	// DisplayStaleAfter is the sample age past which status renders an account as
+	// "stale". It must exceed the daemon's worst-case normal poll gap
+	// (daemon.basePollInterval 180s + pollJitter 30s = 210s) so a healthy,
+	// regularly-polled account is never shown stale, while an account genuinely
+	// stuck in rate-limit backoff (whose data really is old) still surfaces.
+	DisplayStaleAfter = 5 * time.Minute
 
 	// FiveHourWindow / SevenDayWindow are the window lengths used to credit an
 	// imminent reset: depletion is discounted by how much of the window is still
@@ -61,15 +72,18 @@ type Input struct {
 	RefreshFailed  bool // the most recent refresh attempt failed
 }
 
-// stale reports whether this account's data is stale or its refresh failed.
-func (in Input) stale(now time.Time) bool {
+// staleAfter reports whether this account's data is older than d, its refresh
+// failed, or it was never sampled. A failed refresh or never-sampled account is
+// stale under any threshold. Two thresholds use this: StaleAfter for the
+// selection penalty and DisplayStaleAfter for the status "stale" flag.
+func (in Input) staleAfter(now time.Time, d time.Duration) bool {
 	if in.RefreshFailed {
 		return true
 	}
 	if !in.HasUsage {
 		return true
 	}
-	return now.Sub(in.SampleTS) > StaleAfter
+	return now.Sub(in.SampleTS) > d
 }
 
 // Components is the per-term breakdown, for `status` and debugging.
@@ -128,10 +142,12 @@ func Score(in Input, now time.Time) Result {
 	if in.RateLimited {
 		c.RateLimitPenalty = PenRateLimit
 	}
-	stale := in.stale(now)
-	if stale {
+	// The penalty engages at the short StaleAfter; the displayed Stale flag uses
+	// the longer DisplayStaleAfter so a normally-polled account isn't shown stale.
+	if in.staleAfter(now, StaleAfter) {
 		c.StalePenalty = PenStale
 	}
+	stale := in.staleAfter(now, DisplayStaleAfter)
 
 	score := c.Remaining5h + c.Remaining7d -
 		c.SessionPenalty - c.RateLimitPenalty - c.StalePenalty -

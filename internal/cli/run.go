@@ -14,6 +14,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 // ccpAccountEnv forces a specific pool account for `ccp run`. The command
@@ -79,7 +80,9 @@ func resolveRunDir(cmd *cobra.Command, m *pool.Manager) (string, error) {
 	// alive to adopt any rotated token after we exec away. A daemon that responds
 	// is authoritative — only an unreachable one falls through to live selection.
 	cl := daemon.NewClient()
-	if cl.EnsureRunning(2 * time.Second) {
+	// A version-skewed (pre-upgrade) daemon is ignored — fall through to live
+	// selection until status/add/init restarts it onto the current binary.
+	if cl.EnsureRunning(2*time.Second) && daemonAt(version.String()) {
 		if resp, ok := cl.Select(nil, 0, false, cwd); ok {
 			switch {
 			case resp.OK && resp.Dir != "":

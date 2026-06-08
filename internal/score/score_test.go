@@ -27,9 +27,37 @@ func TestRateLimitMakesUnavailable(t *testing.T) {
 
 func TestStaleWhenOld(t *testing.T) {
 	now := time.Now()
-	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-5 * time.Minute), Util5h: 0}, now)
+	// Past DisplayStaleAfter (5m), so the displayed Stale flag engages.
+	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-10 * time.Minute), Util5h: 0}, now)
 	if !r.Stale {
 		t.Fatal("old sample must be stale")
+	}
+}
+
+// TestDisplayStaleDecoupledFromPenalty pins the decoupling: a sample older than
+// StaleAfter (90s) but younger than DisplayStaleAfter (5m) still takes the
+// scoring penalty yet is NOT shown stale — so a normally-polled account (the
+// daemon polls every ~180s) doesn't flash "stale" between polls.
+func TestDisplayStaleDecoupledFromPenalty(t *testing.T) {
+	now := time.Now()
+
+	mid := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-100 * time.Second), Util5h: 0}, now)
+	if mid.Stale {
+		t.Fatal("a 100s-old sample must not be display-stale (< DisplayStaleAfter)")
+	}
+	if mid.Components.StalePenalty != PenStale {
+		t.Fatalf("a 100s-old sample must still take the scoring penalty, got %.1f", mid.Components.StalePenalty)
+	}
+
+	fresh := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-30 * time.Second), Util5h: 0}, now)
+	if fresh.Stale || fresh.Components.StalePenalty != 0 {
+		t.Fatalf("a 30s-old sample must be neither penalized nor display-stale, got stale=%v pen=%.1f",
+			fresh.Stale, fresh.Components.StalePenalty)
+	}
+
+	old := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-6 * time.Minute), Util5h: 0}, now)
+	if !old.Stale {
+		t.Fatal("a 6m-old sample must be display-stale")
 	}
 }
 

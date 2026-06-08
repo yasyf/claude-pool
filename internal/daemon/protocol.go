@@ -44,6 +44,7 @@ type AccountStatus struct {
 	Remaining7d    float64   `json:"remaining_7d"`
 	ActiveSessions int       `json:"active_sessions"`
 	RateLimited    bool      `json:"rate_limited"`
+	HasUsage       bool      `json:"has_usage"` // false only if the account was never sampled
 	Stale          bool      `json:"stale"`
 	Resets5h       time.Time `json:"resets_5h"`
 	Resets7d       time.Time `json:"resets_7d"`

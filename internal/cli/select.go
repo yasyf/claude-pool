@@ -10,6 +10,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 func newSelectCmd() *cobra.Command {
@@ -73,6 +74,11 @@ func selectViaDaemon(cmd *cobra.Command, m *pool.Manager, account *int, wait boo
 	// Auto-spawn a detached daemon if none is running (≤2s), then fall through
 	// to live selection if it still doesn't come up.
 	if !cl.EnsureRunning(2 * time.Second) {
+		return "", false, nil
+	}
+	// A pre-upgrade daemon would score with stale logic; prefer live selection
+	// until status/add/init restarts it onto the current binary.
+	if !daemonAt(version.String()) {
 		return "", false, nil
 	}
 	// pid 0: ccp exits before `claude` starts, so its pid is useless for

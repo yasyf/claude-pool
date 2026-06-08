@@ -32,6 +32,14 @@ var (
 // piped/`--plain` path stays on renderTable.
 func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	ctx := cmd.Context()
+	// Restart a pre-upgrade daemon onto the current binary so the cached view it
+	// serves carries the newer wire fields the detail pane renders. Best-effort;
+	// gatherStatus version-gates and falls back to live regardless. Skipped under
+	// --live (the user already opted out of the daemon). The alt-screen clears any
+	// "restarting…" line on entry.
+	if !live {
+		ensureDaemon(cmd)
+	}
 	model := statusTUI{
 		ctx: ctx,
 		gather: func(c context.Context) ([]pool.Snapshot, error) {
