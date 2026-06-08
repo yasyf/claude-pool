@@ -72,9 +72,8 @@ func TestUsageHeadersAndParsing(t *testing.T) {
 			t.Errorf("anthropic-beta = %q, want %q", got, betaHeader)
 		}
 		io.WriteString(w, `{
-			"five_hour":{"utilization":0.4,"resets_at":1700000000},
-			"seven_day":{"utilization":0.1,"resets_at":1700600000},
-			"seven_day_opus":{"utilization":0.9,"resets_at":1700600000}
+			"five_hour":{"utilization":40.0,"resets_at":1700000000},
+			"seven_day":{"utilization":10.0,"resets_at":1700600000}
 		}`)
 	}))
 	defer srv.Close()
@@ -90,11 +89,46 @@ func TestUsageHeadersAndParsing(t *testing.T) {
 	if u.FiveHour.Remaining() != 60 {
 		t.Errorf("five_hour remaining = %.1f, want 60", u.FiveHour.Remaining())
 	}
-	if !u.SevenDayOpus.Present || u.SevenDayOpus.Used() != 90 {
-		t.Errorf("opus window = %+v", u.SevenDayOpus)
+	if u.SevenDay.Used() != 10 {
+		t.Errorf("seven_day used = %.1f, want 10", u.SevenDay.Used())
 	}
 	if u.FiveHour.ResetsAt.Unix() != 1700000000 {
 		t.Errorf("resets_at = %v", u.FiveHour.ResetsAt)
+	}
+}
+
+// TestUsageIgnoresUnknownWindows feeds a realistic current /api/oauth/usage
+// payload — with the many per-model, promo, and credit windows the API now
+// emits — and asserts cc-pool reads only five_hour and seven_day and decodes the
+// rest without error. utilization is a percent in [0,100] (e.g. 13.0 == 13%).
+func TestUsageIgnoresUnknownWindows(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{
+			"five_hour":{"utilization":31.0,"resets_at":"2026-06-08T12:10:01+00:00"},
+			"seven_day":{"utilization":56.0,"resets_at":"2026-06-11T13:00:00+00:00"},
+			"seven_day_oauth_apps":null,
+			"seven_day_opus":null,
+			"seven_day_sonnet":{"utilization":0.0,"resets_at":null},
+			"seven_day_omelette":{"utilization":0.0,"resets_at":null},
+			"tangelo":null,
+			"extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":177.0,"utilization":3.54,"currency":"USD","disabled_reason":null}
+		}`)
+	}))
+	defer srv.Close()
+	c := New()
+	c.usageURL = srv.URL
+	u, err := c.Usage(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("Usage with current payload: %v", err)
+	}
+	if u.FiveHour.Used() != 31 {
+		t.Errorf("five_hour used = %.2f, want 31", u.FiveHour.Used())
+	}
+	if u.SevenDay.Used() != 56 {
+		t.Errorf("seven_day used = %.2f, want 56", u.SevenDay.Used())
+	}
+	if u.SevenDay.Remaining() != 44 {
+		t.Errorf("seven_day remaining = %.2f, want 44", u.SevenDay.Remaining())
 	}
 }
 
@@ -142,7 +176,7 @@ func TestResetTimeDecoding(t *testing.T) {
 // resets_at as a string, which the old *float64 field could not decode.
 func TestUsageStringResetsAt(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, `{"five_hour":{"utilization":0.4,"resets_at":"1700000000"}}`)
+		io.WriteString(w, `{"five_hour":{"utilization":40.0,"resets_at":"1700000000"}}`)
 	}))
 	defer srv.Close()
 	c := New()
@@ -160,7 +194,7 @@ func TestUsageUserAgentSent(t *testing.T) {
 	var ua string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ua = r.Header.Get("User-Agent")
-		io.WriteString(w, `{"five_hour":{"utilization":0.5,"resets_at":1}}`)
+		io.WriteString(w, `{"five_hour":{"utilization":50.0,"resets_at":1}}`)
 	}))
 	defer srv.Close()
 	c := New()

@@ -142,18 +142,16 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	return &tr, nil
 }
 
-// Window is one usage window (5-hour, 7-day, or 7-day-opus).
+// Window is one usage window (5-hour or 7-day).
 type Window struct {
-	// Utilization is a fraction in [0,1] (e.g. 0.7 == 70%), as the API reports it.
+	// Utilization is a percentage in [0,100] as the API reports it (e.g. 13.0 == 13%).
 	Utilization float64
 	// ResetsAt is when this window resets. Zero if absent.
 	ResetsAt time.Time
-	// Present reports whether the API included this window at all.
-	Present bool
 }
 
 // Used returns utilization as a 0..100 percentage for scoring/display.
-func (w Window) Used() float64 { return w.Utilization * 100 }
+func (w Window) Used() float64 { return w.Utilization }
 
 // Remaining returns 100 - Used, clamped to [0,100].
 func (w Window) Remaining() float64 {
@@ -167,11 +165,12 @@ func (w Window) Remaining() float64 {
 	return r
 }
 
-// Usage is the parsed /api/oauth/usage response.
+// Usage is the parsed /api/oauth/usage response. The API returns many windows
+// (per-model 7-day limits, credit overage, promo buckets); cc-pool consumes only
+// the 5-hour and aggregate 7-day windows, and the decoder ignores the rest.
 type Usage struct {
-	FiveHour     Window
-	SevenDay     Window
-	SevenDayOpus Window
+	FiveHour Window
+	SevenDay Window
 }
 
 // rawWindow matches the API JSON: utilization is a fraction in [0,1] and
@@ -187,7 +186,7 @@ func (rw *rawWindow) toWindow() Window {
 	if rw == nil {
 		return Window{}
 	}
-	w := Window{Present: true}
+	var w Window
 	if rw.Utilization != nil {
 		w.Utilization = *rw.Utilization
 	}
@@ -240,9 +239,8 @@ func (r *resetTime) UnmarshalJSON(b []byte) error {
 }
 
 type rawUsage struct {
-	FiveHour     *rawWindow `json:"five_hour"`
-	SevenDay     *rawWindow `json:"seven_day"`
-	SevenDayOpus *rawWindow `json:"seven_day_opus"`
+	FiveHour *rawWindow `json:"five_hour"`
+	SevenDay *rawWindow `json:"seven_day"`
 }
 
 // UsageError carries the HTTP status from a failed usage fetch.
@@ -288,9 +286,8 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 		return nil, fmt.Errorf("decode usage response: %w", err)
 	}
 	return &Usage{
-		FiveHour:     ru.FiveHour.toWindow(),
-		SevenDay:     ru.SevenDay.toWindow(),
-		SevenDayOpus: ru.SevenDayOpus.toWindow(),
+		FiveHour: ru.FiveHour.toWindow(),
+		SevenDay: ru.SevenDay.toWindow(),
 	}, nil
 }
 
