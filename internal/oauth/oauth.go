@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -173,11 +175,12 @@ type Usage struct {
 }
 
 // rawWindow matches the API JSON: utilization is a fraction in [0,1] and
-// resets_at is a Unix epoch in seconds (the binary does utilization*100 and
-// new Date(resets_at*1000).toISOString() on the raw response).
+// resets_at is the reset time. The API has been observed to encode resets_at
+// three ways across versions — a JSON number of epoch seconds, a numeric string
+// of epoch seconds, or an RFC3339 string — so resetTime tolerates all three.
 type rawWindow struct {
-	Utilization *float64 `json:"utilization"`
-	ResetsAt    *float64 `json:"resets_at"` // Unix epoch SECONDS
+	Utilization *float64  `json:"utilization"`
+	ResetsAt    resetTime `json:"resets_at"`
 }
 
 func (rw *rawWindow) toWindow() Window {
@@ -188,10 +191,52 @@ func (rw *rawWindow) toWindow() Window {
 	if rw.Utilization != nil {
 		w.Utilization = *rw.Utilization
 	}
-	if rw.ResetsAt != nil {
-		w.ResetsAt = time.Unix(int64(*rw.ResetsAt), 0)
+	if rw.ResetsAt.present {
+		w.ResetsAt = rw.ResetsAt.t
 	}
 	return w
+}
+
+// resetTime decodes the usage endpoint's resets_at field, which the API encodes
+// inconsistently: a JSON number (epoch seconds), a numeric string (epoch
+// seconds), or an RFC3339 timestamp string. An absent or null value leaves
+// present false. Anything else is a hard decode error — we do not silently
+// swallow a representation we have never seen.
+type resetTime struct {
+	t       time.Time
+	present bool
+}
+
+func (r *resetTime) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" || s == "" {
+		return nil
+	}
+	if !strings.HasPrefix(s, `"`) {
+		secs, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return fmt.Errorf("resets_at %s: not a number or string", s)
+		}
+		r.t, r.present = time.Unix(int64(secs), 0), true
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(b, &str); err != nil {
+		return fmt.Errorf("resets_at %s: %w", s, err)
+	}
+	if str = strings.TrimSpace(str); str == "" {
+		return nil
+	}
+	if secs, err := strconv.ParseFloat(str, 64); err == nil {
+		r.t, r.present = time.Unix(int64(secs), 0), true
+		return nil
+	}
+	ts, err := time.Parse(time.RFC3339, str)
+	if err != nil {
+		return fmt.Errorf("resets_at %q: not epoch seconds or RFC3339: %w", str, err)
+	}
+	r.t, r.present = ts, true
+	return nil
 }
 
 type rawUsage struct {

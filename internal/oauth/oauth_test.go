@@ -98,6 +98,64 @@ func TestUsageHeadersAndParsing(t *testing.T) {
 	}
 }
 
+// TestResetTimeDecoding covers every resets_at encoding the usage endpoint has
+// been seen to emit. 1700000000 epoch seconds == 2023-11-14T22:13:20Z.
+func TestResetTimeDecoding(t *testing.T) {
+	const epoch int64 = 1700000000
+	cases := []struct {
+		name    string
+		json    string
+		present bool
+		unix    int64
+	}{
+		{"number", `1700000000`, true, epoch},
+		{"fractional number", `1700000000.5`, true, epoch},
+		{"numeric string", `"1700000000"`, true, epoch},
+		{"rfc3339 string", `"2023-11-14T22:13:20Z"`, true, epoch},
+		{"null", `null`, false, 0},
+		{"empty string", `""`, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var rt resetTime
+			if err := json.Unmarshal([]byte(tc.json), &rt); err != nil {
+				t.Fatalf("Unmarshal(%s): %v", tc.json, err)
+			}
+			if rt.present != tc.present {
+				t.Fatalf("present = %v, want %v", rt.present, tc.present)
+			}
+			if tc.present && rt.t.Unix() != tc.unix {
+				t.Errorf("unix = %d, want %d", rt.t.Unix(), tc.unix)
+			}
+		})
+	}
+
+	t.Run("unparseable string is a hard error", func(t *testing.T) {
+		var rt resetTime
+		if err := json.Unmarshal([]byte(`"not-a-time"`), &rt); err == nil {
+			t.Fatal("want a decode error for an unparseable resets_at, got nil")
+		}
+	})
+}
+
+// TestUsageStringResetsAt reproduces the reported crash: the API returned
+// resets_at as a string, which the old *float64 field could not decode.
+func TestUsageStringResetsAt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"five_hour":{"utilization":0.4,"resets_at":"1700000000"}}`)
+	}))
+	defer srv.Close()
+	c := New()
+	c.usageURL = srv.URL
+	u, err := c.Usage(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("Usage with string resets_at: %v", err)
+	}
+	if u.FiveHour.ResetsAt.Unix() != 1700000000 {
+		t.Errorf("resets_at = %v, want unix 1700000000", u.FiveHour.ResetsAt)
+	}
+}
+
 func TestUsageUserAgentSent(t *testing.T) {
 	var ua string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
