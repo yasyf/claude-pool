@@ -43,7 +43,16 @@ Your main subscription joins the pool like any other account: `clp add` gives
 it its own login in its own account dir. Plain `claude` stays fully decoupled —
 the pool can never log it out.
 
-Make it the default in your shell:
+Make `claude` use the pool by default — `clp add` offers to do this for you, appending a
+`claude` alias to your shell (`~/.zshrc`, `~/.bash_profile`, or `~/.config/fish/config.fish`)
+that forwards every argument:
+
+```sh
+alias claude='CLAUDE_CONFIG_DIR=$(clp select) command claude'
+```
+
+`command claude` keeps plain `claude` (on `~/.claude`) one keystroke away. Prefer a separate
+command and leave `claude` untouched? Add your own alias instead:
 
 ```sh
 alias cl='CLAUDE_CONFIG_DIR=$(clp select) claude'
