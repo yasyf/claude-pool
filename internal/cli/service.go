@@ -16,7 +16,7 @@ import (
 func newServiceCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "service",
-		Short: "Manage the background daemon (LaunchAgent)",
+		Short: "Manage the background daemon",
 	}
 	cmd.AddCommand(
 		&cobra.Command{
@@ -57,22 +57,22 @@ func newServiceUninstallCmd() *cobra.Command {
 	var purge bool
 	cmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Stop and remove the LaunchAgent (and with --purge, all pool state)",
+		Short: "Stop and remove the LaunchAgent; --purge also removes pool state",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			out := cmd.OutOrStdout()
 			if service.IsBrewManaged() {
 				if err := service.BrewStop(); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "brew services stop: %v\n", err)
+					warn(cmd.ErrOrStderr(), "couldn't stop the brew service: %v", err)
 				}
 				// Remove any stale self-rolled agent from before the brew switch.
 				_ = service.Uninstall()
-				fmt.Fprintln(out, "✓ Daemon stopped (brew services)")
+				success(out, "Stopped the daemon.")
 			} else {
 				if err := service.Uninstall(); err != nil {
 					return err
 				}
-				fmt.Fprintln(out, "✓ LaunchAgent removed")
+				success(out, "Removed the LaunchAgent.")
 			}
 
 			// Always unmount any fuse overlays and re-assert nothing is left mounted.
@@ -88,13 +88,13 @@ func newServiceUninstallCmd() *cobra.Command {
 			})
 
 			if !purge {
-				fmt.Fprintln(out, "  (pool accounts and state preserved; re-run `clp service install` to resume)")
+				note(out, "Your accounts and state are preserved. Run `clp service install` to resume.")
 				return nil
 			}
 			return purgeAll(cmd)
 		},
 	}
-	cmd.Flags().BoolVar(&purge, "purge", false, "also remove all pool accounts, dirs, and state (never touches ~/.claude)")
+	cmd.Flags().BoolVar(&purge, "purge", false, "also remove all pool accounts and state; never touches ~/.claude")
 	return cmd
 }
 
@@ -110,7 +110,7 @@ func purgeAll(cmd *cobra.Command) error {
 		}
 		for _, a := range accts {
 			if err := m.Remove(a.ID, true); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "remove acct-%02d: %v\n", a.ID, err)
+				warn(cmd.ErrOrStderr(), "couldn't remove acct-%02d: %v", a.ID, err)
 			}
 		}
 		return nil
@@ -119,7 +119,7 @@ func purgeAll(cmd *cobra.Command) error {
 		return err
 	}
 	_ = os.RemoveAll(pool.StateDir())
-	fmt.Fprintln(out, "✓ Purged all pool state (~/.claude left intact)")
+	success(out, "Purged all pool state. ~/.claude is untouched.")
 	return nil
 }
 
@@ -136,13 +136,13 @@ func runServiceInstall(cmd *cobra.Command) error {
 		if err := service.BrewStart(); err != nil {
 			return fmt.Errorf("brew services start: %w", err)
 		}
-		fmt.Fprintln(out, "✓ Daemon started via brew services")
+		success(out, "Started the daemon.")
 		return nil
 	}
 	if err := service.Install(); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "✓ Daemon installed and started")
+	success(out, "Installed and started the daemon.")
 	return nil
 }
 
@@ -158,17 +158,17 @@ func ensureDaemon(cmd *cobra.Command) {
 	if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 		// launchd's KeepAlive holds the old binary's image alive across
 		// upgrades indefinitely; restart it onto the current binary.
-		fmt.Fprintf(cmd.OutOrStdout(), "  restarting cc-pool daemon (%s → %s)…\n", resp.Version, want)
+		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon to pick up the new version…")
 		if service.IsBrewManaged() {
 			// `brew services start` is a no-op on a running service; stop
 			// first, and say so if that fails (the stale daemon would
 			// otherwise survive behind a "restarted" message).
 			if err := service.BrewStop(); err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "warning: brew services stop: %v\n", err)
+				warn(cmd.ErrOrStderr(), "couldn't stop the brew service: %v", err)
 			}
 		}
 	} else {
-		fmt.Fprintln(cmd.OutOrStdout(), "  starting the cc-pool daemon…")
+		step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
 	}
 	if err := runServiceInstall(cmd); err != nil {
 		// Re-check at the wanted version: a concurrent start or an
@@ -177,13 +177,12 @@ func ensureDaemon(cmd *cobra.Command) {
 		if daemonAt(want) {
 			return
 		}
-		fmt.Fprintf(cmd.ErrOrStderr(),
-			"warning: daemon start failed: %v\n  (run `clp service install` from a GUI session to enable background polling)\n", err)
+		warn(cmd.ErrOrStderr(),
+			"couldn't start the daemon: %v; run `clp service install` from a GUI session to enable background polling", err)
 		return
 	}
 	if !waitDaemon(want, 3*time.Second) {
-		fmt.Fprintln(cmd.ErrOrStderr(),
-			"warning: daemon not responding at the current version yet; check `clp service status`")
+		warn(cmd.ErrOrStderr(), "the daemon isn't responding yet; check `clp service status`")
 	}
 }
 

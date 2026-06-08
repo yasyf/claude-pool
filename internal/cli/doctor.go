@@ -16,20 +16,20 @@ func newDoctorCmd() *cobra.Command {
 	var fix bool
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Re-validate Keychain items and overlays; repair drift with --fix",
+		Short: "Check accounts' Keychain items and overlays; --fix repairs drift",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
 				out := cmd.OutOrStdout()
 				ok := true
 				report := func(label string, healthy bool, detail string) {
-					mark := "✓"
+					mark := okStyle.Render("✓")
 					if !healthy {
-						mark = "✗"
+						mark = badStyle.Render("✗")
 						ok = false
 					}
 					if detail != "" {
-						fmt.Fprintf(out, "%s %s — %s\n", mark, label, detail)
+						fmt.Fprintf(out, "%s %s: %s\n", mark, label, detail)
 					} else {
 						fmt.Fprintf(out, "%s %s\n", mark, label)
 					}
@@ -46,7 +46,7 @@ func newDoctorCmd() *cobra.Command {
 				if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
 					report("daemon", true, resp.Version)
 				} else {
-					report("daemon", false, "not running (run `clp service install`)")
+					report("daemon", false, "not running; run `clp service install`")
 				}
 
 				accts, err := m.Store.ListAccounts()

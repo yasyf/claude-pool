@@ -17,10 +17,10 @@ func newRunCmd() *cobra.Command {
 	var account int
 	cmd := &cobra.Command{
 		Use:   "run [-- claude args...]",
-		Short: "Select an account and exec `claude`, owning the session lifecycle",
+		Short: "Select an account and run `claude`, owning the session",
 		Long: `run picks the best account, launches ` + "`claude`" + ` with CLAUDE_CONFIG_DIR set,
-and owns the resulting process — so the session is tracked precisely and the
-(possibly rotated) token is adopted on exit. Best for automation.`,
+and owns the resulting process, so the session is tracked precisely and any
+rotated token is re-asserted on exit. Best for automation.`,
 		DisableFlagParsing: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -43,10 +43,10 @@ and owns the resulting process — so the session is tracked precisely and the
 					return err
 				}
 				if err := m.SyncOverlay(a); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: overlay sync: %v\n", err)
+					warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
 				}
 				if err := m.PreflightRefresh(cmd.Context(), a); err != nil && !errors.Is(err, pool.ErrNeedsLogin) {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: %v\n", err)
+					warn(cmd.ErrOrStderr(), "%v", err)
 				}
 				return execClaude(cmd, m, a, args)
 			})
@@ -84,7 +84,7 @@ func execClaude(cmd *cobra.Command, m *pool.Manager, a store.Account, args []str
 	}
 	pid := child.Process.Pid
 	sessID, _ := m.Store.OpenSession(a.ID, pid, a.ConfigDir)
-	fmt.Fprintf(cmd.ErrOrStderr(), "running claude on acct-%02d (pid %d, %s)\n", a.ID, pid, a.ConfigDir)
+	step(cmd.ErrOrStderr(), "Running claude as %s (pid %d).", accountName(a.Label), pid)
 
 	waitErr := child.Wait()
 

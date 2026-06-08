@@ -9,7 +9,7 @@ import (
 func newDaemonCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:    "daemon",
-		Short:  "Run the background daemon (used by the LaunchAgent)",
+		Short:  "Run the background daemon used by the LaunchAgent",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {

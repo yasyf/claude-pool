@@ -5,10 +5,8 @@
 //
 //   - ~/.claude      The canonical Claude Code config dir: plain `claude`'s
 //     home and the shared overlay base. NEVER moved, never
-//     registered as a pool account — the pool never mutates
-//     plain claude's credential or state (adoption at `clp add`
-//     reads the canonical credential once, read-only, to copy
-//     it into a pool account's own item).
+//     registered as a pool account, never read or written — the
+//     pool never touches plain claude's credential or state.
 //   - ~/.cc-pool/    cc-pool's OWN state (sqlite db, daemon socket, logs),
 //     plus accounts/ holding the pool account dirs
 //     (acct-01, acct-02, ...). Each account dir is a real,

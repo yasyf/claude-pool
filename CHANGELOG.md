@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-08
+
+### Removed
+- Credential adoption. `clp add` no longer copies plain claude's current login
+  into a pool account. Adopting meant refreshing plain claude's single-use
+  OAuth refresh token, which rotation invalidated — silently logging plain
+  claude out. Every account now logs in with its own `claude /login`, so plain
+  claude's token is never read or spent. The `keychain.ReadCanonical` /
+  `CanonicalExists` accessors and the `pool.CanonicalReader` seam are gone; no
+  code path can name the canonical Keychain item anymore.
+
+### Fixed
+- Usage decode crashed when the API returned `resets_at` as a string. The field
+  now accepts a JSON number, a numeric string, or an RFC3339 timestamp.
+
+### Changed
+- Reworked the CLI output: a shared styled output layer with consistent,
+  flush-left formatting and a single huh form theme. Human flows (`add`,
+  `status`, `select`, `run`) no longer leak internal ids, Keychain service
+  names, paths, or overlay kind; those stay in the inspection commands
+  (`clp list`, `clp doctor`). Copy across every command rewritten for clarity.
+
 ## [0.4.0] - 2026-06-06
 
 ### Added

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"errors"
-	"fmt"
 	"os/exec"
 	"strings"
 
@@ -27,26 +26,19 @@ func newAddCmd() *cobra.Command {
 	var opts addOptions
 	cmd := &cobra.Command{
 		Use:   "add",
-		Short: "Pool one or more Claude subscriptions (interactive login)",
-		Long: `add allocates a new account dir, sets up its overlay onto ~/.claude, seeds
-the account's .claude.json from ~/.claude.json (so the session inherits your
-settings and skips first-run onboarding), then walks you through logging that
-account in. After login it discovers the account's Keychain item, takes over
-its ACL for prompt-free refresh, validates with one usage call, and records it.
+		Short: "Add a Claude subscription to the pool",
+		Long: `add pools a Claude subscription. It sets up a new account, logs it in, and
+records it so clp can route sessions to it.
 
-If the account you are currently logged into with plain ` + "`claude`" + ` is not in
-the pool yet, add offers to adopt it: the credential is copied (read-only —
-plain claude is untouched) into the new account's own Keychain item and
-immediately refreshed onto its own token chain, skipping the login entirely.
+Each account logs in with its own ` + "`claude /login`" + `, so it gets its own token
+chain. Plain claude stays logged in and untouched.
 
-When you do log in interactively, add watches for the credential to land and
-closes claude for you — no need to exit it yourself.
+On a fresh machine, add also sets up the pool and starts the background daemon,
+so you do not need a separate ` + "`clp init`" + `.
 
-On a fresh machine it also initializes the pool (~/.cc-pool) and starts the
-background daemon automatically — no separate ` + "`clp init`" + ` needed.
-
-Run interactively it loops, offering to add another account after each one. Use
---count to add a fixed number, or -y to add a single account without prompts.`,
+Run it without flags to add accounts one at a time; it offers to add another
+after each. Use --count to add a set number, or -y to add one and log in right
+away.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -54,10 +46,10 @@ Run interactively it loops, offering to add another account after each one. Use
 			})
 		},
 	}
-	cmd.Flags().StringVar(&opts.label, "label", "", "human label for the (first) account")
-	cmd.Flags().BoolVar(&opts.runNow, "run-login", false, "run `claude /login` immediately instead of asking")
-	cmd.Flags().BoolVarP(&opts.autoYes, "yes", "y", false, "add a single account with no prompts")
-	cmd.Flags().IntVar(&opts.count, "count", 0, "add exactly N accounts without the continue prompt")
+	cmd.Flags().StringVar(&opts.label, "label", "", "name for the first account")
+	cmd.Flags().BoolVar(&opts.runNow, "run-login", false, "log in immediately instead of asking how")
+	cmd.Flags().BoolVarP(&opts.autoYes, "yes", "y", false, "add one account and log in right away")
+	cmd.Flags().IntVar(&opts.count, "count", 0, "add exactly N accounts, no continue prompt")
 	return cmd
 }
 
@@ -78,7 +70,7 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 			if len(added) == 0 {
 				return err // nothing added yet → propagate (nonzero exit)
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "stopping after %d account(s): %v\n", len(added), err)
+			warn(cmd.ErrOrStderr(), "stopping after %s: %v", plural(len(added), "account"), err)
 			break
 		}
 		added = append(added, *acct)
@@ -98,60 +90,47 @@ func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 		return err
 	}
 	if !ok {
-		res, err := m.Init()
-		if err != nil {
+		if _, err := m.Init(); err != nil {
 			return err
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "✓ Pool initialized (~/.cc-pool, overlay: %s)\n", res.OverlayKind)
+		success(cmd.OutOrStdout(), "Set up cc-pool on this machine.")
 	}
 	ensureDaemon(cmd)
 	return nil
 }
 
-// addOne runs the full prepare → adopt-or-login → finalize flow for a single
-// account.
+// addOne runs the full prepare → login → finalize flow for a single account.
 func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) (*store.Account, error) {
 	out := cmd.OutOrStdout()
 	pending, err := m.PrepareAdd()
 	if err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(out, "Allocated acct-%02d → %s (overlay: %s)\n",
-		pending.Index, pending.ConfigDir, pending.OverlayKind)
+	step(out, "Setting up a new account…")
 	switch pending.ClaudeJSONSeed {
 	case pool.SeedCopied:
-		fmt.Fprintln(out, dimStyle.Render("  seeded .claude.json (settings + onboarding inherited; login sets the account)"))
+		note(out, "Carried over your settings, so there's no first-run setup.")
 	case pool.SeedNoSource:
-		fmt.Fprintln(out, "  note: no ~/.claude.json found — claude will run first-run onboarding for this account")
+		note(out, "No settings to carry over; this account will do first-run setup.")
 	case pool.SeedKeptExisting:
-		fmt.Fprintln(out, "  note: this dir already holds a logged-in .claude.json from an earlier attempt;")
-		fmt.Fprintln(out, "  logging in again is safe — or pick the manual option and just continue to reuse it")
+		note(out, "This account has a login from an earlier attempt. Logging in again is safe, or continue to reuse it.")
 	}
 	if pending.PurgedStaleCredential {
-		fmt.Fprintln(out, dimStyle.Render("  discarded a stale credential from a previous attempt"))
+		note(out, "Cleared a leftover login from a previous attempt.")
 	}
 
-	adopted := false
-	if pending.ClaudeJSONSeed != pool.SeedKeptExisting {
-		adopted, err = offerAdopt(cmd, m, pending, opts)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if !adopted {
-		if err := loginFlow(cmd, pending, opts); err != nil {
-			return nil, err
-		}
+	if err := loginFlow(cmd, pending, opts); err != nil {
+		return nil, err
 	}
 
 	prompt := label == "" && isTTY() && !opts.autoYes
 	label = defaultLabel(label, pending.OverlayKind, pending.ConfigDir)
 	if prompt {
 		_ = huh.NewInput().
-			Title("Label for this account (optional)").
+			Title("Name for this account (optional)").
 			Placeholder("e.g. work@example.com").
 			Value(&label). // prefilled with the account email when known
+			WithTheme(clpTheme()).
 			Run()
 	}
 
@@ -159,23 +138,26 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	if err != nil {
 		if acct != nil {
 			// The row is registered and the credential is live — only the
-			// best-effort usage validation failed (e.g. a network blip).
-			// Abandoning here would orphan the row and destroy a working
-			// credential; keep the account and surface the warning instead.
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: %v\n", err)
+			// best-effort usage check failed (e.g. a network blip). Keep the
+			// account and surface a soft warning rather than orphan the row.
+			warn(cmd.ErrOrStderr(), "added the account, but its first usage check failed; run `clp doctor` to retry")
 		} else {
-			fmt.Fprintf(cmd.ErrOrStderr(), "could not finalize: %v\n", err)
+			fail(cmd.ErrOrStderr(), "couldn't finish adding the account: %v", err)
 			if shouldAbandon(cmd) {
 				if aerr := m.AbandonAdd(pending); aerr != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "cleanup failed: %v\n", aerr)
+					warn(cmd.ErrOrStderr(), "cleanup failed: %v", aerr)
 				} else {
-					fmt.Fprintf(out, "rolled back acct-%02d\n", pending.Index)
+					step(out, "Rolled back the account.")
 				}
 			}
 			return nil, err
 		}
 	}
-	fmt.Fprintf(out, "✓ Added acct-%02d (%s). Keychain: %s\n", acct.ID, acct.Label, acct.KeychainService)
+	name := acct.Label
+	if name == "" {
+		name = "the account"
+	}
+	success(out, "Added %s.", name)
 	return acct, nil
 }
 
@@ -193,44 +175,6 @@ func defaultLabel(explicit string, kind overlay.Kind, configDir string) string {
 	return id.EmailAddress
 }
 
-// offerAdopt offers to copy plain claude's current login into the pending
-// account when that login is not in the pool yet. Interactive runs confirm
-// (default yes); -y/--count/non-TTY adopt automatically with a printed notice.
-// Adoption failure is not fatal: it falls back to the interactive login with a
-// printed reason.
-func offerAdopt(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd, opts addOptions) (bool, error) {
-	cand, err := m.AdoptCandidate()
-	if err != nil {
-		return false, err
-	}
-	if cand == nil {
-		return false, nil
-	}
-	email := cand.Identity.EmailAddress
-	if auto := opts.autoYes || opts.count > 0 || !isTTY(); auto {
-		fmt.Fprintf(cmd.OutOrStdout(), "✓ adopting current login (%s)\n", email)
-	} else {
-		use := true
-		err := huh.NewConfirm().
-			Title(fmt.Sprintf("Use your current login (%s)?", email)).
-			Description("Copies the credential into this account — no new login needed. Plain claude is untouched.").
-			Value(&use).
-			Run()
-		if err != nil {
-			return false, err // ^C must abort the add, not launch a login
-		}
-		if !use {
-			return false, nil
-		}
-	}
-	if err := m.AdoptCredential(cmd.Context(), p, cand.Identity); err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "could not adopt current login: %v — falling back to interactive login\n", err)
-		return false, nil
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "✓ adopted current login (%s)\n", email)
-	return true, nil
-}
-
 // loginFlow walks the user through the interactive login: either a watched
 // `claude /login` in this terminal (closed automatically once the credential
 // lands) or a manual command in another terminal (polled until it lands).
@@ -240,12 +184,13 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 	if isTTY() && !doRun {
 		choice := "run"
 		_ = huh.NewSelect[string]().
-			Title("How do you want to log in this account?").
+			Title("How do you want to log in?").
 			Options(
-				huh.NewOption("Run `claude /login` now in this terminal", "run"),
-				huh.NewOption("I'll run the login command myself in another terminal", "manual"),
+				huh.NewOption("Log in now, in this terminal", "run"),
+				huh.NewOption("I'll log in from another terminal", "manual"),
 			).
 			Value(&choice).
+			WithTheme(clpTheme()).
 			Run()
 		doRun = choice == "run"
 	}
@@ -257,12 +202,12 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 				return err // cancellation or infrastructure failure
 			}
 			// claude exiting nonzero is not fatal; finalize decides, as before.
-			fmt.Fprintf(cmd.ErrOrStderr(), "login command exited with error: %v\n", err)
+			warn(cmd.ErrOrStderr(), "the login command exited with an error: %v", err)
 		}
 		return nil
 	}
 
-	fmt.Fprintf(out, "\nRun this, complete the login, then return here:\n\n    %s\n\n", pending.LoginCommand)
+	step(out, "\nRun this in another terminal, finish the login, then come back:\n\n    %s\n", pending.LoginCommand)
 	if !isTTY() {
 		return nil
 	}
@@ -271,8 +216,9 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 		// tell reuse from a fresh login, so keep the explicit confirm.
 		cont := true
 		_ = huh.NewConfirm().
-			Title("Press enter once login is complete (or to reuse the existing credential)").
+			Title("Press enter when the login is done").
 			Value(&cont).
+			WithTheme(clpTheme()).
 			Run()
 		return nil
 	}
@@ -292,8 +238,8 @@ func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
 		return false
 	}
 	again := false
-	if err := huh.NewConfirm().Title("Add another account?").Value(&again).Run(); err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "prompt error: %v\n", err)
+	if err := huh.NewConfirm().Title("Add another account?").Value(&again).WithTheme(clpTheme()).Run(); err != nil {
+		warn(cmd.ErrOrStderr(), "prompt failed: %v", err)
 		return false
 	}
 	return again
@@ -306,14 +252,17 @@ func summarizeAdds(cmd *cobra.Command, m *pool.Manager, added []store.Account) {
 	}
 	names := make([]string, len(added))
 	for i, a := range added {
-		names[i] = fmt.Sprintf("acct-%02d", a.ID)
+		names[i] = a.Label
+		if names[i] == "" {
+			names[i] = "a new account"
+		}
 	}
 	total := len(added)
 	if all, err := m.Store.ListAccounts(); err == nil {
 		total = len(all)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "\nAdded %s; pool now has %d account(s).\n",
-		strings.Join(names, ", "), total)
+	step(cmd.OutOrStdout(), "\nAdded %s. The pool now has %s.",
+		strings.Join(names, ", "), plural(total, "account"))
 }
 
 func shouldAbandon(cmd *cobra.Command) bool {
@@ -322,8 +271,9 @@ func shouldAbandon(cmd *cobra.Command) bool {
 	}
 	abandon := true
 	_ = huh.NewConfirm().
-		Title("Roll back this half-added account?").
+		Title("Roll back this incomplete account?").
 		Value(&abandon).
+		WithTheme(clpTheme()).
 		Run()
 	return abandon
 }

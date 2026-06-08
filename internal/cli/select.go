@@ -21,13 +21,13 @@ func newSelectCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "select",
-		Short: "Print the config dir of the emptiest account (the hot path)",
-		Long: `select scores every account and prints ONLY the chosen account's config
-dir to stdout, so it composes as:
+		Short: "Print the config dir of the emptiest account",
+		Long: `select scores every account and prints only the chosen account's config dir
+to stdout, so it composes as:
 
     CLAUDE_CONFIG_DIR=$(clp select) claude
 
-Diagnostics go to stderr. When the daemon is running, select reads its cached
+Diagnostics go to stderr. With the daemon running, select reads its cached
 scores; otherwise it samples usage live.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -85,14 +85,14 @@ func selectViaDaemon(cmd *cobra.Command, account *int, wait bool, cwd string) (d
 	}
 	if resp.OK && resp.Dir != "" {
 		if resp.Sticky {
-			fmt.Fprintf(cmd.ErrOrStderr(), "selected via daemon (sticky): %s\n", resp.Dir)
+			step(cmd.ErrOrStderr(), "Reusing the account pinned to this directory.")
 		} else {
-			fmt.Fprintf(cmd.ErrOrStderr(), "selected via daemon: %s\n", resp.Dir)
+			step(cmd.ErrOrStderr(), "Selected the emptiest account.")
 		}
 		return resp.Dir, true, nil
 	}
 	if !resp.OK && wait && resp.SoonestReset != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "all accounts busy; waiting until %s\n", resp.SoonestReset.Format(time.Kitchen))
+		step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", resp.SoonestReset.Format(time.Kitchen))
 		// Fall back to live waiting loop for simplicity.
 		return "", false, nil
 	}
@@ -110,20 +110,20 @@ func selectLive(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, fr
 			return err
 		}
 		_ = m.RecordSticky(cwd, a.ID, time.Now()) // best-effort: anchor future selects here
-		return emitChoice(cmd, m, a, fmt.Sprintf("forced acct-%02d", a.ID))
+		return emitChoice(cmd, m, a, accountName(a.Label))
 	}
 	opts := pool.SelectOptions{Live: true, FreshFor: fresh, Cwd: cwd}
 	for {
 		sr, err := m.Select(cmd.Context(), opts)
 		if errors.Is(err, pool.ErrNoneAvailable) {
 			if !wait {
-				fmt.Fprintln(cmd.ErrOrStderr(), "no account available (all rate-limited)")
+				step(cmd.ErrOrStderr(), "No account is available right now; all are rate-limited.")
 				return err
 			}
 			reset, ok := sr.SoonestReset()
 			d := 15 * time.Second
 			if ok {
-				fmt.Fprintf(cmd.ErrOrStderr(), "all rate-limited; soonest reset %s\n", reset.Format(time.Kitchen))
+				step(cmd.ErrOrStderr(), "All accounts are rate-limited; soonest reset at %s.", reset.Format(time.Kitchen))
 				if until := time.Until(reset); until > 0 && until < d {
 					d = until
 				}
@@ -138,9 +138,9 @@ func selectLive(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, fr
 		if err != nil {
 			return err
 		}
-		reason := fmt.Sprintf("acct-%02d score %.1f", sr.Best.ID, sr.Result.Score)
+		reason := fmt.Sprintf("%s (score %.1f)", accountName(sr.Best.Label), sr.Result.Score)
 		if sr.Sticky {
-			reason = fmt.Sprintf("acct-%02d (sticky)", sr.Best.ID)
+			reason = fmt.Sprintf("%s (pinned to this directory)", accountName(sr.Best.Label))
 		}
 		return emitChoice(cmd, m, sr.Best, reason)
 	}
@@ -152,16 +152,16 @@ func emitChoice(cmd *cobra.Command, m *pool.Manager, a store.Account, reason str
 	// Re-assert the overlay so the launched session sees any new top-level
 	// ~/.claude entries (replaces the old explicit `clp sync`).
 	if err := m.SyncOverlay(a); err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "warning: overlay sync: %v\n", err)
+		warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
 	}
 	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
 		if errors.Is(err, pool.ErrNeedsLogin) {
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: acct-%02d needs re-login (`clp add` or `claude /login`)\n", a.ID)
+			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `clp add` or `claude /login`", accountName(a.Label))
 		} else {
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: %v\n", err)
+			warn(cmd.ErrOrStderr(), "%v", err)
 		}
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), a.ConfigDir)
-	fmt.Fprintf(cmd.ErrOrStderr(), "selected %s\n", reason)
+	step(cmd.ErrOrStderr(), "selected %s", reason)
 	return nil
 }

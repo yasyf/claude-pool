@@ -15,17 +15,16 @@ func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "cc-pool",
 		Short: "Predictive multi-account load-balancing for Claude Code",
-		Long: `cc-pool (clp) pools several Claude subscriptions and launches each
-session on the emptiest account:
+		Long: `cc-pool (clp) pools several Claude subscriptions and launches each session
+on the emptiest account:
 
     CLAUDE_CONFIG_DIR=$(clp select) claude
 
-Run bare ` + "`clp`" + ` to get started: on an empty pool it walks you through adding
-your subscriptions (offering to adopt your current login — a read-only copy);
-once accounts exist it shows the status table.
+Run bare ` + "`clp`" + ` to get started. On an empty pool it walks you through adding
+your subscriptions; once accounts exist it shows the status table.
 
-Plain ` + "`claude`" + ` keeps working untouched on ~/.claude — it is never part
-of the pool.`,
+Plain ` + "`claude`" + ` keeps working untouched on ~/.claude and is never part of the
+pool.`,
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -52,7 +51,7 @@ of the pool.`,
 				case actionAdd:
 					return runAdd(cmd, m, addOptions{})
 				default:
-					return fmt.Errorf("no accounts — run `clp add` to pool your first subscription")
+					return fmt.Errorf("no accounts yet; run `clp add` to pool your first subscription")
 				}
 			})
 		},
@@ -114,7 +113,7 @@ func requireInit(m *pool.Manager) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("pool not initialized — run `clp add` to set it up and add your first account")
+		return fmt.Errorf("pool not initialized; run `clp add` to set it up and add your first account")
 	}
 	return nil
 }

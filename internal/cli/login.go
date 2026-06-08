@@ -110,8 +110,7 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	case err != nil:
 		return fmt.Errorf("probe credential for %s: %w", p.ConfigDir, err)
 	default:
-		fmt.Fprintln(cmd.OutOrStdout(), dimStyle.Render(
-			"  existing credential detected — exit claude when done (it is reused unless you log in again)"))
+		note(cmd.OutOrStdout(), "Found an existing login. Exit claude when done; it's reused unless you log in again.")
 	}
 
 	fd := int(os.Stdin.Fd())
@@ -156,11 +155,9 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 		return err
 	}
 	if !waitForIdentity(ctx, p.OverlayKind, p.ConfigDir, identityPostExitGrace) {
-		fmt.Fprintln(cmd.ErrOrStderr(), warnStyle.Render(
-			"could not capture this account's email — label prefill and duplicate-login detection won't work for it;\n"+
-				"if this add does not finalize, retrying will discard this login"))
+		warn(cmd.ErrOrStderr(), "couldn't read this account's email, so its name won't prefill; if this add doesn't finish, retrying will discard this login")
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), "✓ login detected — closed claude")
+	success(cmd.OutOrStdout(), "Logged in. Closed claude.")
 	return nil
 }
 
@@ -219,7 +216,7 @@ func waitForCredential(ctx context.Context, out io.Writer, service string) error
 	ticker := time.NewTicker(loginPollInterval)
 	defer ticker.Stop()
 	for i := 0; ; i++ {
-		fmt.Fprintf(out, "\r%s %s", frames[i%len(frames)], dimStyle.Render("waiting for login to complete… (ctrl-c to abort)"))
+		fmt.Fprintf(out, "\r%s %s", frames[i%len(frames)], dimStyle.Render("waiting for login… press ctrl-c to abort"))
 		select {
 		case <-ctx.Done():
 			fmt.Fprint(out, "\r\x1b[K")
@@ -233,7 +230,7 @@ func waitForCredential(ctx context.Context, out io.Writer, service string) error
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(out, "✓ login detected")
+			success(out, "Logged in.")
 			return nil
 		}
 	}

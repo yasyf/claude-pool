@@ -7,18 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
-)
-
-var (
-	hdrStyle  = lipgloss.NewStyle().Bold(true)
-	dimStyle  = lipgloss.NewStyle().Faint(true)
-	bestStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
-	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	badStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 )
 
 func newStatusCmd() *cobra.Command {
@@ -26,7 +17,7 @@ func newStatusCmd() *cobra.Command {
 	var live bool
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show a live table of per-account usage, score, and sessions",
+		Short: "Show per-account usage, score, and sessions",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -46,11 +37,11 @@ func newStatusCmd() *cobra.Command {
 // `clp status` and bare `clp` dispatch here.
 func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live bool) error {
 	render := func() error {
-		snaps, src, err := gatherStatus(cmd.Context(), m, live)
+		snaps, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
 			return err
 		}
-		out := renderTable(snaps, src)
+		out := renderTable(snaps)
 		if watch {
 			fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
 		}
@@ -73,14 +64,13 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live bool) error {
 }
 
 // gatherStatus prefers the daemon's cached view, falling back to live sampling.
-func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, string, error) {
+func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, error) {
 	if !forceLive {
 		if resp, err := daemon.NewClient().Status(); err == nil && resp.OK {
-			return fromDaemon(resp.Accounts), "daemon", nil
+			return fromDaemon(resp.Accounts), nil
 		}
 	}
-	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
-	return snaps, "live", err
+	return m.Snapshots(ctx, true, pool.DefaultFreshFor)
 }
 
 // fromDaemon converts daemon account statuses into Snapshots for rendering.
@@ -109,22 +99,21 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 }
 
 // renderTable produces a styled fixed-width table, best account highlighted.
-func renderTable(snaps []pool.Snapshot, source string) string {
+func renderTable(snaps []pool.Snapshot) string {
 	if len(snaps) == 0 {
-		return "no accounts — run `clp add`\n"
+		return "No accounts yet. Run `clp add` to add one.\n"
 	}
 	// Sort by score desc for display; best first.
 	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].Score > snaps[j].Score })
 
 	var b strings.Builder
-	header := fmt.Sprintf("%-8s %-22s %8s %7s %7s %6s %-10s %s",
-		"ACCT", "LABEL", "SCORE", "5h", "7d", "SESS", "RESET", "FLAGS")
+	header := fmt.Sprintf("%-24s %8s %7s %7s %6s %-10s %s",
+		"ACCOUNT", "SCORE", "5h", "7d", "SESS", "RESET", "FLAGS")
 	b.WriteString(hdrStyle.Render(header))
 	b.WriteByte('\n')
 
 	for i, s := range snaps {
-		acct := fmt.Sprintf("acct-%02d", s.Account.ID)
-		label := truncate(s.Account.Label, 22)
+		label := truncate(accountName(s.Account.Label), 24)
 		rem5 := fmt.Sprintf("%5.0f%%", s.Remaining5h)
 		rem7 := fmt.Sprintf("%5.0f%%", s.Remaining7d)
 		sess := fmt.Sprintf("%d", s.ActiveSessions)
@@ -142,8 +131,8 @@ func renderTable(snaps []pool.Snapshot, source string) string {
 		if !s.HasUsage {
 			flags = append(flags, dimStyle.Render("no-data"))
 		}
-		row := fmt.Sprintf("%-8s %-22s %8.1f %7s %7s %6s %-10s %s",
-			acct, label, s.Score, rem5, rem7, sess, reset, strings.Join(flags, " "))
+		row := fmt.Sprintf("%-24s %8.1f %7s %7s %6s %-10s %s",
+			label, s.Score, rem5, rem7, sess, reset, strings.Join(flags, " "))
 		if i == 0 {
 			row = bestStyle.Render("▸ ") + row
 		} else {
@@ -152,8 +141,17 @@ func renderTable(snaps []pool.Snapshot, source string) string {
 		b.WriteString(row)
 		b.WriteByte('\n')
 	}
-	b.WriteString(dimStyle.Render(fmt.Sprintf("source: %s · %s", source, time.Now().Format(time.Kitchen))))
+	b.WriteString(dimStyle.Render(fmt.Sprintf("updated %s", time.Now().Format(time.Kitchen))))
 	return b.String()
+}
+
+// accountName returns an account's display label, or a placeholder when it is
+// unnamed. The internal acct-NN id is shown only by `clp list` and `clp doctor`.
+func accountName(label string) string {
+	if label == "" {
+		return "(unnamed)"
+	}
+	return label
 }
 
 func humanizeUntil(d time.Duration) string {

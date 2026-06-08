@@ -25,8 +25,7 @@ type InitResult struct {
 // Init prepares the pool: ~/.cc-pool state dirs, the overlay provider choice
 // for new accounts, and the initialized marker. It never touches ~/.claude or
 // the Keychain — accounts (including the user's main subscription) join via
-// Add, by adopting your current login or with their own independent login.
-// Idempotent.
+// Add, each with its own independent `claude /login`. Idempotent.
 func (m *Manager) Init() (*InitResult, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err

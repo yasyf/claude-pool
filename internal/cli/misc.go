@@ -14,7 +14,7 @@ import (
 func newListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List pool accounts (static, no usage fetch)",
+		Short: "List accounts with their ids, paths, and Keychain items",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -23,14 +23,14 @@ func newListCmd() *cobra.Command {
 					return err
 				}
 				if len(accts) == 0 {
-					fmt.Fprintln(cmd.ErrOrStderr(), "no accounts — run `clp add`")
+					step(cmd.ErrOrStderr(), "No accounts yet. Run `clp add` to add one.")
 					return nil
 				}
 				tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
 				fmt.Fprintln(tw, "ACCT\tLABEL\tOVERLAY\tCONFIG DIR\tKEYCHAIN SERVICE")
 				for _, a := range accts {
 					fmt.Fprintf(tw, "acct-%02d\t%s\t%s\t%s\t%s\n",
-						a.ID, a.Label, a.OverlayKind, a.ConfigDir, a.KeychainService)
+						a.ID, accountName(a.Label), a.OverlayKind, a.ConfigDir, a.KeychainService)
 				}
 				return tw.Flush()
 			})
@@ -47,13 +47,13 @@ func newRemoveCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := strconv.Atoi(args[0])
 			if err != nil {
-				return fmt.Errorf("invalid account id %q", args[0])
+				return fmt.Errorf("%q is not a valid account id", args[0])
 			}
 			return withManager(func(m *pool.Manager) error {
 				if err := m.Remove(id, !keepCred); err != nil {
 					return err
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "removed acct-%02d\n", id)
+				success(cmd.OutOrStdout(), "Removed acct-%02d.", id)
 				return nil
 			})
 		},
@@ -67,7 +67,7 @@ func newEnvCmd() *cobra.Command {
 	var account int
 	cmd := &cobra.Command{
 		Use:   "env",
-		Short: "Print shell export lines for an account (eval-friendly)",
+		Short: "Print shell export lines to launch an account",
 		Long: `env prints the environment needed to launch a specific account:
 
     eval "$(clp env --account 1)"; claude`,
