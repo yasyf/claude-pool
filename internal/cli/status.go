@@ -185,6 +185,28 @@ func accountName(label string) string {
 	return label
 }
 
+// remainingSuffix renders effective 5h/7d headroom as " · 5h X% · 7d Y%
+// remaining" for the `selected`/`run` diagnostic lines. It returns "" when usage
+// is unknown — a never-sampled pick, or a daemon predating the wire fields — so
+// we never print a fabricated 100%.
+func remainingSuffix(hasUsage bool, eff5, eff7 float64) string {
+	if !hasUsage {
+		return ""
+	}
+	return fmt.Sprintf(" · 5h %.0f%% · 7d %.0f%% remaining", eff5, eff7)
+}
+
+// daemonAccountName resolves a daemon SelectedID to a display name, degrading to
+// "account" when the id is nil or unknown.
+func daemonAccountName(m *pool.Manager, id *int) string {
+	if id != nil {
+		if a, err := m.Store.GetAccount(*id); err == nil {
+			return accountName(a.Label)
+		}
+	}
+	return "account"
+}
+
 func humanizeUntil(d time.Duration) string {
 	if d <= 0 {
 		return "now"

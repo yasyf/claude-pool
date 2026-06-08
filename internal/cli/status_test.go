@@ -136,3 +136,26 @@ func TestDaemonStatusUsable(t *testing.T) {
 		})
 	}
 }
+
+// TestRemainingSuffix pins the headroom suffix: known usage renders rounded
+// 5h/7d remaining; unknown usage renders nothing so callers never print a
+// fabricated 100% for a never-sampled (or pre-upgrade-daemon) pick.
+func TestRemainingSuffix(t *testing.T) {
+	cases := map[string]struct {
+		hasUsage   bool
+		eff5, eff7 float64
+		want       string
+	}{
+		"unknown usage":   {false, 87, 92, ""},
+		"unknown ignores eff": {false, 0, 0, ""},
+		"rounds to whole": {true, 86.7, 91.4, " · 5h 87% · 7d 91% remaining"},
+		"drained pick":    {true, 0, 0, " · 5h 0% · 7d 0% remaining"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := remainingSuffix(tc.hasUsage, tc.eff5, tc.eff7); got != tc.want {
+				t.Errorf("remainingSuffix = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

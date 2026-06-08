@@ -36,11 +36,12 @@ const DefaultFreshFor = 60 * time.Second
 
 // SelectResult is a ranked selection outcome.
 type SelectResult struct {
-	Best   store.Account
-	Result score.Result
-	Ranked []score.Result
-	Sticky bool // the pick honored a sticky record rather than the ranking
-	byID   map[int]store.Account
+	Best     store.Account
+	Result   score.Result
+	Ranked   []score.Result
+	Sticky   bool // the pick honored a sticky record rather than the ranking
+	HasUsage bool // the pick has at least one usage sample (false = never sampled)
+	byID     map[int]store.Account
 }
 
 // Select scores all accounts and returns the best available one.
@@ -62,12 +63,14 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	now := time.Now()
 	inputs := make([]score.Input, 0, len(accts))
 	byID := make(map[int]store.Account, len(accts))
+	inByID := make(map[int]score.Input, len(accts))
 	for _, a := range accts {
 		byID[a.ID] = a
 		in, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
+		inByID[a.ID] = in
 		inputs = append(inputs, in)
 	}
 
@@ -75,14 +78,14 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	if r, ok := m.StickyPick(opts.Cwd, ranked, now); ok {
 		// Best-effort: stickiness must never fail a select.
 		_ = m.RecordSticky(opts.Cwd, r.AccountID, now)
-		return &SelectResult{Best: byID[r.AccountID], Result: r, Ranked: ranked, Sticky: true, byID: byID}, nil
+		return &SelectResult{Best: byID[r.AccountID], Result: r, Ranked: ranked, Sticky: true, HasUsage: inByID[r.AccountID].HasUsage, byID: byID}, nil
 	}
 	best, ok := score.Pick(ranked)
 	if !ok {
 		return &SelectResult{Ranked: ranked, byID: byID}, ErrNoneAvailable
 	}
 	_ = m.RecordSticky(opts.Cwd, best.AccountID, now) // best-effort, as above
-	return &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked, byID: byID}, nil
+	return &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked, HasUsage: inByID[best.AccountID].HasUsage, byID: byID}, nil
 }
 
 // sampleStale concurrently refreshes usage for accounts whose latest sample is

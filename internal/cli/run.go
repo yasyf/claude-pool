@@ -1,20 +1,15 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
-	"github.com/yasyf/cc-pool/internal/store"
-	"github.com/yasyf/cc-pool/internal/version"
 )
 
 // ccpAccountEnv forces a specific pool account for `ccp run`. The command
@@ -44,10 +39,18 @@ This is the imperative equivalent of:
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				dir, err := resolveRunDir(cmd, m)
+				account, err := ccpAccountFromEnv()
 				if err != nil {
 					return err
 				}
+				cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
+				// `ccp run` is the imperative form of `ccp select | claude`: it shares
+				// the exact selection pipeline, then execs instead of printing the dir.
+				dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd})
+				if err != nil {
+					return err
+				}
+				step(cmd.ErrOrStderr(), "%s", line)
 				return execClaude(dir, args)
 			})
 		},
@@ -55,81 +58,18 @@ This is the imperative equivalent of:
 	return cmd
 }
 
-// resolveRunDir picks the account `ccp run` launches on and returns its config
-// dir. CCP_ACCOUNT forces a specific account; otherwise it mirrors `ccp select`:
-// ensure a daemon (so it can adopt any token claude rotates once ccp has exec'd
-// away), take its reserved pick, and fall back to a live selection only when the
-// daemon is unreachable.
-func resolveRunDir(cmd *cobra.Command, m *pool.Manager) (string, error) {
-	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
-
-	if v := os.Getenv(ccpAccountEnv); v != "" {
-		id, err := strconv.Atoi(v)
-		if err != nil {
-			return "", fmt.Errorf("%s must be an account id, got %q: %w", ccpAccountEnv, v, err)
-		}
-		a, err := m.Store.GetAccount(id)
-		if err != nil {
-			return "", fmt.Errorf("%s=%d: %w", ccpAccountEnv, id, err)
-		}
-		_ = m.RecordSticky(cwd, a.ID, time.Now()) // anchor future selects here
-		return prepareAccount(cmd, m, a, accountName(a.Label))
+// ccpAccountFromEnv reads the CCP_ACCOUNT override, returning nil when it is
+// unset and an error when it is not a valid account id.
+func ccpAccountFromEnv() (*int, error) {
+	v := os.Getenv(ccpAccountEnv)
+	if v == "" {
+		return nil, nil
 	}
-
-	// Fast path: the daemon's cached, reserved pick. EnsureRunning keeps a daemon
-	// alive to adopt any rotated token after we exec away. A daemon that responds
-	// is authoritative — only an unreachable one falls through to live selection.
-	cl := daemon.NewClient()
-	// A version-skewed (pre-upgrade) daemon is ignored — fall through to live
-	// selection until status/add/init restarts it onto the current binary.
-	if cl.EnsureRunning(2*time.Second) && daemonAt(version.String()) {
-		if resp, ok := cl.Select(nil, 0, false, cwd); ok {
-			switch {
-			case resp.OK && resp.Dir != "":
-				if resp.Sticky {
-					step(cmd.ErrOrStderr(), "Reusing the account pinned to this directory.")
-				} else {
-					step(cmd.ErrOrStderr(), "Selected the emptiest account.")
-				}
-				return resp.Dir, nil
-			case resp.Error != "":
-				return "", errors.New(resp.Error)
-			default:
-				return "", pool.ErrNoneAvailable
-			}
-		}
-	}
-
-	// Live fallback (no daemon): sample + score synchronously. Select records
-	// stickiness itself.
-	sr, err := m.Select(cmd.Context(), pool.SelectOptions{Live: true, Cwd: cwd})
+	id, err := strconv.Atoi(v)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("%s must be an account id, got %q: %w", ccpAccountEnv, v, err)
 	}
-	reason := fmt.Sprintf("%s (score %.1f)", accountName(sr.Best.Label), sr.Result.Score)
-	if sr.Sticky {
-		reason = fmt.Sprintf("%s (pinned to this directory)", accountName(sr.Best.Label))
-	}
-	return prepareAccount(cmd, m, sr.Best, reason)
-}
-
-// prepareAccount re-asserts the account's overlay and preflight-refreshes its
-// token before launch — the daemonless equivalent of what the daemon does for
-// its own picks — then returns the config dir. The choice is logged to stderr;
-// stdout is left clean for claude.
-func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, reason string) (string, error) {
-	if err := m.SyncOverlay(a); err != nil {
-		warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
-	}
-	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
-		if errors.Is(err, pool.ErrNeedsLogin) {
-			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `ccp add` or `claude /login`", accountName(a.Label))
-		} else {
-			warn(cmd.ErrOrStderr(), "%v", err)
-		}
-	}
-	step(cmd.ErrOrStderr(), "selected %s", reason)
-	return a.ConfigDir, nil
+	return &id, nil
 }
 
 // execClaude replaces this process with `claude`, forwarding args verbatim and

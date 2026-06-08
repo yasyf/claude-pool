@@ -38,29 +38,47 @@ func TestExecEnv(t *testing.T) {
 	})
 }
 
-// TestResolveRunDirCcpAccount covers the two CCP_ACCOUNT error paths, which
-// return before any overlay/Keychain access. The valid-id path is exercised by
-// manual verification (it reaches SyncOverlay/PreflightRefresh, which need real
-// state and must not be touched here).
-func TestResolveRunDirCcpAccount(t *testing.T) {
-	m := &pool.Manager{Store: openTestStore(t)}
-	cmd := &cobra.Command{}
+// TestCcpAccountFromEnv pins the CCP_ACCOUNT override parsing: unset yields no
+// override, a non-integer is rejected, and a valid id parses through.
+func TestCcpAccountFromEnv(t *testing.T) {
+	t.Run("unset yields no override", func(t *testing.T) {
+		t.Setenv(ccpAccountEnv, "")
+		got, err := ccpAccountFromEnv()
+		if err != nil || got != nil {
+			t.Fatalf("ccpAccountFromEnv() = %v, %v; want nil, nil", got, err)
+		}
+	})
 
 	t.Run("non-integer is rejected", func(t *testing.T) {
 		t.Setenv(ccpAccountEnv, "not-a-number")
-		_, err := resolveRunDir(cmd, m)
+		_, err := ccpAccountFromEnv()
 		if err == nil || !strings.Contains(err.Error(), "must be an account id") {
 			t.Fatalf("err = %v, want an 'account id' parse error", err)
 		}
 	})
 
-	t.Run("unknown id is rejected", func(t *testing.T) {
-		t.Setenv(ccpAccountEnv, "999")
-		_, err := resolveRunDir(cmd, m)
-		if err == nil || !strings.Contains(err.Error(), "999") {
-			t.Fatalf("err = %v, want a not-found error mentioning account 999", err)
+	t.Run("valid id parses", func(t *testing.T) {
+		t.Setenv(ccpAccountEnv, "5")
+		got, err := ccpAccountFromEnv()
+		if err != nil || got == nil || *got != 5 {
+			t.Fatalf("ccpAccountFromEnv() = %v, %v; want &5, nil", got, err)
 		}
 	})
+}
+
+// TestResolveSelectionForcedUnknown covers the forced-account error path shared
+// by `ccp run` and `ccp select`, which returns before any overlay/Keychain
+// access. The valid-id path is exercised by manual verification (it reaches
+// SyncOverlay/PreflightRefresh, which need real state and must not be touched
+// here).
+func TestResolveSelectionForcedUnknown(t *testing.T) {
+	m := &pool.Manager{Store: openTestStore(t)}
+	cmd := &cobra.Command{}
+	id := 999
+	_, _, err := resolveSelection(cmd, m, selectReq{account: &id})
+	if err == nil || !strings.Contains(err.Error(), "999") {
+		t.Fatalf("err = %v, want a not-found error mentioning account 999", err)
+	}
 }
 
 func openTestStore(t *testing.T) *store.Store {
