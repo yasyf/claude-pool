@@ -77,3 +77,27 @@ func (c *Client) Checkin(pid int) (*Response, error) {
 func (c *Client) Health() (*Response, error) {
 	return c.do(Request{Op: OpHealth}, 2*time.Second)
 }
+
+// Shutdown asks the daemon to step down. An OK reply means it accepted and will
+// release the socket shortly; use WaitGone to confirm. This evicts a daemon
+// regardless of launchd tracking — the only way to clear an orphan a `brew
+// services stop` (launchctl bootout) cannot kill.
+func (c *Client) Shutdown() (*Response, error) {
+	return c.do(Request{Op: OpShutdown}, 2*time.Second)
+}
+
+// WaitGone polls until the socket stops accepting connections or timeout
+// elapses, reporting whether it went dead. Reused by the CLI upgrade path and a
+// successor daemon's bind-time eviction.
+func (c *Client) WaitGone(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("unix", c.socket, 200*time.Millisecond)
+		if err != nil {
+			return true
+		}
+		conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
+}

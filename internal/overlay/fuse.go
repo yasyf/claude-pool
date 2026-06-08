@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
+	"golang.org/x/sys/unix"
 )
 
 const fuseBuilt = true
@@ -142,7 +143,21 @@ func (p *FuseProvider) Health(base, accountDir string) error {
 	return nil
 }
 
-// Teardown unmounts the account dir's mirror.
+const (
+	// unmountGrace lets cgofuse's graceful Unmount complete before we escalate
+	// to a forced kernel unmount.
+	unmountGrace = 3 * time.Second
+	// forceGrace bounds the wait for the serving goroutine to exit after a
+	// forced unmount, so a wedged fuse-t fault can't hold shutdown open.
+	forceGrace = 2 * time.Second
+)
+
+// Teardown unmounts the account dir's mirror. It is bounded: cgofuse's
+// host.Unmount is a blocking cgo call that can wedge on a fuse-t fault, so it
+// runs in a goroutine behind a grace timer and escalates to a forced kernel
+// unmount — a synchronous unmount here would hang the daemon's shutdown and
+// orphan it (which is exactly how the socket-holding orphan this guards against
+// is born).
 func (p *FuseProvider) Teardown(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to tear down base dir %q", accountDir)
@@ -152,13 +167,20 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 	delete(mounts, accountDir)
 	mountMu.Unlock()
 	if !ok {
-		// Not ours (e.g. left over from a prior run): best-effort unmount.
-		_ = syscall.Unmount(accountDir, 0)
+		// Not ours (e.g. left over from a prior run): forced best-effort unmount.
+		_ = unix.Unmount(accountDir, unix.MNT_FORCE)
 	} else {
-		h.host.Unmount()
+		// host.Unmount returns once the mount is gone (graceful or forced); the
+		// forced kernel unmount below guarantees that, so this goroutine exits.
+		go h.host.Unmount()
 		select {
 		case <-h.done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(unmountGrace):
+			_ = unix.Unmount(accountDir, unix.MNT_FORCE)
+			select {
+			case <-h.done:
+			case <-time.After(forceGrace):
+			}
 		}
 	}
 	// Honest teardown: confirm the path is no longer a mountpoint. If the

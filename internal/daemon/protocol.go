@@ -17,10 +17,11 @@ const ProtocolVersion = 1
 type Op string
 
 const (
-	OpSelect  Op = "select"  // pick the best account; optionally mark a checkout
-	OpStatus  Op = "status"  // return scored status for all accounts
-	OpCheckin Op = "checkin" // release a checkout and adopt a rotated token
-	OpHealth  Op = "health"  // liveness + version probe
+	OpSelect   Op = "select"   // pick the best account; optionally mark a checkout
+	OpStatus   Op = "status"   // return scored status for all accounts
+	OpCheckin  Op = "checkin"  // release a checkout and adopt a rotated token
+	OpHealth   Op = "health"   // liveness + version probe
+	OpShutdown Op = "shutdown" // step down gracefully and release the socket
 )
 
 // Request is one client request (one JSON object per line).

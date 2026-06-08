@@ -146,6 +146,10 @@ func runServiceInstall(cmd *cobra.Command) error {
 	return nil
 }
 
+// evictTimeout bounds the wait for a version-skewed daemon to release the
+// socket after being asked to step down.
+const evictTimeout = 5 * time.Second
+
 // ensureDaemon makes sure a daemon at the current version is responding,
 // silently starting (or restarting, after an upgrade) it as needed.
 // Best-effort: failures are warnings, never fatal — no calling flow requires
@@ -155,17 +159,25 @@ func ensureDaemon(cmd *cobra.Command) {
 	if daemonAt(want) {
 		return
 	}
-	if resp, err := daemon.NewClient().Health(); err == nil && resp.OK {
-		// launchd's KeepAlive holds the old binary's image alive across
-		// upgrades indefinitely; restart it onto the current binary.
+	cl := daemon.NewClient()
+	if resp, err := cl.Health(); err == nil && resp.OK {
+		// A version-skewed daemon answers here: launchd's KeepAlive holding a
+		// pre-upgrade image, or a detached EnsureRunning spawn launchd never
+		// tracked. Evict it over the socket — `brew services stop` (launchctl
+		// bootout) cannot kill a process launchd does not own.
 		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon to pick up the new version…")
+		if _, err := cl.Shutdown(); err != nil {
+			warn(cmd.ErrOrStderr(), "couldn't ask the old daemon to step down: %v", err)
+		}
+		if !cl.WaitGone(evictTimeout) {
+			warn(cmd.ErrOrStderr(),
+				"the old daemon (%s) won't release the socket; kill it once: pkill -f 'cc-pool daemon'", resp.Version)
+		}
 		if service.IsBrewManaged() {
-			// `brew services start` is a no-op on a running service; stop
-			// first, and say so if that fails (the stale daemon would
-			// otherwise survive behind a "restarted" message).
-			if err := service.BrewStop(); err != nil {
-				warn(cmd.ErrOrStderr(), "couldn't stop the brew service: %v", err)
-			}
+			// Bookkeeping only: clears launchd's record so the restart below
+			// re-bootstraps cleanly. The Shutdown above already evicted the
+			// process (which BrewStop could not, were it an orphan).
+			_ = service.BrewStop()
 		}
 	} else {
 		step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")
@@ -181,7 +193,7 @@ func ensureDaemon(cmd *cobra.Command) {
 			"couldn't start the daemon: %v; run `ccp service install` from a GUI session to enable background polling", err)
 		return
 	}
-	if !waitDaemon(want, 3*time.Second) {
+	if !waitDaemon(want, 10*time.Second) {
 		warn(cmd.ErrOrStderr(), "the daemon isn't responding yet; check `ccp service status`")
 	}
 }

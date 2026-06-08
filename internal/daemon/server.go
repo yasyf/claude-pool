@@ -32,11 +32,23 @@ const reservationTTL = 30 * time.Second
 // blocked on a slow network refresh.
 const preflightTimeout = 8 * time.Second
 
+// defaultEvictTimeout bounds how long a starting daemon waits for a
+// version-skewed holder to release the socket after being told to step down.
+const defaultEvictTimeout = 5 * time.Second
+
 // Server is the running daemon.
 type Server struct {
 	m      *pool.Manager
 	socket string
 	log    *log.Logger
+
+	// evictTimeout bounds the wait for a skewed holder to release the socket.
+	evictTimeout time.Duration
+
+	// triggerShutdown cancels serve's context, ending the daemon. It is set once
+	// in serve before the accept loop starts; the go-statement that spawns each
+	// handler establishes the happens-before, so handlers read it without a lock.
+	triggerShutdown context.CancelFunc
 
 	// wg tracks every daemon goroutine (scheduler, connection handlers,
 	// preflight refreshes); serve Waits on it before tearing down mounts and
@@ -65,6 +77,7 @@ func Run(ctx context.Context) error {
 		m:            m,
 		socket:       pool.SocketPath(),
 		log:          log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
+		evictTimeout: defaultEvictTimeout,
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},
 	}
@@ -92,25 +105,40 @@ func (s *Server) serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// No defer os.Remove(s.socket): *net.UnixListener unlinks the socket file on
-	// Close. An explicit Remove here would race a restart — a successor daemon
-	// that bound a fresh socket in the gap would have its live socket deleted.
-	defer ln.Close()
+	// closeListener unlinks the socket exactly once. *net.UnixListener.Close
+	// unlinks the socket file and is NOT idempotent: a second Close (the late
+	// deferred one, after a slow teardown) would delete a successor daemon's
+	// freshly-bound socket. The sync.Once pins the unlink to the first close, at
+	// ctx-cancel time. No explicit os.Remove for the same reason.
+	var closeOnce sync.Once
+	closeListener := func() { closeOnce.Do(func() { _ = ln.Close() }) }
+	defer closeListener()
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// stop cancels ctx, so it doubles as the over-the-socket shutdown trigger
+	// (OpShutdown). Set before the accept loop spawns any handler.
+	s.triggerShutdown = stop
 
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
-	s.establishMounts()
 
-	// Scheduler.
+	// Establish mounts then run the scheduler in one goroutine, off the accept
+	// path so Health is responsive from the first instant (a synchronous mount
+	// would bind the socket but not accept, looking "not responding" during
+	// boot). They stay sequential in one goroutine — not two bare ones — because
+	// establishMounts must finish before the scheduler's first poll, which can
+	// also touch fuse Setup (a check-then-act on the same mountpoint).
 	s.wg.Add(1)
-	go func() { defer s.wg.Done(); s.scheduler(ctx) }()
+	go func() {
+		defer s.wg.Done()
+		s.establishMounts(ctx)
+		s.scheduler(ctx)
+	}()
 
-	// Accept loop.
+	// Break the accept loop on shutdown.
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		closeListener()
 	}()
 	for {
 		conn, err := ln.Accept()
@@ -134,14 +162,13 @@ func (s *Server) serve(ctx context.Context) error {
 	return nil
 }
 
-// listen binds the unix socket with 0600 perms, refusing to start if another
-// live daemon already owns it.
+// listen binds the unix socket with 0600 perms, evicting a version-skewed
+// holder first (see evictHolder) and refusing only a live same-version peer.
 func (s *Server) listen() (net.Listener, error) {
-	if conn, err := net.DialTimeout("unix", s.socket, 300*time.Millisecond); err == nil {
-		conn.Close()
-		return nil, errors.New("another cc-pool daemon is already running")
+	if err := s.evictHolder(); err != nil {
+		return nil, err
 	}
-	_ = os.Remove(s.socket) // clear a stale socket
+	_ = os.Remove(s.socket) // clear any stale socket the evicted holder left
 	// Only the socket's parent dir is needed here (in production that is the
 	// state dir); deriving it from s.socket keeps tests off the real ~/.cc-pool.
 	if err := os.MkdirAll(filepath.Dir(s.socket), 0o700); err != nil {
@@ -156,6 +183,32 @@ func (s *Server) listen() (net.Listener, error) {
 		return nil, err
 	}
 	return ln, nil
+}
+
+// evictHolder makes way when the socket is already held. A holder at our own
+// version is a genuine double-start and is refused. A version-skewed holder —
+// an orphan launchd no longer tracks (a detached EnsureRunning spawn, or a
+// pre-upgrade image KeepAlive held), which `brew services stop` cannot kill —
+// is told to step down (OpShutdown) and waited out so we can rebind. Only the
+// non-holder ever evicts, and only on a version mismatch, so two daemons can
+// never mutually evict each other.
+func (s *Server) evictHolder() error {
+	c := &Client{socket: s.socket}
+	resp, err := c.Health()
+	if err != nil {
+		return nil // no live holder: stale or missing socket
+	}
+	if resp.Version == version.String() {
+		return errors.New("another cc-pool daemon at the same version is already running")
+	}
+	s.log.Printf("evicting version-skewed daemon (%s) holding the socket", resp.Version)
+	if _, err := c.Shutdown(); err != nil {
+		return fmt.Errorf("evict holder %s: %w", resp.Version, err)
+	}
+	if !c.WaitGone(s.evictTimeout) {
+		return fmt.Errorf("holder %s did not release the socket within %s", resp.Version, s.evictTimeout)
+	}
+	return nil
 }
 
 // handle serves one connection. ctx is the daemon's lifecycle context (bounds
@@ -188,9 +241,21 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleSelect(ctx, req)
 	case OpCheckin:
 		return s.handleCheckin(ctx, req)
+	case OpShutdown:
+		return s.handleShutdown()
 	default:
 		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
 	}
+}
+
+// handleShutdown replies OK, then cancels serve's context so this instance steps
+// down and releases the socket — the only eviction that works on an orphan
+// launchd no longer tracks. Cancelling the ctx closes the listener, never this
+// live connection, so the OK reply (written by handle after dispatch returns)
+// still lands; wg.Wait then drains this handler normally. Idempotent on repeats.
+func (s *Server) handleShutdown() Response {
+	s.triggerShutdown()
+	return Response{OK: true, Version: version.String()}
 }
 
 // handleStatus returns scored snapshots from cached samples (no live fetch).
@@ -392,13 +457,18 @@ func toStatuses(snaps []pool.Snapshot) []AccountStatus {
 	return out
 }
 
-// establishMounts brings up fuse mounts for fuse-kind accounts at startup.
-func (s *Server) establishMounts() {
+// establishMounts brings up fuse mounts for fuse-kind accounts at startup. It
+// runs off the accept path; ctx is checked between accounts so a boot-time
+// shutdown doesn't block wg.Wait for the full mount timeout of a slow account.
+func (s *Server) establishMounts(ctx context.Context) {
 	accts, err := s.m.Store.ListAccounts()
 	if err != nil {
 		return
 	}
 	for _, a := range accts {
+		if ctx.Err() != nil {
+			return
+		}
 		if a.OverlayKind != string(overlay.KindFuse) {
 			continue
 		}
