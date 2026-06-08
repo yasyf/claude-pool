@@ -4,7 +4,11 @@
 // newline-delimited JSON protocol defined here.
 package daemon
 
-import "time"
+import (
+	"time"
+
+	"github.com/yasyf/cc-pool/internal/score"
+)
 
 // ProtocolVersion is bumped on incompatible wire changes.
 const ProtocolVersion = 1
@@ -42,7 +46,10 @@ type AccountStatus struct {
 	RateLimited    bool      `json:"rate_limited"`
 	Stale          bool      `json:"stale"`
 	Resets5h       time.Time `json:"resets_5h"`
+	Resets7d       time.Time `json:"resets_7d"`
 	SampleAge      string    `json:"sample_age"`
+	// Components is the per-term score breakdown, so status can explain the score.
+	Components score.Components `json:"components"`
 }
 
 // Response is one server reply (one JSON object per line).

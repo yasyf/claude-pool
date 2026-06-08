@@ -379,7 +379,9 @@ func toStatuses(snaps []pool.Snapshot) []AccountStatus {
 			RateLimited:    sn.RateLimited,
 			Stale:          sn.Stale,
 			Resets5h:       sn.Resets5h,
+			Resets7d:       sn.Resets7d,
 			SampleAge:      sn.SampleAge.Round(time.Second).String(),
+			Components:     sn.Components,
 		})
 	}
 	return out

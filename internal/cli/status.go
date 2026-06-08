@@ -15,6 +15,7 @@ import (
 func newStatusCmd() *cobra.Command {
 	var watch bool
 	var live bool
+	var plain bool
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show per-account usage, score, and sessions",
@@ -24,18 +25,24 @@ func newStatusCmd() *cobra.Command {
 				if err := requireInit(m); err != nil {
 					return err
 				}
-				return runStatus(cmd, m, watch, live)
+				return runStatus(cmd, m, watch, live, plain)
 			})
 		},
 	}
-	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "refresh continuously")
+	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "refresh continuously (plain mode)")
 	cmd.Flags().BoolVar(&live, "live", false, "force live sampling even if the daemon is running")
+	cmd.Flags().BoolVar(&plain, "plain", false, "print the plain table instead of the interactive TUI")
 	return cmd
 }
 
-// runStatus renders the status table (once, or continuously with watch). Both
-// `clp status` and bare `clp` dispatch here.
-func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live bool) error {
+// runStatus shows account status. On an interactive terminal it launches the
+// TUI (which refreshes itself); piped or with --plain it prints the plain
+// table, once or continuously under --watch. Both `clp status` and bare `clp`
+// dispatch here.
+func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) error {
+	if isTTY() && !plain {
+		return runStatusTUI(cmd, m, live)
+	}
 	render := func() error {
 		snaps, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
@@ -88,6 +95,8 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 			RateLimited:    a.RateLimited,
 			Stale:          a.Stale,
 			Resets5h:       a.Resets5h,
+			Resets7d:       a.Resets7d,
+			Components:     a.Components,
 		}
 		s.Account.ID = a.ID
 		s.Account.ConfigDir = a.ConfigDir
@@ -107,32 +116,25 @@ func renderTable(snaps []pool.Snapshot) string {
 	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].Score > snaps[j].Score })
 
 	var b strings.Builder
-	header := fmt.Sprintf("%-24s %8s %7s %7s %6s %-10s %s",
-		"ACCOUNT", "SCORE", "5h", "7d", "SESS", "RESET", "FLAGS")
+	// Two leading spaces align the header with the rows' marker gutter ("▸ "/"  ").
+	header := fmt.Sprintf("  %-24s %8s %8s %8s %5s %-8s",
+		"ACCOUNT", "SCORE", "5h used", "7d used", "LIVE", "RESETS")
 	b.WriteString(hdrStyle.Render(header))
 	b.WriteByte('\n')
 
 	for i, s := range snaps {
 		label := truncate(accountName(s.Account.Label), 24)
-		rem5 := fmt.Sprintf("%5.0f%%", s.Remaining5h)
-		rem7 := fmt.Sprintf("%5.0f%%", s.Remaining7d)
-		sess := fmt.Sprintf("%d", s.ActiveSessions)
+		used5 := fmt.Sprintf("%.0f%%", s.Util5h)
+		used7 := fmt.Sprintf("%.0f%%", s.Util7d)
 		reset := "-"
 		if !s.Resets5h.IsZero() {
 			reset = humanizeUntil(time.Until(s.Resets5h))
 		}
-		var flags []string
-		if s.Stale {
-			flags = append(flags, warnStyle.Render("stale"))
+		row := fmt.Sprintf("%-24s %8.1f %8s %8s %5d %-8s",
+			label, s.Score, used5, used7, s.ActiveSessions, reset)
+		if flags := snapshotFlags(s); flags != "" {
+			row += " " + flags
 		}
-		if s.RateLimited {
-			flags = append(flags, badStyle.Render("rate-limited"))
-		}
-		if !s.HasUsage {
-			flags = append(flags, dimStyle.Render("no-data"))
-		}
-		row := fmt.Sprintf("%-24s %8.1f %7s %7s %6s %-10s %s",
-			label, s.Score, rem5, rem7, sess, reset, strings.Join(flags, " "))
 		if i == 0 {
 			row = bestStyle.Render("▸ ") + row
 		} else {
@@ -141,8 +143,27 @@ func renderTable(snaps []pool.Snapshot) string {
 		b.WriteString(row)
 		b.WriteByte('\n')
 	}
+	b.WriteString(dimStyle.Render("▸ = next pick · score higher = emptier · 5h/7d = % used"))
+	b.WriteByte('\n')
 	b.WriteString(dimStyle.Render(fmt.Sprintf("updated %s", time.Now().Format(time.Kitchen))))
 	return b.String()
+}
+
+// snapshotFlags renders the colored status tokens (stale / rate-limited /
+// no-data) for one account, or "" when the account is healthy. Shared by the
+// plain table and the TUI.
+func snapshotFlags(s pool.Snapshot) string {
+	var flags []string
+	if s.Stale {
+		flags = append(flags, warnStyle.Render("stale"))
+	}
+	if s.RateLimited {
+		flags = append(flags, badStyle.Render("rate-limited"))
+	}
+	if !s.HasUsage {
+		flags = append(flags, dimStyle.Render("no-data"))
+	}
+	return strings.Join(flags, " ")
 }
 
 // accountName returns an account's display label, or a placeholder when it is

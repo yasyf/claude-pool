@@ -27,6 +27,9 @@ type Snapshot struct {
 	Resets7d       time.Time
 	Burn5hPerHour  float64
 	SampleAge      time.Duration
+	// Components is the per-term score breakdown, so status can explain why an
+	// account scored what it did without recomputing.
+	Components score.Components
 }
 
 // Snapshots returns a scored view of every account. When live is true, stale
@@ -73,6 +76,7 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			Resets5h:       in.Resets5h,
 			Resets7d:       in.Resets7d,
 			Burn5hPerHour:  in.Burn5hPerHour,
+			Components:     r.Components,
 		}
 		if in.HasUsage {
 			s.SampleAge = now.Sub(in.SampleTS)

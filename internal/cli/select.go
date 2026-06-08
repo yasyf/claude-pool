@@ -45,7 +45,7 @@ scores; otherwise it samples usage live.`,
 
 				// Fast path: ask the daemon for its cached pick.
 				if !noDaemon {
-					if dir, done, err := selectViaDaemon(cmd, acctPtr, wait, cwd); done {
+					if dir, done, err := selectViaDaemon(cmd, m, acctPtr, wait, cwd); done {
 						if err != nil {
 							return err
 						}
@@ -68,7 +68,7 @@ scores; otherwise it samples usage live.`,
 
 // selectViaDaemon attempts a daemon-served selection. done=false means the
 // daemon was unreachable and the caller should fall back to live selection.
-func selectViaDaemon(cmd *cobra.Command, account *int, wait bool, cwd string) (dir string, done bool, err error) {
+func selectViaDaemon(cmd *cobra.Command, m *pool.Manager, account *int, wait bool, cwd string) (dir string, done bool, err error) {
 	cl := daemon.NewClient()
 	// Auto-spawn a detached daemon if none is running (≤2s), then fall through
 	// to live selection if it still doesn't come up.
@@ -84,11 +84,7 @@ func selectViaDaemon(cmd *cobra.Command, account *int, wait bool, cwd string) (d
 		return "", false, nil
 	}
 	if resp.OK && resp.Dir != "" {
-		if resp.Sticky {
-			step(cmd.ErrOrStderr(), "Reusing the account pinned to this directory.")
-		} else {
-			step(cmd.ErrOrStderr(), "Selected the emptiest account.")
-		}
+		announceSelected(cmd, m, resp.SelectedID, resp.Sticky)
 		return resp.Dir, true, nil
 	}
 	if !resp.OK && wait && resp.SoonestReset != nil {
@@ -162,6 +158,33 @@ func emitChoice(cmd *cobra.Command, m *pool.Manager, a store.Account, reason str
 		}
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), a.ConfigDir)
-	step(cmd.ErrOrStderr(), "selected %s", reason)
+	if stdoutIsTTY() {
+		step(cmd.ErrOrStderr(), "selected %s", reason)
+	}
 	return nil
+}
+
+// announceSelected prints a terse line naming the chosen account, but only when
+// stdout is an interactive terminal — captured/piped callers ($(clp select))
+// get the bare dir on stdout and nothing else.
+func announceSelected(cmd *cobra.Command, m *pool.Manager, id *int, sticky bool) {
+	if !stdoutIsTTY() {
+		return
+	}
+	step(cmd.ErrOrStderr(), "%s", selectedLine(m, id, sticky))
+}
+
+// selectedLine builds the human-facing "selected <account>" diagnostic from the
+// daemon's SelectedID. An unknown or absent id degrades to a generic "account".
+func selectedLine(m *pool.Manager, id *int, sticky bool) string {
+	label := "account"
+	if id != nil {
+		if a, err := m.Store.GetAccount(*id); err == nil {
+			label = accountName(a.Label)
+		}
+	}
+	if sticky {
+		return fmt.Sprintf("selected %s (pinned to this directory)", label)
+	}
+	return fmt.Sprintf("selected %s", label)
 }

@@ -47,7 +47,7 @@ pool.`,
 				}
 				switch bareAction(initialized, accounts, isTTY()) {
 				case actionStatus:
-					return runStatus(cmd, m, false, false)
+					return runStatus(cmd, m, false, false, false)
 				case actionAdd:
 					return runAdd(cmd, m, addOptions{})
 				default:
