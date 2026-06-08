@@ -10,6 +10,31 @@ cc-pool (`clp`) pools several Claude Max/Pro subscriptions and launches each Cla
 - **Test**: `go test ./...` — must pass with no network, no Keychain, no daemon
 - **Vet**: `go vet ./...` before every commit
 
+## Releasing
+
+Releases are **tag-triggered** — there is no version file to edit. `Version`/`Commit` in
+`internal/version` default to `dev` locally and are injected at build time via `-ldflags`.
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which (1) builds universal
+(arm64+amd64) binaries on macOS — both the pure-Go default and the `-tags fuse` variant, (2)
+creates a GitHub Release with auto-generated notes + tarballs, and (3) auto-bumps
+`Formula/cc-pool.rb` (download urls + both sha256s) on `main`. **Never hand-edit the formula
+version/shas** — the `bump-formula` job owns them. A tag containing `-` (e.g. `v1.2.3-rc.1`)
+publishes assets but skips the formula bump (prerelease).
+
+Versioning is semver: `feat` → minor, `fix`/`chore`/`refactor` → patch. Latest released version:
+`git tag --sort=-creatordate | head`.
+
+This repo is **colocated jj + git**. To cut a release once the change is committed (jj manages
+bookmarks; tags go through plain `git`):
+
+```sh
+jj bookmark set main -r <change>     # move main to the release commit
+jj git push -b main                  # push main (fast-forward)
+git tag vX.Y.Z <commit-sha>          # tag the release commit
+git push origin vX.Y.Z               # push tag → triggers release.yml
+```
+
 ## Repository Structure
 
 ```
