@@ -136,6 +136,11 @@ func runServiceInstall(cmd *cobra.Command) error {
 		if err := service.BrewStart(); err != nil {
 			return fmt.Errorf("brew services start: %w", err)
 		}
+		// brew services start only loads the job; a bootout race can leave it
+		// loaded-but-not-running, so force the daemon to actually exec.
+		if err := service.BrewKickstart(); err != nil {
+			warn(cmd.ErrOrStderr(), "couldn't kickstart the brew service: %v", err)
+		}
 		success(out, "Started the daemon.")
 		return nil
 	}
