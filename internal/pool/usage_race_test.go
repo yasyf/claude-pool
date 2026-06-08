@@ -149,7 +149,7 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Keychain: fk}
+	m := &Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()}
 
 	const goroutines = 16
 	const iterations = 25
@@ -167,7 +167,7 @@ func TestPerAccountLockSerializesCredentialCycle(t *testing.T) {
 						return
 					}
 				} else {
-					if err := m.AdoptRotatedToken(a); err != nil {
+					if err := m.AdoptRotatedToken(context.Background(), a); err != nil {
 						t.Errorf("AdoptRotatedToken: %v", err)
 						return
 					}

@@ -42,7 +42,7 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 		t.Fatal(err)
 	}
 	fo := &fakeOAuth{currentRT: "rt-0"}
-	m := &Manager{Store: st, OAuth: fo, Keychain: fk}
+	m := &Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()}
 
 	if _, _, err := m.SampleUsage(context.Background(), a, true); err != nil {
 		t.Fatalf("SampleUsage: %v", err)
@@ -50,7 +50,7 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 	if got := fo.refreshes; got != 1 {
 		t.Fatalf("refreshes = %d, want 1 (near-expiry token must be refreshed)", got)
 	}
-	if err := m.AdoptRotatedToken(a); err != nil {
+	if err := m.AdoptRotatedToken(context.Background(), a); err != nil {
 		t.Fatalf("AdoptRotatedToken: %v", err)
 	}
 	if err := m.Remove(a.ID, true); err != nil {

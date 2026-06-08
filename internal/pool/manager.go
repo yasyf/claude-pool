@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 
 	"github.com/yasyf/cc-pool/internal/keychain"
@@ -57,19 +58,27 @@ type Manager struct {
 	OAuth    Refresher
 	Keychain CredentialStore
 
+	// LockDir holds the per-account cross-process refresh lock files. Open sets
+	// it under the state dir; tests point it at a temp dir so they never touch
+	// real state.
+	LockDir string
+
 	// muMap guards locks; locks holds one mutex per account ID serializing that
-	// account's credential read→refresh→write cycle. These per-account mutexes
-	// are DELIBERATELY held across Keychain and OAuth I/O — a documented
-	// exception to the no-locks-across-I/O rule: concurrent mutation of one
-	// account's single-use refresh token is never safe (double-spend gets
+	// account's credential read→refresh→write cycle WITHIN this process. These
+	// per-account mutexes are DELIBERATELY held across Keychain and OAuth I/O — a
+	// documented exception to the no-locks-across-I/O rule: concurrent mutation
+	// of one account's single-use refresh token is never safe (double-spend gets
 	// invalid_grant; a stale write-back clobbers the rotated token), so
 	// serializing the whole cycle is the point. muMap itself is only ever held
-	// for the map access, never across an op.
+	// for the map access, never across an op. Cross-process serialization (the
+	// daemon vs a concurrent `clp` invocation) is layered on top by lockAccount's
+	// per-account flock — the mutex alone cannot span processes.
 	muMap sync.Mutex
 	locks map[int]*sync.Mutex
 }
 
-// acctLock returns the mutex serializing credential operations for an account.
+// acctLock returns the mutex serializing credential operations for an account
+// within this process.
 func (m *Manager) acctLock(id int) *sync.Mutex {
 	m.muMap.Lock()
 	defer m.muMap.Unlock()
@@ -80,6 +89,28 @@ func (m *Manager) acctLock(id int) *sync.Mutex {
 		m.locks[id] = &sync.Mutex{}
 	}
 	return m.locks[id]
+}
+
+// lockAccount serializes an account's credential read→refresh→write cycle both
+// in-process (the per-account mutex) and across processes (a per-account flock),
+// so the daemon and a concurrent `clp` invocation can never both refresh one
+// account and double-spend its single-use refresh token. Acquire order is mutex
+// then flock; the returned release reverses it and must be called exactly once.
+// A flock that cannot be taken before ctx is done is returned as an error; the
+// caller falls back to the existing (possibly stale) credential rather than
+// racing a refresh.
+func (m *Manager) lockAccount(ctx context.Context, id int) (func(), error) {
+	mu := m.acctLock(id)
+	mu.Lock()
+	h, err := flockAcquire(ctx, filepath.Join(m.LockDir, AccountDirName(id)+".lock"))
+	if err != nil {
+		mu.Unlock()
+		return nil, fmt.Errorf("acct-%d refresh lock: %w", id, err)
+	}
+	return func() {
+		h.release()
+		mu.Unlock()
+	}, nil
 }
 
 // Open ensures the state dir exists, opens the database, and returns a Manager.
@@ -95,6 +126,7 @@ func Open() (*Manager, error) {
 		Store:    st,
 		OAuth:    oauth.New(),
 		Keychain: sysKeychain{},
+		LockDir:  filepath.Join(StateDir(), "locks"),
 	}, nil
 }
 

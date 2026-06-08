@@ -24,15 +24,20 @@ var ErrNeedsLogin = errors.New("account needs re-login (refresh token missing or
 // is written back to all of the account's services and logged. allowRefresh
 // should be false for accounts with a live session (that session owns refresh).
 func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, bool, error) {
-	mu := m.acctLock(a.ID)
-	mu.Lock()
-	defer mu.Unlock()
+	release, err := m.lockAccount(ctx, a.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
 	return m.ensureFreshToken(ctx, a, within, allowRefresh)
 }
 
 // ensureFreshToken is EnsureFreshToken's body; split out so SampleUsage can
 // compose it with fetchUsage's 401-retry under ONE continuous critical section
-// (sync.Mutex is not reentrant). Caller must hold acctLock(a.ID).
+// (sync.Mutex is not reentrant). Caller must hold the per-account lock
+// (lockAccount). The credential is (re-)read here, inside the lock, so a waiter
+// that wins the lock after a peer rotated the token sees the fresh blob and
+// returns it without a second refresh POST.
 func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, bool, error) {
 	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
 	if err != nil {
@@ -59,7 +64,8 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 }
 
 // refresh performs the OAuth refresh and persists the new blob, preserving the
-// non-token fields from the prior credential. Caller must hold acctLock(a.ID).
+// non-token fields from the prior credential. Caller must hold the per-account
+// lock (lockAccount).
 // Every account runs its own token chain, created by its own `claude /login`, so
 // refreshing a pool account's credential never affects plain claude.
 func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.Credential) (*keychain.Credential, error) {
@@ -83,10 +89,12 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.C
 // live claude session may have rotated it) and writes it straight back,
 // re-asserting our `security`-trusted ACL over the rotated item. Used by the
 // daemon on session check-in.
-func (m *Manager) AdoptRotatedToken(a store.Account) error {
-	mu := m.acctLock(a.ID)
-	mu.Lock()
-	defer mu.Unlock()
+func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error {
+	release, err := m.lockAccount(ctx, a.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
 	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
 	if err != nil {
 		return err
@@ -114,9 +122,11 @@ func (m *Manager) SampleUsage(ctx context.Context, a store.Account, allowRefresh
 // another goroutine could rotate the token between them and the retry would
 // re-POST a consumed single-use refresh token.
 func (m *Manager) sampleUsage(ctx context.Context, a store.Account, allowRefresh bool) (*oauth.Usage, bool, error) {
-	mu := m.acctLock(a.ID)
-	mu.Lock()
-	defer mu.Unlock()
+	release, err := m.lockAccount(ctx, a.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
 	cred, _, err := m.ensureFreshToken(ctx, a, RefreshLeadTime, allowRefresh)
 	if err != nil && !errors.Is(err, ErrNeedsLogin) {
 		// Even on transient refresh failure we may still have a usable token.
@@ -127,8 +137,8 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, allowRefresh
 	return m.fetchUsage(ctx, a, cred, allowRefresh)
 }
 
-// fetchUsage fetches usage, refreshing once on 401. Caller must hold
-// acctLock(a.ID).
+// fetchUsage fetches usage, refreshing once on 401. Caller must hold the
+// per-account lock (lockAccount).
 func (m *Manager) fetchUsage(ctx context.Context, a store.Account, cred *keychain.Credential, allowRefresh bool) (*oauth.Usage, bool, error) {
 	usage, err := m.OAuth.Usage(ctx, cred.ClaudeAiOauth.AccessToken)
 	if err == nil {

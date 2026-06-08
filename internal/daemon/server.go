@@ -187,7 +187,7 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	case OpSelect:
 		return s.handleSelect(ctx, req)
 	case OpCheckin:
-		return s.handleCheckin(req)
+		return s.handleCheckin(ctx, req)
 	default:
 		return Response{OK: false, Error: "unknown op: " + string(req.Op)}
 	}
@@ -281,7 +281,7 @@ func (s *Server) recordSticky(cwd string, accountID int) {
 }
 
 // handleCheckin closes sessions for a pid and adopts any rotated token.
-func (s *Server) handleCheckin(req Request) Response {
+func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
 	sessions, err := s.m.Store.ListActiveSessions()
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
@@ -294,9 +294,11 @@ func (s *Server) handleCheckin(req Request) Response {
 			s.log.Printf("checkin close session %d: %v", se.ID, err)
 		}
 		if a, err := s.m.Store.GetAccount(se.AccountID); err == nil {
-			if err := s.m.AdoptRotatedToken(a); err != nil {
+			actx, cancel := context.WithTimeout(ctx, preflightTimeout)
+			if err := s.m.AdoptRotatedToken(actx, a); err != nil {
 				s.log.Printf("acct-%02d adopt rotated token on checkin: %v", a.ID, err)
 			}
+			cancel()
 		}
 	}
 	return Response{OK: true}

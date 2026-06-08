@@ -47,7 +47,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 	}
 	return &Server{
 		m: &pool.Manager{
-			Store: st, OAuth: &fakeOAuth{}, Keychain: newFakeKeychain(),
+			Store: st, OAuth: &fakeOAuth{}, Keychain: newFakeKeychain(), LockDir: t.TempDir(),
 		},
 		log:          log.New(io.Discard, "", 0),
 		reservations: map[int]time.Time{},

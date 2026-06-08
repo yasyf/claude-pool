@@ -145,7 +145,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	fo := &fakeOAuth{currentRT: "rt-0"}
 
 	s := &Server{
-		m:            &pool.Manager{Store: st, OAuth: fo, Keychain: fk},
+		m:            &pool.Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()},
 		log:          log.New(io.Discard, "", 0),
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},

@@ -124,7 +124,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 		// rotated by its live session — adopt it (re-asserting our ACL) before
 		// sampling.
 		if idle {
-			if err := s.m.AdoptRotatedToken(a); err != nil {
+			if err := s.m.AdoptRotatedToken(ctx, a); err != nil {
 				s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)
 			}
 		}

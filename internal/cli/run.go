@@ -90,7 +90,7 @@ func execClaude(cmd *cobra.Command, m *pool.Manager, a store.Account, args []str
 
 	// Session check-in: prefer the daemon (event-driven adopt), else do it here.
 	if resp, err := daemon.NewClient().Checkin(pid); err != nil || resp == nil || !resp.OK {
-		_ = m.AdoptRotatedToken(a)
+		_ = m.AdoptRotatedToken(cmd.Context(), a)
 	}
 	if sessID > 0 {
 		_ = m.Store.CloseSession(sessID)

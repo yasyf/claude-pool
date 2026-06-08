@@ -17,7 +17,7 @@ func openTestManager(t *testing.T) *Manager {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return &Manager{Store: st}
+	return &Manager{Store: st, LockDir: t.TempDir()}
 }
 
 func TestStickyPick(t *testing.T) {
