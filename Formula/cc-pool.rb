@@ -93,15 +93,6 @@ class CcPool < Formula
       Get started:
         ccp add         # pool a Claude subscription (auto-inits; plain `claude` keeps working)
         CLAUDE_CONFIG_DIR=$(ccp select) claude
-
-      The background daemon (keeps idle tokens fresh, scores live) starts
-      automatically on `ccp add`, managed via `brew services`.
-
-      Optional live-mirror overlay (instead of per-entry symlinks): install
-      fuse-t, then reinstall so the fuse-enabled build is selected:
-        brew install macos-fuse-t/cask/fuse-t
-        brew reinstall cc-pool
-      The default symlink overlay needs nothing extra.
     EOS
   end
 
