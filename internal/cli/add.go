@@ -19,6 +19,7 @@ type addOptions struct {
 	runNow  bool
 	autoYes bool
 	count   int
+	noAlias bool
 }
 
 // errAddSkipped signals that an addOne was cleanly skipped (the user declined to
@@ -53,6 +54,7 @@ away.`,
 	cmd.Flags().BoolVar(&opts.runNow, "run-login", false, "log in immediately instead of asking how")
 	cmd.Flags().BoolVarP(&opts.autoYes, "yes", "y", false, "add one account and log in right away")
 	cmd.Flags().IntVar(&opts.count, "count", 0, "add exactly N accounts, no continue prompt")
+	cmd.Flags().BoolVar(&opts.noAlias, "no-alias", false, "don't add a `claude` shell alias")
 	return cmd
 }
 
@@ -85,6 +87,9 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 		}
 	}
 	summarizeAdds(cmd, m, added)
+	if len(added) > 0 {
+		offerAlias(cmd, opts)
+	}
 	return nil
 }
 
