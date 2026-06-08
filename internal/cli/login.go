@@ -157,7 +157,6 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 	if !waitForIdentity(ctx, p.OverlayKind, p.ConfigDir, identityPostExitGrace) {
 		warn(cmd.ErrOrStderr(), "couldn't read this account's email, so its name won't prefill; if this add doesn't finish, retrying will discard this login")
 	}
-	success(cmd.OutOrStdout(), "Logged in. Closed claude.")
 	return nil
 }
 

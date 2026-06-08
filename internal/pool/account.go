@@ -61,6 +61,28 @@ type PendingAdd struct {
 	PurgedStaleCredential bool
 }
 
+// DuplicateIdentity returns an existing pool account that shares want's
+// accountUuid (the same Claude subscription), or nil if none does. Accounts
+// whose identity cannot be read are skipped, so one broken account dir never
+// blocks the check.
+func (m *Manager) DuplicateIdentity(want Identity) (*store.Account, error) {
+	accounts, err := m.Store.ListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	for i := range accounts {
+		a := accounts[i]
+		id, err := AccountIdentity(overlay.Kind(a.OverlayKind), a.ConfigDir)
+		if err != nil {
+			continue
+		}
+		if id.AccountUUID == want.AccountUUID {
+			return &a, nil
+		}
+	}
+	return nil, nil
+}
+
 // PrepareAdd allocates the next account dir, establishes its overlay, and
 // seeds its private .claude.json from plain claude's (~/.claude.json) so the
 // login session inherits onboarding state and settings instead of running the

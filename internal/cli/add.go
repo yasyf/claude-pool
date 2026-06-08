@@ -3,7 +3,6 @@ package cli
 import (
 	"errors"
 	"os/exec"
-	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
@@ -21,6 +20,10 @@ type addOptions struct {
 	autoYes bool
 	count   int
 }
+
+// errAddSkipped signals that an addOne was cleanly skipped (the user declined to
+// pool a subscription that is already in the pool). It is not a failure.
+var errAddSkipped = errors.New("add skipped")
 
 func newAddCmd() *cobra.Command {
 	var opts addOptions
@@ -67,6 +70,9 @@ func runAdd(cmd *cobra.Command, m *pool.Manager, opts addOptions) error {
 		}
 		acct, err := addOne(cmd, m, lbl, opts)
 		if err != nil {
+			if errors.Is(err, errAddSkipped) {
+				break // user declined a duplicate; not a failure
+			}
 			if len(added) == 0 {
 				return err // nothing added yet → propagate (nonzero exit)
 			}
@@ -106,21 +112,17 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	if err != nil {
 		return nil, err
 	}
-	step(out, "Setting up a new account…")
-	switch pending.ClaudeJSONSeed {
-	case pool.SeedCopied:
-		note(out, "Carried over your settings, so there's no first-run setup.")
-	case pool.SeedNoSource:
-		note(out, "No settings to carry over; this account will do first-run setup.")
-	case pool.SeedKeptExisting:
-		note(out, "This account has a login from an earlier attempt. Logging in again is safe, or continue to reuse it.")
-	}
-	if pending.PurgedStaleCredential {
-		note(out, "Cleared a leftover login from a previous attempt.")
-	}
 
 	if err := loginFlow(cmd, pending, opts); err != nil {
 		return nil, err
+	}
+
+	if checkDuplicate(cmd, m, pending, opts) {
+		note(out, "Skipped; didn't add a duplicate.")
+		if aerr := m.AbandonAdd(pending); aerr != nil {
+			warn(cmd.ErrOrStderr(), "cleanup failed: %v", aerr)
+		}
+		return nil, errAddSkipped
 	}
 
 	prompt := label == "" && isTTY() && !opts.autoYes
@@ -173,6 +175,37 @@ func defaultLabel(explicit string, kind overlay.Kind, configDir string) string {
 		return ""
 	}
 	return id.EmailAddress
+}
+
+// checkDuplicate reports whether the just-logged-in account should be skipped
+// because its subscription is already pooled. Interactive runs ask and default
+// to skipping; non-interactive runs warn and keep it so automation is never
+// blocked. A missing identity (login didn't capture one) disables the check.
+func checkDuplicate(cmd *cobra.Command, m *pool.Manager, p *pool.PendingAdd, opts addOptions) bool {
+	id, err := pool.AccountIdentity(p.OverlayKind, p.ConfigDir)
+	if err != nil {
+		return false
+	}
+	dup, err := m.DuplicateIdentity(*id)
+	if err != nil || dup == nil {
+		return false
+	}
+	who := id.EmailAddress
+	if who == "" {
+		who = "that subscription"
+	}
+	if opts.autoYes || opts.count > 0 || !isTTY() {
+		warn(cmd.ErrOrStderr(), "%s is already in the pool; adding it again", who)
+		return false
+	}
+	warn(cmd.ErrOrStderr(), "%s is already in the pool.", who)
+	keep := false
+	_ = huh.NewConfirm().
+		Title("Add it again anyway?").
+		Value(&keep).
+		WithTheme(clpTheme()).
+		Run()
+	return !keep
 }
 
 // loginFlow walks the user through the interactive login: either a watched
@@ -237,7 +270,9 @@ func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
 	if autoYes || !isTTY() {
 		return false
 	}
-	again := false
+	// Most people pool more than one subscription, so nudge toward a second
+	// account after the first; stop nudging once they have a few.
+	again := done == 1
 	if err := huh.NewConfirm().Title("Add another account?").Value(&again).WithTheme(clpTheme()).Run(); err != nil {
 		warn(cmd.ErrOrStderr(), "prompt failed: %v", err)
 		return false
@@ -245,24 +280,17 @@ func addAnother(cmd *cobra.Command, done, count int, autoYes bool) bool {
 	return again
 }
 
-// summarizeAdds prints a closing summary of what was added.
+// summarizeAdds prints the running pool total once the add loop ends. Each
+// account was already confirmed individually, so this only reports the total.
 func summarizeAdds(cmd *cobra.Command, m *pool.Manager, added []store.Account) {
 	if len(added) == 0 {
 		return
-	}
-	names := make([]string, len(added))
-	for i, a := range added {
-		names[i] = a.Label
-		if names[i] == "" {
-			names[i] = "a new account"
-		}
 	}
 	total := len(added)
 	if all, err := m.Store.ListAccounts(); err == nil {
 		total = len(all)
 	}
-	step(cmd.OutOrStdout(), "\nAdded %s. The pool now has %s.",
-		strings.Join(names, ", "), plural(total, "account"))
+	step(cmd.OutOrStdout(), "\nYour pool now has %s.", plural(total, "account"))
 }
 
 func shouldAbandon(cmd *cobra.Command) bool {

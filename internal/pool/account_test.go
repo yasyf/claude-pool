@@ -20,6 +20,61 @@ func openTestStore(t *testing.T) *store.Store {
 	return st
 }
 
+func TestDuplicateIdentity(t *testing.T) {
+	st := openTestStore(t)
+	m := &Manager{Store: st}
+
+	mkAccount := func(t *testing.T, id int, uuid, email string) store.Account {
+		t.Helper()
+		dir := t.TempDir()
+		if uuid != "" {
+			body := `{"oauthAccount":{"accountUuid":"` + uuid + `","emailAddress":"` + email + `"}}`
+			if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		a := store.Account{ID: id, ConfigDir: dir, KeychainService: keychain.ServiceName(dir), KeychainAccount: "user", OverlayKind: "symlink"}
+		if err := st.UpsertAccount(a); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+
+	a1 := mkAccount(t, 1, "u-1", "a@example.com")
+	mkAccount(t, 2, "u-2", "b@example.com")
+
+	t.Run("matches an already-pooled subscription", func(t *testing.T) {
+		dup, err := m.DuplicateIdentity(Identity{AccountUUID: "u-1", EmailAddress: "a@example.com"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dup == nil || dup.ID != a1.ID {
+			t.Fatalf("DuplicateIdentity(u-1) = %+v, want acct %d", dup, a1.ID)
+		}
+	})
+
+	t.Run("a new subscription returns nil", func(t *testing.T) {
+		dup, err := m.DuplicateIdentity(Identity{AccountUUID: "u-3"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dup != nil {
+			t.Fatalf("DuplicateIdentity(u-3) = %+v, want nil", dup)
+		}
+	})
+
+	t.Run("an account with no readable identity is skipped, not matched", func(t *testing.T) {
+		mkAccount(t, 3, "", "") // no .claude.json
+		dup, err := m.DuplicateIdentity(Identity{AccountUUID: "u-1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dup == nil || dup.ID != 1 {
+			t.Fatalf("got %+v, want acct 1 (the broken acct must be skipped, not error)", dup)
+		}
+	})
+}
+
 func TestInitIdempotentAndMarker(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st := openTestStore(t)

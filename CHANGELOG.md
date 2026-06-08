@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `clp add` detects when a login is the same subscription already in the pool
+  (by accountUuid) and, on a TTY, asks before adding it again; non-interactive
+  runs warn and proceed so automation is never blocked.
+
+### Changed
+- Trimmed the add flow to what the user can act on: dropped the seeding,
+  overlay, and cleanup chatter and the redundant "closed claude" line. "Add
+  another account?" now defaults to yes after the first account, and the closing
+  line just reports the pool total.
+
 ## [0.5.0] - 2026-06-08
 
 ### Removed
