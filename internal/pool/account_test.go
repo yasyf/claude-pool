@@ -1,7 +1,9 @@
 package pool
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -298,6 +300,35 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 			t.Errorf("kept credential was purged: %v", err)
 		}
 	})
+}
+
+// TestFinalizeAddRequiresIdentity pins the anti-adoption gate: a credential can
+// land in an account dir without a real login — with a fresh CLAUDE_CONFIG_DIR
+// claude adopts the global session's secret into the suffixed Keychain item (or
+// the plaintext .credentials.json headless over SSH) at startup, writing no
+// oauthAccount. FinalizeAdd must refuse to register such an account rather than
+// pool a copy of plain claude's login. The gate precedes any credential read,
+// so this is hermetic (no Keychain, no network).
+func TestFinalizeAddRequiresIdentity(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(ClaudeDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Store: openTestStore(t), Keychain: newFakeKeychain()}
+	if _, err := m.Init(); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := m.PrepareAdd() // no ~/.claude.json to seed → no identity
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct, err := m.FinalizeAdd(context.Background(), pending, "")
+	if acct != nil {
+		t.Fatalf("FinalizeAdd returned acct %+v, want nil when no identity was written", acct)
+	}
+	if !errors.Is(err, ErrNoIdentity) {
+		t.Fatalf("FinalizeAdd err = %v, want ErrNoIdentity", err)
+	}
 }
 
 // TestAbandonAddDeletesKeychainItem pins that rolling back a half-added

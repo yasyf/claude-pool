@@ -7,7 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
 )
 
 func TestAwaitLogin(t *testing.T) {
@@ -70,40 +71,31 @@ func TestAwaitLogin(t *testing.T) {
 
 }
 
-func TestNewCredProbe(t *testing.T) {
-	infraErr := errors.New("security: exec format error")
+func TestNewIdentityProbe(t *testing.T) {
+	brokenErr := errors.New("parse .claude.json: unexpected end of JSON input")
 	cases := map[string]struct {
-		discover  func(string) (string, error)
-		writeFile bool // drop a .credentials.json in the probe's configDir
-		want      bool
-		wantErr   error
+		read    func(overlay.Kind, string) (*pool.Identity, error)
+		want    bool
+		wantErr error
 	}{
-		"absent in both backends is not done": {
-			discover: func(string) (string, error) { return "", keychain.ErrNotFound },
+		// A startup adoption copies the global credential but writes no identity.
+		"no identity yet is not done": {
+			read: func(overlay.Kind, string) (*pool.Identity, error) { return nil, pool.ErrNoIdentity },
 		},
-		"present Keychain item is done": {
-			discover: func(string) (string, error) { return "someone", nil },
-			want:     true,
+		"a real login wrote the account identity is done": {
+			read: func(overlay.Kind, string) (*pool.Identity, error) {
+				return &pool.Identity{AccountUUID: "u-1", EmailAddress: "a@example.com"}, nil
+			},
+			want: true,
 		},
-		"no Keychain item but plaintext file present is done": {
-			discover:  func(string) (string, error) { return "", keychain.ErrNotFound },
-			writeFile: true,
-			want:      true,
-		},
-		"infrastructure error aborts": {
-			discover: func(string) (string, error) { return "", infraErr },
-			wantErr:  infraErr,
+		"a broken identity read aborts instead of silently retrying": {
+			read:    func(overlay.Kind, string) (*pool.Identity, error) { return nil, brokenErr },
+			wantErr: brokenErr,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			if tc.writeFile {
-				if err := keychain.WriteFileCredential(dir, &keychain.Credential{ClaudeAiOauth: keychain.OAuth{AccessToken: "at"}}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			probe := newCredProbe(tc.discover, dir, "Claude Code-credentials-deadbeef")
+			probe := newIdentityProbe(tc.read, overlay.KindSymlink, "/cfg")
 			done, err := probe()
 			if done != tc.want || !errors.Is(err, tc.wantErr) {
 				t.Errorf("probe() = %v, %v; want %v, %v", done, err, tc.want, tc.wantErr)

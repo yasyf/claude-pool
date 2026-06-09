@@ -153,6 +153,21 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 // confirms the credential landed, re-asserts ACL ownership, validates with one
 // usage call, and records the account. label is an optional human note.
 func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) (*store.Account, error) {
+	// A completed `claude /login` writes the account's own oauthAccount identity.
+	// A startup adoption of the global credential copies the secret (the Keychain
+	// item, or the plaintext .credentials.json headless over SSH) but writes NO
+	// identity — a missing identity here means the login never completed. Refuse
+	// to register what would be a copy of plain claude's session (invariant: the
+	// pool never adopts plain claude's credential). cc-pool pools Max/Pro OAuth
+	// logins only; a Console/3rd-party login writes no oauthAccount and is
+	// likewise (correctly) refused. The check precedes any credential read.
+	if _, err := AccountIdentity(p.OverlayKind, p.ConfigDir); err != nil {
+		if errors.Is(err, ErrNoIdentity) {
+			return nil, fmt.Errorf("login didn't complete for %s — cc-pool pools Max/Pro (OAuth) logins only and won't register an unverified copy of your main login: %w", p.ConfigDir, ErrNoIdentity)
+		}
+		return nil, fmt.Errorf("read account identity for %s: %w", p.ConfigDir, err)
+	}
+
 	account, src, err := keychain.LocateCredential(p.ConfigDir, p.KeychainService)
 	if errors.Is(err, keychain.ErrNotFound) {
 		return nil, fmt.Errorf("no credential found for %s — was the login completed?", p.ConfigDir)
