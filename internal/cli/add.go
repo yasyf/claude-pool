@@ -6,7 +6,6 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
-	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -249,8 +248,8 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 	if !isTTY() {
 		return nil
 	}
-	if _, _, err := keychain.LocateCredential(pending.ConfigDir, pending.KeychainService); err == nil {
-		// A credential already exists (the kept-existing reuse path): polling
+	if pending.ClaudeJSONSeed == pool.SeedKeptExisting {
+		// The dir already holds a logged-in identity (the reuse path): polling
 		// cannot tell reuse from a fresh login, so keep the explicit confirm.
 		cont := true
 		_ = huh.NewConfirm().
@@ -260,11 +259,7 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 			Run()
 		return nil
 	}
-	if err := waitForCredential(cmd.Context(), out, pending.ConfigDir, pending.KeychainService); err != nil {
-		return err
-	}
-	waitForIdentity(cmd.Context(), pending.OverlayKind, pending.ConfigDir, identityPostExitGrace)
-	return nil
+	return waitForLogin(cmd.Context(), out, pending.OverlayKind, pending.ConfigDir)
 }
 
 // addAnother decides whether the loop continues after a successful add.
