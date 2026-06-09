@@ -183,15 +183,17 @@ func accountName(label string) string {
 	return label
 }
 
-// remainingSuffix renders effective 5h/7d headroom as " · 5h X% · 7d Y%
-// remaining" for the `selected`/`run` diagnostic lines. It returns "" when usage
-// is unknown — a never-sampled pick, or a daemon predating the wire fields — so
-// we never print a fabricated 100%.
-func remainingSuffix(hasUsage bool, eff5, eff7 float64) string {
+// usageSuffix renders raw 5h/7d percent-used as " · 5h X% used · 7d Y% used"
+// for the `select`/`run` diagnostic lines, each figure health-tinted. It returns
+// "" when usage is unknown — a never-sampled pick, or a daemon predating the wire
+// fields — so we never print a fabricated 0%.
+func usageSuffix(hasUsage bool, used5, used7 float64) string {
 	if !hasUsage {
 		return ""
 	}
-	return fmt.Sprintf(" · 5h %.0f%% · 7d %.0f%% remaining", eff5, eff7)
+	pct5 := usageStyle(used5).Render(fmt.Sprintf("%.0f%%", used5))
+	pct7 := usageStyle(used7).Render(fmt.Sprintf("%.0f%%", used7))
+	return dimStyle.Render(" · 5h ") + pct5 + dimStyle.Render(" used · 7d ") + pct7 + dimStyle.Render(" used")
 }
 
 // daemonAccountName resolves a daemon SelectedID to a display name, degrading to

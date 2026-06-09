@@ -142,6 +142,22 @@ func TestImminentResetRanksUp(t *testing.T) {
 	}
 }
 
+// TestSevenDayCreditCapped: a 7-day reset days away earns no credit — its
+// effective remaining equals the plain remaining — while a reset within
+// MaxResetCreditHorizon still lifts it. Before the cap, a reset 2.5 days out
+// forgave ~65% of weekly usage and inflated the rank.
+func TestSevenDayCreditCapped(t *testing.T) {
+	now := time.Now()
+	farReset := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util7d: 73, Resets7d: now.Add(59 * time.Hour)}, now)
+	if got := farReset.Components.Eff7; got != 100-73 {
+		t.Fatalf("7d reset days away should earn no credit: eff7 = %.1f, want plain remaining 27", got)
+	}
+	nearReset := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now, Util7d: 73, Resets7d: now.Add(time.Hour)}, now)
+	if nearReset.Components.Eff7 <= farReset.Components.Eff7 {
+		t.Fatalf("a 7d reset within the horizon should lift eff7: near=%.1f far=%.1f", nearReset.Components.Eff7, farReset.Components.Eff7)
+	}
+}
+
 // TestBarrierGuardsLowSevenDay: a 5h-rich account whose 7-day window is nearly
 // exhausted must rank below a balanced peer (the weighted sum alone would mask it).
 func TestBarrierGuardsLowSevenDay(t *testing.T) {

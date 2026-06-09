@@ -20,6 +20,21 @@ var (
 	okStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 )
 
+// usageStyle tints a 0..100 percent-used figure by health: green below 70%,
+// yellow from 70%, red from 90%. Shared by the usage bars and the select/run
+// heading so both read the same thresholds. For a headroom (free) figure, pass
+// 100−free.
+func usageStyle(usedPct float64) lipgloss.Style {
+	switch {
+	case usedPct >= 90:
+		return badStyle
+	case usedPct >= 70:
+		return warnStyle
+	default:
+		return okStyle
+	}
+}
+
 // The semantic printers below are the single source of truth for line-level
 // output. They all write flush-left with no ad-hoc indentation, so printed
 // lines stay aligned with each other and with the interactive forms.

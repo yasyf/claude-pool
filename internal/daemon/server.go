@@ -297,7 +297,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 				s.recordSticky(req.Cwd, sn.Account.ID)
 				id := sn.Account.ID
 				return Response{OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
-					Eff5: sn.Components.Eff5, Eff7: sn.Components.Eff7, HasUsage: sn.HasUsage}
+					Remaining5h: sn.Remaining5h, Remaining7d: sn.Remaining7d, HasUsage: sn.HasUsage}
 			}
 		}
 		return Response{OK: false, Error: fmt.Sprintf("account %d not found", *req.Account)}
@@ -346,7 +346,7 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}()
 	return Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id, Sticky: sticky,
-		Eff5: best.Components.Eff5, Eff7: best.Components.Eff7, HasUsage: best.HasUsage}
+		Remaining5h: best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage}
 }
 
 // recordSticky upserts the cwd->account sticky record, logging (not failing)

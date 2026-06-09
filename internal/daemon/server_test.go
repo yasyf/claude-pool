@@ -91,9 +91,9 @@ func TestHandleSelectRecordsSticky(t *testing.T) {
 	if resp.Sticky {
 		t.Fatal("first select must not report sticky")
 	}
-	// A sampled pick carries its effective headroom back for the diagnostic line.
-	if !resp.HasUsage || resp.Eff5 <= 0 || resp.Eff7 <= 0 {
-		t.Fatalf("expected headroom on a sampled pick, got HasUsage=%v Eff5=%.1f Eff7=%.1f", resp.HasUsage, resp.Eff5, resp.Eff7)
+	// A sampled pick carries its raw 5h/7d remaining back for the diagnostic line.
+	if !resp.HasUsage || resp.Remaining5h <= 0 || resp.Remaining7d <= 0 {
+		t.Fatalf("expected remaining headroom on a sampled pick, got HasUsage=%v Remaining5h=%.1f Remaining7d=%.1f", resp.HasUsage, resp.Remaining5h, resp.Remaining7d)
 	}
 	st, ok, err := s.m.Store.GetSticky("/proj")
 	if err != nil || !ok || st.AccountID != 1 {

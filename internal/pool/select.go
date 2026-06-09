@@ -39,8 +39,10 @@ type SelectResult struct {
 	Best     store.Account
 	Result   score.Result
 	Ranked   []score.Result
-	Sticky   bool // the pick honored a sticky record rather than the ranking
-	HasUsage bool // the pick has at least one usage sample (false = never sampled)
+	Sticky   bool    // the pick honored a sticky record rather than the ranking
+	HasUsage bool    // the pick has at least one usage sample (false = never sampled)
+	Util5h   float64 // the pick's raw 5h percent used (0 when never sampled)
+	Util7d   float64 // the pick's raw 7d percent used (0 when never sampled)
 	byID     map[int]store.Account
 }
 
@@ -78,14 +80,16 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	if r, ok := m.StickyPick(opts.Cwd, ranked, now); ok {
 		// Best-effort: stickiness must never fail a select.
 		_ = m.RecordSticky(opts.Cwd, r.AccountID, now)
-		return &SelectResult{Best: byID[r.AccountID], Result: r, Ranked: ranked, Sticky: true, HasUsage: inByID[r.AccountID].HasUsage, byID: byID}, nil
+		ri := inByID[r.AccountID]
+		return &SelectResult{Best: byID[r.AccountID], Result: r, Ranked: ranked, Sticky: true, HasUsage: ri.HasUsage, Util5h: ri.Util5h, Util7d: ri.Util7d, byID: byID}, nil
 	}
 	best, ok := score.Pick(ranked)
 	if !ok {
 		return &SelectResult{Ranked: ranked, byID: byID}, ErrNoneAvailable
 	}
 	_ = m.RecordSticky(opts.Cwd, best.AccountID, now) // best-effort, as above
-	return &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked, HasUsage: inByID[best.AccountID].HasUsage, byID: byID}, nil
+	bi := inByID[best.AccountID]
+	return &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked, HasUsage: bi.HasUsage, Util5h: bi.Util5h, Util7d: bi.Util7d, byID: byID}, nil
 }
 
 // sampleStale concurrently refreshes usage for accounts whose latest sample is

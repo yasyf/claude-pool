@@ -32,9 +32,17 @@ var (
 
 	// FiveHourWindow / SevenDayWindow are the window lengths used to credit an
 	// imminent reset: depletion is discounted by how much of the window is still
-	// ahead before it refills.
+	// ahead before it refills, but never further ahead than MaxResetCreditHorizon.
 	FiveHourWindow = 5 * time.Hour
 	SevenDayWindow = 7 * 24 * time.Hour
+
+	// MaxResetCreditHorizon caps how far ahead a reset earns credit, independent
+	// of window length. Without it the 7-day window credits depletion linearly
+	// across its 168h, so a reset 2.5 days out still forgives ~65% of weekly
+	// usage. Capping at one 5-hour session means a weekly reset only lifts
+	// headroom when it lands within the span of work about to start; the 5h
+	// window (already ≤ the cap) is unchanged.
+	MaxResetCreditHorizon = 5 * time.Hour
 
 	// BarrierKnee is the remaining-% below which a convex low-headroom penalty
 	// kicks in (so a nearly-exhausted window can't be masked by the other).
@@ -124,8 +132,10 @@ func Score(in Input, now time.Time) Result {
 	}
 
 	// Reset-aware effective remaining: discount depletion by how much of the
-	// window is still ahead before it refills. frac=1 (reset far/unknown) gives
-	// the plain remaining; frac→0 (imminent reset) gives ~100.
+	// credit horizon is still ahead before the window refills. frac=1 (reset
+	// beyond the horizon or unknown) gives the plain remaining; frac→0 (imminent
+	// reset) gives ~100. The horizon is capped at MaxResetCreditHorizon, so a
+	// weekly reset days away earns no credit.
 	eff5 := 100 - windowFrac(in.Resets5h, now, FiveHourWindow)*util5
 	eff7 := 100 - windowFrac(in.Resets7d, now, SevenDayWindow)*util7
 
@@ -163,14 +173,20 @@ func Score(in Input, now time.Time) Result {
 	}
 }
 
-// windowFrac is the fraction of a usage window still ahead before it resets, in
-// [0,1]. A zero/far reset returns 1 (the depletion counts fully); an imminent
-// reset returns ~0 (the depletion is about to be refilled).
+// windowFrac is the fraction of the credit horizon still ahead before the
+// window resets, in [0,1]. A zero/far reset returns 1 (the depletion counts
+// fully); an imminent reset returns ~0 (the depletion is about to be refilled).
+// The horizon is min(window, MaxResetCreditHorizon), so a reset beyond the cap —
+// e.g. a weekly window resetting days from now — earns no credit.
 func windowFrac(resetsAt, now time.Time, window time.Duration) float64 {
 	if resetsAt.IsZero() || window <= 0 {
 		return 1
 	}
-	frac := resetsAt.Sub(now).Seconds() / window.Seconds()
+	horizon := window
+	if horizon > MaxResetCreditHorizon {
+		horizon = MaxResetCreditHorizon
+	}
+	frac := resetsAt.Sub(now).Seconds() / horizon.Seconds()
 	switch {
 	case frac < 0:
 		return 0

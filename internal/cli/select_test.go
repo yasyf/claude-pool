@@ -30,9 +30,9 @@ func selectTestManager(t *testing.T) *pool.Manager {
 // TestSelectionLine pins the wording of the shared selection diagnostic and its
 // degraded fallbacks. The daemon's SelectedID resolves to the account label; a
 // sticky pick is labelled "Reusing … (pinned)"; an unknown/absent id degrades to
-// a generic "account"; and a sampled pick (HasUsage) gets its effective 5h/7d
-// headroom appended, while an unsampled one stays headroom-free (no fabricated
-// 100%).
+// a generic "account"; and a sampled pick (HasUsage) gets its raw 5h/7d usage
+// appended (100−remaining), while an unsampled one stays usage-free (no
+// fabricated 0%). ANSI is stripped so the assertions hold regardless of TTY.
 func TestSelectionLine(t *testing.T) {
 	m := selectTestManager(t)
 	id := 5
@@ -46,13 +46,13 @@ func TestSelectionLine(t *testing.T) {
 		"named sticky, no usage":  {daemon.Response{SelectedID: &id, Sticky: true}, "Reusing work@example.com (pinned)"},
 		"nil id degrades":         {daemon.Response{}, "Selected account"},
 		"unknown id degrades":     {daemon.Response{SelectedID: &missing}, "Selected account"},
-		"named with usage":        {daemon.Response{SelectedID: &id, HasUsage: true, Eff5: 87, Eff7: 92}, "Selected work@example.com · 5h 87% · 7d 92% remaining"},
-		"named sticky with usage": {daemon.Response{SelectedID: &id, Sticky: true, HasUsage: true, Eff5: 87, Eff7: 92}, "Reusing work@example.com (pinned) · 5h 87% · 7d 92% remaining"},
+		"named with usage":        {daemon.Response{SelectedID: &id, HasUsage: true, Remaining5h: 96, Remaining7d: 27}, "Selected work@example.com · 5h 4% used · 7d 73% used"},
+		"named sticky with usage": {daemon.Response{SelectedID: &id, Sticky: true, HasUsage: true, Remaining5h: 96, Remaining7d: 27}, "Reusing work@example.com (pinned) · 5h 4% used · 7d 73% used"},
 	}
 	for name, tc := range cases {
 		tc := tc
 		t.Run(name, func(t *testing.T) {
-			if got := daemonSelectionLine(m, &tc.resp); got != tc.want {
+			if got := stripANSI(daemonSelectionLine(m, &tc.resp)); got != tc.want {
 				t.Errorf("daemonSelectionLine = %q, want %q", got, tc.want)
 			}
 		})

@@ -61,10 +61,10 @@ type Response struct {
 	Error        string          `json:"error,omitempty"`
 	Dir          string          `json:"dir,omitempty"` // select: chosen config dir
 	SelectedID   *int            `json:"selected_id,omitempty"`
-	Sticky       bool            `json:"sticky,omitempty"`    // select honored a sticky record
-	Eff5         float64         `json:"eff_5h,omitempty"`    // select: effective 5h remaining of the pick
-	Eff7         float64         `json:"eff_7d,omitempty"`    // select: effective 7d remaining of the pick
-	HasUsage     bool            `json:"has_usage,omitempty"` // select: false if the pick was never sampled
+	Sticky       bool            `json:"sticky,omitempty"`       // select honored a sticky record
+	Remaining5h  float64         `json:"remaining_5h,omitempty"` // select: raw 5h remaining (100−used) of the pick
+	Remaining7d  float64         `json:"remaining_7d,omitempty"` // select: raw 7d remaining (100−used) of the pick
+	HasUsage     bool            `json:"has_usage,omitempty"`    // select: false if the pick was never sampled
 	Accounts     []AccountStatus `json:"accounts,omitempty"`  // status
 	Version      string          `json:"version,omitempty"`   // health
 	SoonestReset *time.Time      `json:"soonest_reset,omitempty"`

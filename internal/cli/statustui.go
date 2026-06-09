@@ -258,9 +258,13 @@ func (t statusTUI) renderDetail() string {
 	b.WriteByte('\n')
 	b.WriteString(fmt.Sprintf("score %.1f\n", s.Score))
 
-	// Positive contributions: reset-aware free headroom × its weight.
-	b.WriteString(fmt.Sprintf("  5h  %3.0f%% free  ×%.2f  = %+5.1f\n", c.Eff5, score.W5h, c.Remaining5h))
-	b.WriteString(fmt.Sprintf("  7d  %3.0f%% free  ×%.2f  = %+5.1f\n", c.Eff7, score.W7d, c.Remaining7d))
+	// Positive contributions: reset-aware effective headroom × its weight. Labeled
+	// "effective" (not "free") because the reset credit can lift it above the raw
+	// remaining shown by the usage bars below; tinted by how depleted it is.
+	eff5Str := usageStyle(100 - c.Eff5).Render(fmt.Sprintf("%3.0f%%", c.Eff5))
+	eff7Str := usageStyle(100 - c.Eff7).Render(fmt.Sprintf("%3.0f%%", c.Eff7))
+	b.WriteString(fmt.Sprintf("  5h  %s effective  ×%.2f  = %+5.1f\n", eff5Str, score.W5h, c.Remaining5h))
+	b.WriteString(fmt.Sprintf("  7d  %s effective  ×%.2f  = %+5.1f\n", eff7Str, score.W7d, c.Remaining7d))
 
 	// Penalties, only the ones actually engaged.
 	var pen []string
@@ -329,13 +333,6 @@ func usageBar(usedPct float64, width int) string {
 	if filled > width {
 		filled = width
 	}
-	fill := okStyle
-	switch {
-	case usedPct >= 90:
-		fill = badStyle
-	case usedPct >= 70:
-		fill = warnStyle
-	}
-	bar := fill.Render(strings.Repeat("█", filled)) + dimStyle.Render(strings.Repeat("░", width-filled))
+	bar := usageStyle(usedPct).Render(strings.Repeat("█", filled)) + dimStyle.Render(strings.Repeat("░", width-filled))
 	return "▕" + bar + "▏"
 }

@@ -87,7 +87,8 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		}
 		_ = m.RecordSticky(req.cwd, a.ID, time.Now()) // anchor future selects here
 		dir, err := prepareAccount(cmd, m, a)
-		return dir, fmt.Sprintf("Selected %s", accountName(a.Label)), err
+		// Forced pick: no scoring, so no usage to report (hasUsage=false → bare name).
+		return dir, selectionLine(accountName(a.Label), false, false, 0, 0), err
 	}
 
 	// Fast path: the daemon's cached, reserved pick. EnsureRunning keeps a daemon
@@ -179,24 +180,25 @@ func announceLine(cmd *cobra.Command, line string) {
 }
 
 // selectionLine formats the selection diagnostic: "Selected <name>", or
-// "Reusing <name> (pinned)" for a sticky pick, plus effective 5h/7d headroom when
-// known.
-func selectionLine(name string, sticky, hasUsage bool, eff5, eff7 float64) string {
+// "Reusing <name> (pinned)" for a sticky pick, plus raw 5h/7d percent-used when
+// known. The account name is accented and the usage figures health-tinted.
+func selectionLine(name string, sticky, hasUsage bool, used5, used7 float64) string {
 	verb := "Selected"
+	styledName := bestStyle.Render(name)
 	if sticky {
 		verb = "Reusing"
-		name += " (pinned)"
+		styledName += dimStyle.Render(" (pinned)")
 	}
-	return fmt.Sprintf("%s %s%s", verb, name, remainingSuffix(hasUsage, eff5, eff7))
+	return fmt.Sprintf("%s %s%s", verb, styledName, usageSuffix(hasUsage, used5, used7))
 }
 
 // daemonSelectionLine builds the diagnostic from a daemon select reply: the name
-// resolved from SelectedID (degrading to "account") plus its effective headroom.
+// resolved from SelectedID (degrading to "account") plus its raw 5h/7d usage.
 func daemonSelectionLine(m *pool.Manager, resp *daemon.Response) string {
-	return selectionLine(daemonAccountName(m, resp.SelectedID), resp.Sticky, resp.HasUsage, resp.Eff5, resp.Eff7)
+	return selectionLine(daemonAccountName(m, resp.SelectedID), resp.Sticky, resp.HasUsage, 100-resp.Remaining5h, 100-resp.Remaining7d)
 }
 
 // liveSelectionLine builds the diagnostic from a live scoring result.
 func liveSelectionLine(sr *pool.SelectResult) string {
-	return selectionLine(accountName(sr.Best.Label), sr.Sticky, sr.HasUsage, sr.Result.Components.Eff5, sr.Result.Components.Eff7)
+	return selectionLine(accountName(sr.Best.Label), sr.Sticky, sr.HasUsage, sr.Util5h, sr.Util7d)
 }
