@@ -73,16 +73,22 @@ func TestAwaitLogin(t *testing.T) {
 func TestNewCredProbe(t *testing.T) {
 	infraErr := errors.New("security: exec format error")
 	cases := map[string]struct {
-		discover func(string) (string, error)
-		want     bool
-		wantErr  error
+		discover  func(string) (string, error)
+		writeFile bool // drop a .credentials.json in the probe's configDir
+		want      bool
+		wantErr   error
 	}{
-		"absent item is not done": {
+		"absent in both backends is not done": {
 			discover: func(string) (string, error) { return "", keychain.ErrNotFound },
 		},
-		"present item is done": {
+		"present Keychain item is done": {
 			discover: func(string) (string, error) { return "someone", nil },
 			want:     true,
+		},
+		"no Keychain item but plaintext file present is done": {
+			discover:  func(string) (string, error) { return "", keychain.ErrNotFound },
+			writeFile: true,
+			want:      true,
 		},
 		"infrastructure error aborts": {
 			discover: func(string) (string, error) { return "", infraErr },
@@ -91,7 +97,13 @@ func TestNewCredProbe(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			probe := newCredProbe(tc.discover, "Claude Code-credentials-deadbeef")
+			dir := t.TempDir()
+			if tc.writeFile {
+				if err := keychain.WriteFileCredential(dir, &keychain.Credential{ClaudeAiOauth: keychain.OAuth{AccessToken: "at"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			probe := newCredProbe(tc.discover, dir, "Claude Code-credentials-deadbeef")
 			done, err := probe()
 			if done != tc.want || !errors.Is(err, tc.wantErr) {
 				t.Errorf("probe() = %v, %v; want %v, %v", done, err, tc.want, tc.wantErr)

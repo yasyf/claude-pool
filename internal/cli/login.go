@@ -68,22 +68,26 @@ func awaitLogin(ctx context.Context, procExit <-chan error, probe func() (bool, 
 // discoverFunc matches keychain.DiscoverAccount; injectable for tests.
 type discoverFunc func(service string) (string, error)
 
-// newCredProbe returns a probe reporting the suffixed item's appearance. It is
-// only used when no item exists at watch start (PrepareAdd purges stale ones):
+// newCredProbe returns a probe reporting the credential's appearance in either
+// backend — the suffixed Keychain item or claude's plaintext .credentials.json
+// (written when the Keychain is unavailable, e.g. headless). It is only used
+// when no credential exists at watch start (PrepareAdd purges stale ones):
 // secret CHANGE is deliberately not a signal — claude rewrites a pre-existing
 // item for non-login reasons (startup token refresh, dead-token clearing), so
-// a pre-existing item disables watching entirely (see runWatchedLogin). Probe
-// errors propagate; a broken keychain must not become a silent retry loop.
-func newCredProbe(discover discoverFunc, service string) func() (bool, error) {
+// a pre-existing credential disables watching entirely (see runWatchedLogin).
+// Probe errors propagate; a broken keychain must not become a silent retry loop.
+func newCredProbe(discover discoverFunc, configDir, service string) func() (bool, error) {
 	return func() (bool, error) {
 		_, err := discover(service)
-		if errors.Is(err, keychain.ErrNotFound) {
-			return false, nil
+		if err == nil {
+			return true, nil
 		}
-		if err != nil {
+		if !errors.Is(err, keychain.ErrNotFound) {
 			return false, err
 		}
-		return true, nil
+		// Nothing in the Keychain yet; claude may have written its plaintext
+		// credential file instead (Keychain-unavailable / headless session).
+		return keychain.FileCredentialExists(configDir), nil
 	}
 }
 
@@ -104,7 +108,7 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 		return fmt.Errorf("`claude` not found on PATH: %w", err)
 	}
 	watch := false
-	switch _, err := keychain.DiscoverAccount(p.KeychainService); {
+	switch _, _, err := keychain.LocateCredential(p.ConfigDir, p.KeychainService); {
 	case errors.Is(err, keychain.ErrNotFound):
 		watch = true
 	case err != nil:
@@ -131,7 +135,7 @@ func runWatchedLogin(ctx context.Context, cmd *cobra.Command, p *pool.PendingAdd
 		return werr
 	}
 
-	probe := newCredProbe(keychain.DiscoverAccount, p.KeychainService)
+	probe := newCredProbe(keychain.DiscoverAccount, p.ConfigDir, p.KeychainService)
 	outcome, werr := awaitLogin(ctx, procExit, probe, loginPollInterval)
 	switch outcome {
 	case awaitExited:
@@ -207,10 +211,11 @@ func waitForIdentity(ctx context.Context, kind overlay.Kind, configDir string, g
 	}
 }
 
-// waitForCredential polls until the (suffixed) item for service appears,
+// waitForCredential polls until the account's credential appears in either
+// backend (the suffixed Keychain item or claude's plaintext .credentials.json),
 // showing a one-line spinner. Used by the manual login path; unbounded — the
 // user may take arbitrarily long in another terminal, and ^C cancels.
-func waitForCredential(ctx context.Context, out io.Writer, service string) error {
+func waitForCredential(ctx context.Context, out io.Writer, configDir, service string) error {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	ticker := time.NewTicker(loginPollInterval)
 	defer ticker.Stop()
@@ -221,7 +226,7 @@ func waitForCredential(ctx context.Context, out io.Writer, service string) error
 			fmt.Fprint(out, "\r\x1b[K")
 			return ctx.Err()
 		case <-ticker.C:
-			_, err := keychain.DiscoverAccount(service)
+			_, _, err := keychain.LocateCredential(configDir, service)
 			if errors.Is(err, keychain.ErrNotFound) {
 				continue
 			}

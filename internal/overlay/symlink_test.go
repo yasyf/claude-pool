@@ -25,6 +25,11 @@ func makeBase(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(base, ".claude.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Plain claude's plaintext credential store (Keychain-unavailable fallback)
+	// must never be linked into accounts — sharing it leaks the live OAuth token.
+	if err := os.WriteFile(filepath.Join(base, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"plain-claude"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(base, ".DS_Store"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -76,8 +81,45 @@ func TestSymlinkSetupSharesAndExcludes(t *testing.T) {
 		t.Errorf("base .claude.json should not be linked into the account dir")
 	}
 
+	// Base's .credentials.json (plain claude's live OAuth token) is never linked
+	// or copied into the account dir.
+	if _, err := os.Lstat(filepath.Join(acct, ".credentials.json")); !os.IsNotExist(err) {
+		t.Errorf("base .credentials.json must never be visible in an account dir")
+	}
+
 	if err := p.Health(base, acct); err != nil {
 		t.Fatalf("Health after setup: %v", err)
+	}
+}
+
+// TestCredentialsFileNeverShared pins the safety fix: plain claude's plaintext
+// credential file (used when the Keychain is unavailable, e.g. a headless SSH
+// session) must never be symlinked into a pool account dir — doing so would let
+// `claude /login` adopt plain claude's login and a refresh mutate it. The base
+// file must stay exactly as written.
+func TestCredentialsFileNeverShared(t *testing.T) {
+	base := makeBase(t)
+	want, err := os.ReadFile(filepath.Join(base, ".credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct := filepath.Join(t.TempDir(), "acct-01")
+	p := &SymlinkProvider{}
+	if err := p.Setup(base, acct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(acct, ".credentials.json")); !os.IsNotExist(err) {
+		t.Fatalf("plain claude's .credentials.json was shared into the account dir")
+	}
+	// Re-sync (the daemon poll) must keep ignoring it.
+	if err := p.Sync(base, acct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(acct, ".credentials.json")); !os.IsNotExist(err) {
+		t.Fatalf("Sync linked .credentials.json into the account dir")
+	}
+	if got, _ := os.ReadFile(filepath.Join(base, ".credentials.json")); string(got) != string(want) {
+		t.Fatalf("base .credentials.json was modified: got %q, want %q", got, want)
 	}
 }
 
@@ -136,6 +178,9 @@ func TestPrivateEntry(t *testing.T) {
 		".claude.json":                   true,
 		".claude.json.tmp.ab12cd34":      true,
 		".claude.json.backup.123":        true,
+		".credentials.json":              true,
+		".credentials.json.tmp.ab12cd34": true,
+		".credentials.json.lock":         true,
 		".last-update-result.json":       true,
 		".last-update-result.json.tmp.x": true,
 		"daemon":                         true,
@@ -145,6 +190,7 @@ func TestPrivateEntry(t *testing.T) {
 		"settings.json":                  false,
 		".claude":                        false,
 		"claude.json":                    false,
+		"credentials.json":               false,
 	}
 	for name, want := range cases {
 		if got := PrivateEntry(name); got != want {

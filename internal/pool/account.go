@@ -153,7 +153,7 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 // confirms the credential landed, re-asserts ACL ownership, validates with one
 // usage call, and records the account. label is an optional human note.
 func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) (*store.Account, error) {
-	account, err := keychain.DiscoverAccount(p.KeychainService)
+	account, src, err := keychain.LocateCredential(p.ConfigDir, p.KeychainService)
 	if errors.Is(err, keychain.ErrNotFound) {
 		return nil, fmt.Errorf("no credential found for %s — was the login completed?", p.ConfigDir)
 	} else if err != nil {
@@ -161,9 +161,12 @@ func (m *Manager) FinalizeAdd(ctx context.Context, p *PendingAdd, label string) 
 	}
 
 	// Re-assert: read the item Claude wrote and write it straight back so our
-	// tooling owns the ACL for prompt-free refresh thereafter.
-	if _, err := keychain.Reassert(p.KeychainService, account); err != nil {
-		return nil, fmt.Errorf("re-assert keychain item: %w", err)
+	// tooling owns the ACL for prompt-free refresh thereafter. Only the Keychain
+	// item has an ACL; the plaintext file backend is read directly.
+	if src == keychain.SourceKeychain {
+		if _, err := keychain.Reassert(p.KeychainService, account); err != nil {
+			return nil, fmt.Errorf("re-assert keychain item: %w", err)
+		}
 	}
 
 	acct := store.Account{

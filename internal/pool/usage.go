@@ -29,7 +29,44 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 		return nil, false, err
 	}
 	defer release()
-	return m.ensureFreshToken(ctx, a, within, allowRefresh)
+	cred, _, refreshed, err := m.ensureFreshToken(ctx, a, within, allowRefresh)
+	return cred, refreshed, err
+}
+
+// readCred returns a's credential from whichever backend currently holds it —
+// the Keychain first (claude's own preference whenever it is reachable), else
+// the plaintext $CONFIG_DIR/.credentials.json file claude writes when the
+// Keychain is unavailable (a headless SSH session) — plus that source, so a
+// refresh writes the new token back to the same place rather than splitting an
+// account across backends.
+func (m *Manager) readCred(a store.Account) (*keychain.Credential, keychain.Source, error) {
+	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
+	if err == nil {
+		return cred, keychain.SourceKeychain, nil
+	}
+	if !errors.Is(err, keychain.ErrNotFound) {
+		return nil, keychain.SourceKeychain, err
+	}
+	fcred, ferr := keychain.ReadFileCredential(a.ConfigDir)
+	if ferr != nil {
+		return nil, keychain.SourceKeychain, ferr
+	}
+	return fcred, keychain.SourceFile, nil
+}
+
+// writeCred persists cred to src — the backend readCred resolved — so refresh
+// never moves an account between the Keychain and its plaintext file.
+func (m *Manager) writeCred(a store.Account, src keychain.Source, cred *keychain.Credential) error {
+	if src == keychain.SourceFile {
+		if err := keychain.WriteFileCredential(a.ConfigDir, cred); err != nil {
+			return fmt.Errorf("write credential to %s: %w", keychain.FileCredentialPath(a.ConfigDir), err)
+		}
+		return nil
+	}
+	if err := m.Keychain.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
+		return fmt.Errorf("write credential to %q: %w", a.KeychainService, err)
+	}
+	return nil
 }
 
 // ensureFreshToken is EnsureFreshToken's body; split out so SampleUsage can
@@ -38,29 +75,29 @@ func (m *Manager) EnsureFreshToken(ctx context.Context, a store.Account, within 
 // (lockAccount). The credential is (re-)read here, inside the lock, so a waiter
 // that wins the lock after a peer rotated the token sees the fresh blob and
 // returns it without a second refresh POST.
-func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, bool, error) {
-	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
+func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within time.Duration, allowRefresh bool) (*keychain.Credential, keychain.Source, bool, error) {
+	cred, src, err := m.readCred(a)
 	if err != nil {
-		return nil, false, err
+		return nil, src, false, err
 	}
 	if !cred.ExpiresWithin(within) || !allowRefresh {
-		return cred, false, nil
+		return cred, src, false, nil
 	}
 	if !cred.HasRefreshToken() {
-		return cred, false, ErrNeedsLogin
+		return cred, src, false, ErrNeedsLogin
 	}
-	refreshed, err := m.refresh(ctx, a, cred)
+	refreshed, err := m.refresh(ctx, a, src, cred)
 	if err != nil {
 		_ = m.Store.LogRefresh(a.ID, false, err.Error())
 		var re *oauth.RefreshError
 		if errors.As(err, &re) && re.Revoked() {
-			return cred, false, ErrNeedsLogin
+			return cred, src, false, ErrNeedsLogin
 		}
 		// Transient: fall back to the (stale) credential we have.
-		return cred, false, err
+		return cred, src, false, err
 	}
 	_ = m.Store.LogRefresh(a.ID, true, "")
-	return refreshed, true, nil
+	return refreshed, src, true, nil
 }
 
 // refresh performs the OAuth refresh and persists the new blob, preserving the
@@ -68,7 +105,7 @@ func (m *Manager) ensureFreshToken(ctx context.Context, a store.Account, within 
 // lock (lockAccount).
 // Every account runs its own token chain, created by its own `claude /login`, so
 // refreshing a pool account's credential never affects plain claude.
-func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.Credential) (*keychain.Credential, error) {
+func (m *Manager) refresh(ctx context.Context, a store.Account, src keychain.Source, prev *keychain.Credential) (*keychain.Credential, error) {
 	tr, err := m.OAuth.Refresh(ctx, fmt.Sprintf("acct-%d", a.ID), prev.ClaudeAiOauth.RefreshToken)
 	if err != nil {
 		return nil, err
@@ -79,30 +116,28 @@ func (m *Manager) refresh(ctx context.Context, a store.Account, prev *keychain.C
 		next.ClaudeAiOauth.RefreshToken = tr.RefreshToken
 	}
 	next.ClaudeAiOauth.ExpiresAt = tr.Expiry(time.Now()).UnixMilli()
-	if err := m.Keychain.Write(a.KeychainService, a.KeychainAccount, next); err != nil {
-		return nil, fmt.Errorf("write credential to %q: %w", a.KeychainService, err)
+	if err := m.writeCred(a, src, next); err != nil {
+		return nil, err
 	}
 	return next, nil
 }
 
-// AdoptRotatedToken re-reads an account's credential from the Keychain (where a
-// live claude session may have rotated it) and writes it straight back,
-// re-asserting our `security`-trusted ACL over the rotated item. Used by the
-// daemon on session check-in.
+// AdoptRotatedToken re-reads an account's credential from its backend (where a
+// live claude session may have rotated it) and writes it straight back. For a
+// Keychain item this re-asserts our `security`-trusted ACL over the rotated
+// item; for the plaintext file backend it is a harmless rewrite (no ACL).
+// Used by the daemon on session check-in.
 func (m *Manager) AdoptRotatedToken(ctx context.Context, a store.Account) error {
 	release, err := m.lockAccount(ctx, a.ID)
 	if err != nil {
 		return err
 	}
 	defer release()
-	cred, err := m.Keychain.Read(a.KeychainService, a.KeychainAccount)
+	cred, src, err := m.readCred(a)
 	if err != nil {
 		return err
 	}
-	if err := m.Keychain.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
-		return fmt.Errorf("write credential to %q: %w", a.KeychainService, err)
-	}
-	return nil
+	return m.writeCred(a, src, cred)
 }
 
 // SampleUsage fetches the account's usage windows, refreshing once on 401, and
@@ -127,19 +162,19 @@ func (m *Manager) sampleUsage(ctx context.Context, a store.Account, allowRefresh
 		return nil, false, err
 	}
 	defer release()
-	cred, _, err := m.ensureFreshToken(ctx, a, RefreshLeadTime, allowRefresh)
+	cred, src, _, err := m.ensureFreshToken(ctx, a, RefreshLeadTime, allowRefresh)
 	if err != nil && !errors.Is(err, ErrNeedsLogin) {
 		// Even on transient refresh failure we may still have a usable token.
 		if cred == nil {
 			return nil, false, err
 		}
 	}
-	return m.fetchUsage(ctx, a, cred, allowRefresh)
+	return m.fetchUsage(ctx, a, src, cred, allowRefresh)
 }
 
 // fetchUsage fetches usage, refreshing once on 401. Caller must hold the
 // per-account lock (lockAccount).
-func (m *Manager) fetchUsage(ctx context.Context, a store.Account, cred *keychain.Credential, allowRefresh bool) (*oauth.Usage, bool, error) {
+func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.Source, cred *keychain.Credential, allowRefresh bool) (*oauth.Usage, bool, error) {
 	usage, err := m.OAuth.Usage(ctx, cred.ClaudeAiOauth.AccessToken)
 	if err == nil {
 		return usage, false, nil
@@ -150,7 +185,7 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, cred *keychai
 			return &oauth.Usage{}, true, nil
 		}
 		if ue.Unauthorized() && allowRefresh && cred.HasRefreshToken() {
-			refreshed, rerr := m.refresh(ctx, a, cred)
+			refreshed, rerr := m.refresh(ctx, a, src, cred)
 			if rerr == nil {
 				if usage, err2 := m.OAuth.Usage(ctx, refreshed.ClaudeAiOauth.AccessToken); err2 == nil {
 					_ = m.Store.LogRefresh(a.ID, true, "")

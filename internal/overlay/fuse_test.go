@@ -75,6 +75,8 @@ func TestMirrorRealRedirectsLocalEntries(t *testing.T) {
 	cases := map[string]string{
 		"/.claude.json":              "/priv/.claude.json",
 		"/.claude.json.tmp.ab12cd34": "/priv/.claude.json.tmp.ab12cd34",
+		"/.credentials.json":         "/priv/.credentials.json",
+		"/.credentials.json.lock":    "/priv/.credentials.json.lock",
 		"/backups":                   "/priv/backups",
 		"/backups/x.bak":             "/priv/backups/x.bak",
 		"/daemon/roster.json":        "/priv/daemon/roster.json",

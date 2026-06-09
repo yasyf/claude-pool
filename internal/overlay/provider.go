@@ -49,12 +49,19 @@ var skipEntries = map[string]bool{
 // the excluded dirs above, plus claude's primary state file .claude.json and
 // its atomic-write temp files (.claude.json.tmp.XXXX), which hold per-account
 // identity (oauthAccount) and must never be shared or land in the base; plus
-// .last-update-result.json (claude's auto-update result, instance-local), which
-// claude rewrites atomically — replacing the overlay's symlink with a real file
-// that Sync would otherwise refuse to relink on every poll.
+// .credentials.json (and its temp/lock siblings), claude's plaintext credential
+// store — the OAuth token blob it writes to $CONFIG_DIR/.credentials.json when
+// the macOS Keychain is unavailable (e.g. a headless SSH session). Sharing it
+// would symlink plain claude's live credential into a pool account, so
+// `claude /login` would adopt plain claude's login and a refresh would mutate
+// it — the exact thing the pool must never do. Plus .last-update-result.json
+// (claude's auto-update result, instance-local), which claude rewrites
+// atomically — replacing the overlay's symlink with a real file that Sync would
+// otherwise refuse to relink on every poll.
 func PrivateEntry(name string) bool {
-	return ExcludedEntries[name] || name == ".claude.json" ||
-		strings.HasPrefix(name, ".claude.json.") ||
+	return ExcludedEntries[name] ||
+		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
+		name == ".credentials.json" || strings.HasPrefix(name, ".credentials.json.") ||
 		strings.HasPrefix(name, ".last-update-result")
 }
 

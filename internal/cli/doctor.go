@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 
@@ -77,19 +78,29 @@ func newDoctorCmd() *cobra.Command {
 func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool, report func(string, bool, string)) {
 	prefix := fmt.Sprintf("acct-%02d", a.ID)
 
-	// Keychain item readable.
-	if _, err := keychain.Read(a.KeychainService, a.KeychainAccount); err != nil {
-		if fix {
-			if _, rerr := keychain.Reassert(a.KeychainService, a.KeychainAccount); rerr == nil {
-				report(prefix+" keychain", true, "re-asserted")
-			} else {
-				report(prefix+" keychain", false, rerr.Error())
-			}
-		} else {
-			report(prefix+" keychain", false, err.Error())
-		}
-	} else {
+	// Credential usable: the Keychain item (readable under our ACL) or, when the
+	// Keychain is unavailable (e.g. headless), claude's plaintext
+	// .credentials.json fallback.
+	_, kerr := keychain.Read(a.KeychainService, a.KeychainAccount)
+	switch {
+	case kerr == nil:
 		report(prefix+" keychain", true, "")
+	case errors.Is(kerr, keychain.ErrNotFound):
+		// No Keychain item; accept the plaintext file backend if claude wrote one.
+		if _, ferr := keychain.ReadFileCredential(a.ConfigDir); ferr == nil {
+			report(prefix+" credential", true, "file")
+		} else {
+			report(prefix+" credential", false, kerr.Error())
+		}
+	case fix:
+		// Item exists but our ACL can't read it (-w denied): re-assert ownership.
+		if _, rerr := keychain.Reassert(a.KeychainService, a.KeychainAccount); rerr == nil {
+			report(prefix+" keychain", true, "re-asserted")
+		} else {
+			report(prefix+" keychain", false, rerr.Error())
+		}
+	default:
+		report(prefix+" keychain", false, kerr.Error())
 	}
 
 	// Overlay health.

@@ -249,9 +249,9 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 	if !isTTY() {
 		return nil
 	}
-	if _, err := keychain.DiscoverAccount(pending.KeychainService); err == nil {
-		// An item already exists (the kept-existing reuse path): polling cannot
-		// tell reuse from a fresh login, so keep the explicit confirm.
+	if _, _, err := keychain.LocateCredential(pending.ConfigDir, pending.KeychainService); err == nil {
+		// A credential already exists (the kept-existing reuse path): polling
+		// cannot tell reuse from a fresh login, so keep the explicit confirm.
 		cont := true
 		_ = huh.NewConfirm().
 			Title("Press enter when the login is done").
@@ -260,7 +260,7 @@ func loginFlow(cmd *cobra.Command, pending *pool.PendingAdd, opts addOptions) er
 			Run()
 		return nil
 	}
-	if err := waitForCredential(cmd.Context(), out, pending.KeychainService); err != nil {
+	if err := waitForCredential(cmd.Context(), out, pending.ConfigDir, pending.KeychainService); err != nil {
 		return err
 	}
 	waitForIdentity(cmd.Context(), pending.OverlayKind, pending.ConfigDir, identityPostExitGrace)
