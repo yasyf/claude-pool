@@ -8,8 +8,30 @@ permissions:
   contents: write
 
 jobs:
+  verify-on-main:
+    # Only commits that live on main may be released. A vX.Y.Z tag is built and
+    # published from its own commit, so if that commit isn't reachable from main
+    # (e.g. a `git push` of main lost a race and the tag went out anyway, or the
+    # tag was cut from a side branch) the release would not reflect main's
+    # history. Fail fast — before any macOS runner spins up — and make the rest
+    # of the pipeline depend on this.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history so merge-base can reach the common ancestor
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main — only commits on main can be released. Push the commit to main first, then re-tag."
+            exit 1
+          fi
+          echo "ok: ${GITHUB_SHA} is contained in main"
+
   build:
     runs-on: macos-15
+    needs: verify-on-main
     outputs:
       pure_sha256: ${{ steps.shas.outputs.pure }}
       fuse_sha256: ${{ steps.shas.outputs.fuse }}
