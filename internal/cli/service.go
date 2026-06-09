@@ -168,21 +168,31 @@ func ensureDaemon(cmd *cobra.Command) {
 	if resp, err := cl.Health(); err == nil && resp.OK {
 		// A version-skewed daemon answers here: launchd's KeepAlive holding a
 		// pre-upgrade image, or a detached EnsureRunning spawn launchd never
-		// tracked. Evict it over the socket — `brew services stop` (launchctl
-		// bootout) cannot kill a process launchd does not own.
+		// tracked.
 		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon to pick up the new version…")
-		if _, err := cl.Shutdown(); err != nil {
-			warn(cmd.ErrOrStderr(), "couldn't ask the old daemon to step down: %v", err)
-		}
-		if !cl.WaitGone(evictTimeout) {
-			warn(cmd.ErrOrStderr(),
-				"the old daemon (%s) won't release the socket; kill it once: pkill -f 'cc-pool daemon'", resp.Version)
-		}
+		// Bootout first: for a launchd-tracked daemon this terminates it (its
+		// signal handler is still armed, so it unmounts cleanly) and disables
+		// KeepAlive so launchd can't respawn the pre-upgrade image under us. A
+		// no-op for an orphan launchd never tracked.
 		if service.IsBrewManaged() {
-			// Bookkeeping only: clears launchd's record so the restart below
-			// re-bootstraps cleanly. The Shutdown above already evicted the
-			// process (which BrewStop could not, were it an orphan).
 			_ = service.BrewStop()
+		} else {
+			_ = service.Uninstall()
+		}
+		// An orphan survives bootout. Ask it to step down over the socket (its one
+		// clean-teardown path); if it still won't let go, kill the exact process on
+		// the other end of the socket — what the old `pkill` hint did by hand.
+		if !cl.WaitGone(evictTimeout) {
+			_, _ = cl.Shutdown()
+			if !cl.WaitGone(evictTimeout) {
+				if _, err := cl.KillHolder(); err != nil {
+					warn(cmd.ErrOrStderr(), "couldn't evict the old daemon (%s): %v", resp.Version, err)
+				}
+				if !cl.WaitGone(evictTimeout) {
+					warn(cmd.ErrOrStderr(),
+						"the old daemon (%s) still won't release the socket; check `ccp service status`", resp.Version)
+				}
+			}
 		}
 	} else {
 		step(cmd.OutOrStdout(), "Starting the cc-pool daemon…")

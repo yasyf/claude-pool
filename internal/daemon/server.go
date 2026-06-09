@@ -206,7 +206,14 @@ func (s *Server) evictHolder() error {
 		return fmt.Errorf("evict holder %s: %w", resp.Version, err)
 	}
 	if !c.WaitGone(s.evictTimeout) {
-		return fmt.Errorf("holder %s did not release the socket within %s", resp.Version, s.evictTimeout)
+		// Acked OpShutdown but wedged: kill the exact socket holder so we can
+		// rebind, rather than exiting and leaving launchd to retry against it.
+		if _, err := c.KillHolder(); err != nil {
+			s.log.Printf("kill holder: %v", err)
+		}
+		if !c.WaitGone(s.evictTimeout) {
+			return fmt.Errorf("holder %s did not release the socket within %s", resp.Version, s.evictTimeout)
+		}
 	}
 	return nil
 }

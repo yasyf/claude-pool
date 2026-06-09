@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -87,6 +88,7 @@ func TestListenRefusesSameVersionHolder(t *testing.T) {
 // TestListenEvictsSkewedHolder pins the load-bearing fix: a version-skewed
 // holder that steps down on OpShutdown is evicted and the successor binds.
 func TestListenEvictsSkewedHolder(t *testing.T) {
+	guardKillProc(t) // the holder releases on shutdown, but keep real signals off the table
 	f := newFakeDaemon(t, "0.0.0-old", true)
 	s := testServer(f.socket, 3*time.Second)
 	ln, err := s.listen()
@@ -103,6 +105,7 @@ func TestListenEvictsSkewedHolder(t *testing.T) {
 // holder that acknowledges but never releases times out (rather than wedging),
 // so the successor exits and launchd retries.
 func TestListenSkewedHolderIgnoresShutdown(t *testing.T) {
+	guardKillProc(t) // KillHolder is reached here; the in-process peer is us (self-guarded), but pin no real signal
 	f := newFakeDaemon(t, "0.0.0-old", false) // acks OpShutdown but keeps listening
 	s := testServer(f.socket, 500*time.Millisecond)
 	if _, err := s.listen(); err == nil || !strings.Contains(err.Error(), "did not release") {
@@ -183,5 +186,41 @@ func TestWaitGone(t *testing.T) {
 	ln.Close()
 	if !cl.WaitGone(2 * time.Second) {
 		t.Fatal("WaitGone did not report gone after the socket was closed")
+	}
+}
+
+// guardKillProc swaps killProc for a no-op for the duration of a test, so a real
+// daemon on the developer's machine can never be signalled by a listen()/
+// evictHolder path that runs the real peer-PID lookup.
+func guardKillProc(t *testing.T) {
+	t.Helper()
+	old := killProc
+	killProc = func(int, syscall.Signal) error { return nil }
+	t.Cleanup(func() { killProc = old })
+}
+
+// TestEvictHolderKillsWedgedOrphan pins the new self-heal: a skewed holder that
+// acks OpShutdown but never releases is hard-killed by its peer PID, and the
+// successor then binds. holderPID/killProc are stubbed so no real process is
+// touched; the stubbed kill closes the fake's listener to model the orphan dying.
+func TestEvictHolderKillsWedgedOrphan(t *testing.T) {
+	f := newFakeDaemon(t, "0.0.0-old", false) // acks shutdown but never releases on its own
+	var got killCall
+	setKillSeams(t,
+		func(*Client) (int, error) { return 999001, nil },
+		func(pid int, sig syscall.Signal) error {
+			got = killCall{pid, sig}
+			f.ln.Close() // the "kill" releases the socket so the successor can rebind
+			return nil
+		})
+
+	s := testServer(f.socket, 3*time.Second)
+	ln, err := s.listen()
+	if err != nil {
+		t.Fatalf("listen should reap the wedged orphan and bind, got err = %v", err)
+	}
+	defer ln.Close()
+	if got.pid != 999001 || got.sig != syscall.SIGKILL {
+		t.Fatalf("kill call = %+v, want SIGKILL to 999001", got)
 	}
 }
