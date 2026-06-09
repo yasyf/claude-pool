@@ -112,10 +112,9 @@ func TestInitIdempotentAndMarker(t *testing.T) {
 }
 
 // TestPrepareAddRepairsHalfAddedDir reconstructs the forensic state of an add
-// that died at the onboarding wizard (overlay symlinks incl. a shared backups
-// link, private daemon/ide dirs, a pre-login .claude.json stub) and proves the
-// normal PrepareAdd flow repairs it in place: index reused, backups converted
-// to a private dir, stub overwritten with the seeded config.
+// that died at the onboarding wizard (overlay symlinks, private daemon/ide/backups
+// dirs, a pre-login .claude.json stub) and proves the normal PrepareAdd flow
+// repairs it in place: index reused, stub overwritten with the seeded config.
 func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -139,15 +138,12 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	if err := os.MkdirAll(acct, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range []string{"daemon", "ide"} {
+	for _, d := range []string{"daemon", "ide", "backups"} {
 		if err := os.MkdirAll(filepath.Join(acct, d), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := os.Symlink(filepath.Join(base, "projects"), filepath.Join(acct, "projects")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(base, "backups"), filepath.Join(acct, "backups")); err != nil {
 		t.Fatal(err)
 	}
 	stub := `{"firstStartTime": "2026-06-06T07:57:05.707Z", "userID": "fresh"}`
@@ -171,13 +167,13 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	if pending.ClaudeJSONSeed != SeedCopied {
 		t.Fatalf("seed outcome = %q, want %q (stub must be overwritten)", pending.ClaudeJSONSeed, SeedCopied)
 	}
-	// backups: shared symlink converted to a private real dir; base untouched.
+	// backups: the existing private dir is left intact; base is never touched.
 	fi, err := os.Lstat(filepath.Join(acct, "backups"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		t.Fatalf("backups not converted to a private dir (mode %v)", fi.Mode())
+		t.Fatalf("backups is not a private dir (mode %v)", fi.Mode())
 	}
 	if _, err := os.Stat(filepath.Join(base, "backups", ".claude.json.backup.1")); err != nil {
 		t.Fatalf("base backups damaged: %v", err)
@@ -235,12 +231,8 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 
 	t.Run("fresh dir purges the leftover", func(t *testing.T) {
 		m, fk, svc := setup(t)
-		pending, err := m.PrepareAdd()
-		if err != nil {
+		if _, err := m.PrepareAdd(); err != nil {
 			t.Fatal(err)
-		}
-		if !pending.PurgedStaleCredential {
-			t.Error("PurgedStaleCredential not reported")
 		}
 		if _, err := fk.Read(svc, "tester"); err != keychain.ErrNotFound {
 			t.Errorf("stale item survived: %v", err)
@@ -263,12 +255,8 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		if err := fk.Write(svc, "someone-else", stale); err != nil {
 			t.Fatal(err)
 		}
-		pending, err := m.PrepareAdd()
-		if err != nil {
+		if _, err := m.PrepareAdd(); err != nil {
 			t.Fatal(err)
-		}
-		if !pending.PurgedStaleCredential {
-			t.Error("PurgedStaleCredential not reported")
 		}
 		if _, err := fk.Read(svc, "someone-else"); err != keychain.ErrNotFound {
 			t.Errorf("label-mismatched stale item survived: %v", err)
@@ -292,9 +280,6 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		}
 		if pending.ClaudeJSONSeed != SeedKeptExisting {
 			t.Fatalf("seed outcome = %q, want %q", pending.ClaudeJSONSeed, SeedKeptExisting)
-		}
-		if pending.PurgedStaleCredential {
-			t.Error("reuse path must not purge")
 		}
 		if _, err := fk.Read(svc, "tester"); err != nil {
 			t.Errorf("kept credential was purged: %v", err)

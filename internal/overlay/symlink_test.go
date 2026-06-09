@@ -140,37 +140,6 @@ func TestBackupsIsPrivatePerAccount(t *testing.T) {
 	}
 }
 
-// TestSyncRepairsBackupsSymlink covers accounts created before backups was
-// excluded: Sync must convert the shared symlink into a private real dir.
-func TestSyncRepairsBackupsSymlink(t *testing.T) {
-	base := makeBase(t)
-	acct := filepath.Join(t.TempDir(), "acct-01")
-	if err := os.MkdirAll(acct, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(base, "backups"), filepath.Join(acct, "backups")); err != nil {
-		t.Fatal(err)
-	}
-	p := &SymlinkProvider{}
-	if err := p.Health(base, acct); err == nil {
-		t.Fatal("Health must fail while backups is a shared symlink")
-	}
-	if err := p.Sync(base, acct); err != nil {
-		t.Fatal(err)
-	}
-	fi, err := os.Lstat(filepath.Join(acct, "backups"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		t.Fatalf("backups not converted to a private dir (mode %v)", fi.Mode())
-	}
-	// Base's backups dir (and its contents) survive the conversion.
-	if _, err := os.Stat(filepath.Join(base, "backups", "seed.bak")); err != nil {
-		t.Fatalf("base backups damaged by conversion: %v", err)
-	}
-}
-
 // TestPrivateEntry pins the private-name predicate, including claude's
 // atomic-write temp files.
 func TestPrivateEntry(t *testing.T) {
@@ -186,6 +155,7 @@ func TestPrivateEntry(t *testing.T) {
 		"daemon":                         true,
 		"ide":                            true,
 		"backups":                        true,
+		"plans":                          false,
 		"projects":                       false,
 		"settings.json":                  false,
 		".claude":                        false,
@@ -245,6 +215,58 @@ func TestWriteThroughSymlinkLandsInBase(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(base, "projects", "x.json")); err != nil {
 		t.Fatalf("write did not pass through to base: %v", err)
+	}
+}
+
+// TestSyncSharesPlans pins the shared-plans fix: claude writes plan-mode plans
+// into $CONFIG_DIR/plans, which would otherwise be born as a real per-account dir
+// and scatter. Setup must create ~/.claude/plans (absent from base) and link each
+// account's plans dir to it, so a plan written by one account is visible to all.
+func TestSyncSharesPlans(t *testing.T) {
+	base := makeBase(t)
+	// Precondition: base (~/.claude) starts without a plans dir.
+	if _, err := os.Lstat(filepath.Join(base, "plans")); !os.IsNotExist(err) {
+		t.Fatalf("precondition: base must start without a plans dir")
+	}
+	acct1 := filepath.Join(t.TempDir(), "acct-01")
+	acct2 := filepath.Join(t.TempDir(), "acct-02")
+	p := &SymlinkProvider{}
+	if err := p.Setup(base, acct1); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Setup(base, acct2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Setup materialized the shared base dir.
+	if fi, err := os.Lstat(filepath.Join(base, "plans")); err != nil || !fi.IsDir() {
+		t.Fatalf("Setup did not create base plans dir: fi=%v err=%v", fi, err)
+	}
+	// Each account's plans is a symlink back into the one shared base dir.
+	for _, acct := range []string{acct1, acct2} {
+		target, err := os.Readlink(filepath.Join(acct, "plans"))
+		if err != nil {
+			t.Fatalf("%s/plans not a symlink: %v", acct, err)
+		}
+		if target != filepath.Join(base, "plans") {
+			t.Errorf("plans -> %q, want %q", target, filepath.Join(base, "plans"))
+		}
+	}
+
+	// A plan written through acct-01 is visible through acct-02 (shared) and
+	// physically lands in base.
+	if err := os.WriteFile(filepath.Join(acct1, "plans", "p.md"), []byte("plan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(acct2, "plans", "p.md"))
+	if err != nil {
+		t.Fatalf("plan not visible to the second account: %v", err)
+	}
+	if string(got) != "plan" {
+		t.Errorf("shared plan content = %q, want %q", got, "plan")
+	}
+	if _, err := os.Stat(filepath.Join(base, "plans", "p.md")); err != nil {
+		t.Fatalf("plan did not land in base: %v", err)
 	}
 }
 

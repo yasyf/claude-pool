@@ -40,6 +40,16 @@ var ExcludedEntries = map[string]bool{
 	"backups": true,
 }
 
+// SharedEntries are top-level entries that must be shared across all accounts
+// even when ~/.claude does not contain them yet. claude writes these lazily into
+// $CLAUDE_CONFIG_DIR (the account dir itself), so without proactively creating
+// them in the base and linking them they would be born as real per-account dirs
+// and scatter. plans (plan-mode plans) is the motivating case. Disjoint from
+// ExcludedEntries / PrivateEntry.
+var SharedEntries = map[string]bool{
+	"plans": true,
+}
+
 // skipEntries are never linked or mirrored (noise / OS cruft).
 var skipEntries = map[string]bool{
 	".DS_Store": true,

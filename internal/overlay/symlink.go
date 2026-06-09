@@ -33,6 +33,13 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to overlay base dir %q onto itself", accountDir)
 	}
+	// Materialize guaranteed-shared entries in base so the loop below links them
+	// like any other shared entry, even when claude has not created them yet.
+	for name := range SharedEntries {
+		if err := os.MkdirAll(filepath.Join(base, name), 0o700); err != nil {
+			return fmt.Errorf("ensure shared base dir %q: %w", name, err)
+		}
+	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return fmt.Errorf("read base dir: %w", err)
@@ -148,19 +155,11 @@ func assertSymlink(target, dst string) error {
 
 // assertPrivateDir ensures dst is a real (non-symlink) directory.
 func assertPrivateDir(dst string) error {
-	fi, err := os.Lstat(dst)
-	if err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			// Tolerate a concurrent Sync (daemon vs CLI) racing to convert
-			// the same stale link: losing the Remove race is success.
-			if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		} else if fi.IsDir() {
+	if fi, err := os.Lstat(dst); err == nil {
+		if fi.IsDir() {
 			return nil
-		} else {
-			return fmt.Errorf("excluded path %q exists as a non-dir", dst)
 		}
+		return fmt.Errorf("excluded path %q exists as a non-dir", dst)
 	}
 	return os.MkdirAll(dst, 0o700)
 }

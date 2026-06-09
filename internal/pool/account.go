@@ -55,10 +55,6 @@ type PendingAdd struct {
 	OverlayKind     overlay.Kind
 	LoginCommand    string
 	ClaudeJSONSeed  SeedOutcome
-
-	// PurgedStaleCredential reports that PrepareAdd found and deleted a
-	// leftover Keychain item from a previous abandoned add at this index.
-	PurgedStaleCredential bool
 }
 
 // DuplicateIdentity returns an existing pool account that shares want's
@@ -117,7 +113,6 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		return nil, fmt.Errorf("seed .claude.json for %s: %w", acctDir, err)
 	}
 	svc := keychain.ServiceName(acctDir)
-	purged := false
 	if seed != SeedKeptExisting {
 		// A leftover item under this service is garbage from a dead attempt
 		// (an abandoned add, or `ccp remove --keep-credential` followed by
@@ -135,17 +130,15 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 			if derr := m.Keychain.Delete(svc, account); derr != nil {
 				return nil, fmt.Errorf("purge stale credential for %s: %w", acctDir, derr)
 			}
-			purged = true
 		}
 	}
 	return &PendingAdd{
-		Index:                 n,
-		ConfigDir:             acctDir,
-		KeychainService:       svc,
-		OverlayKind:           kind,
-		LoginCommand:          fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude /login", acctDir),
-		ClaudeJSONSeed:        seed,
-		PurgedStaleCredential: purged,
+		Index:           n,
+		ConfigDir:       acctDir,
+		KeychainService: svc,
+		OverlayKind:     kind,
+		LoginCommand:    fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude /login", acctDir),
+		ClaudeJSONSeed:  seed,
 	}, nil
 }
 

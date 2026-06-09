@@ -17,8 +17,6 @@ type Store struct {
 	db *sql.DB
 }
 
-const schemaVersion = 1
-
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -86,11 +84,7 @@ func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO meta(key,value) VALUES('schema_version',?)
-		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-		fmt.Sprint(schemaVersion))
-	return err
+	return nil
 }
 
 // GetMeta returns the meta value for key, ok=false if absent.
