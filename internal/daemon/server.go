@@ -69,10 +69,6 @@ func Run(ctx context.Context) error {
 	}
 	defer m.Close()
 
-	// Stamp our OAuth User-Agent with the detected claude version so polling
-	// looks like the official client.
-	oauth.SetUserAgentVersion(detectClaudeVersion())
-
 	s := &Server{
 		m:            m,
 		socket:       pool.SocketPath(),
@@ -122,15 +118,20 @@ func (s *Server) serve(ctx context.Context) error {
 
 	s.log.Printf("daemon %s started; socket=%s", version.String(), s.socket)
 
-	// Establish mounts then run the scheduler in one goroutine, off the accept
-	// path so Health is responsive from the first instant (a synchronous mount
-	// would bind the socket but not accept, looking "not responding" during
-	// boot). They stay sequential in one goroutine — not two bare ones — because
-	// establishMounts must finish before the scheduler's first poll, which can
-	// also touch fuse Setup (a check-then-act on the same mountpoint).
+	// Detect the claude version, establish mounts, then run the scheduler in one
+	// goroutine, off the accept path so Health is responsive from the first
+	// instant. detectClaudeVersion runs `claude --version` (a heavy Node CLI, up
+	// to a 3s timeout): kept off the pre-bind path here so a slow probe can't make
+	// a freshly-started daemon look "not responding" to a waiting `ccp add`. It
+	// only stamps the OAuth User-Agent, whose sole consumer is the scheduler's
+	// first poll, so running it before establishMounts/scheduler preserves
+	// ordering. The three stay sequential in one goroutine — not bare ones —
+	// because establishMounts must finish before the scheduler's first poll, which
+	// can also touch fuse Setup (a check-then-act on the same mountpoint).
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		oauth.SetUserAgentVersion(detectClaudeVersion())
 		s.establishMounts(ctx)
 		s.scheduler(ctx)
 	}()

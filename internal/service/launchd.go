@@ -133,7 +133,10 @@ func Install() error {
 		return fmt.Errorf("launchctl bootstrap: %v: %s", err, out)
 	}
 	_, _ = launchctl("enable", serviceTarget())
-	if out, err := launchctl("kickstart", "-k", serviceTarget()); err != nil {
+	// bootstrap already started the agent (RunAtLoad); plain `kickstart` (no
+	// `-k`) only covers the loaded-but-not-running race and is a no-op when it is
+	// already running, so we don't kill and cold-start it a second time.
+	if out, err := launchctl("kickstart", serviceTarget()); err != nil {
 		return fmt.Errorf("launchctl kickstart: %v: %s", err, out)
 	}
 	return nil

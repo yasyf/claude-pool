@@ -112,8 +112,12 @@ func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 // addOne runs the full prepare → login → finalize flow for a single account.
 func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) (*store.Account, error) {
 	out := cmd.OutOrStdout()
-	pending, err := m.PrepareAdd()
-	if err != nil {
+	var pending *pool.PendingAdd
+	if err := withSpinner(out, "preparing the account…", func() error {
+		var e error
+		pending, e = m.PrepareAdd()
+		return e
+	}); err != nil {
 		return nil, err
 	}
 

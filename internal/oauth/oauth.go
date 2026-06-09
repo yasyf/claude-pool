@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -33,17 +34,33 @@ const (
 	betaHeader = "oauth-2025-04-20"
 )
 
-// UserAgent matches the Claude Code CLI's own User-Agent format
-// (`claude-cli/<version> (external)`, from the binary's Io() builder) so the
-// OAuth endpoints treat our polling like the official client. The daemon stamps
-// the detected claude version via SetUserAgentVersion.
-var UserAgent = "claude-cli/2.1.166 (external)"
+// userAgentValue holds the User-Agent string, matching the Claude Code CLI's
+// own format (`claude-cli/<version> (external)`, from the binary's Io() builder)
+// so the OAuth endpoints treat our polling like the official client. The daemon
+// stamps the detected claude version via SetUserAgentVersion, which races with
+// in-flight request handlers (the version probe now runs in a startup
+// goroutine), so access goes through the mutex below.
+var (
+	userAgentMu    sync.RWMutex
+	userAgentValue = "claude-cli/2.1.166 (external)"
+)
 
-// SetUserAgentVersion sets UserAgent to claude-cli/<version> (external).
+// SetUserAgentVersion sets the User-Agent to claude-cli/<version> (external).
+// An empty version is a no-op, leaving the default in place.
 func SetUserAgentVersion(version string) {
-	if version != "" {
-		UserAgent = "claude-cli/" + version + " (external)"
+	if version == "" {
+		return
 	}
+	userAgentMu.Lock()
+	userAgentValue = "claude-cli/" + version + " (external)"
+	userAgentMu.Unlock()
+}
+
+// userAgent returns the current User-Agent string.
+func userAgent() string {
+	userAgentMu.RLock()
+	defer userAgentMu.RUnlock()
+	return userAgentValue
 }
 
 // Client is a thin OAuth client. The zero value is not usable; use New.
@@ -120,7 +137,7 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) (*TokenRespon
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("User-Agent", userAgent())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -269,7 +286,7 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", betaHeader)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("User-Agent", userAgent())
 
 	resp, err := c.http.Do(req)
 	if err != nil {

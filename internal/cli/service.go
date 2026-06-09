@@ -208,7 +208,12 @@ func ensureDaemon(cmd *cobra.Command) {
 			"couldn't start the daemon: %v; run `ccp service install` from a GUI session to enable background polling", err)
 		return
 	}
-	if !waitDaemon(want, 10*time.Second) {
+	ready := true
+	_ = withSpinner(cmd.OutOrStdout(), "waiting for the daemon…", func() error {
+		ready = waitDaemon(want, 10*time.Second)
+		return nil
+	})
+	if !ready {
 		warn(cmd.ErrOrStderr(), "the daemon isn't responding yet; check `ccp service status`")
 	}
 }

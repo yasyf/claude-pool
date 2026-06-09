@@ -179,12 +179,11 @@ func restoreTerminal(out io.Writer, fd int, state *term.State) {
 // arbitrarily long in another terminal, and ^C cancels. A startup adoption of
 // the global credential writes no identity, so it never trips this.
 func waitForLogin(ctx context.Context, out io.Writer, kind overlay.Kind, configDir string) error {
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	probe := newIdentityProbe(pool.AccountIdentity, kind, configDir)
 	ticker := time.NewTicker(loginPollInterval)
 	defer ticker.Stop()
 	for i := 0; ; i++ {
-		fmt.Fprintf(out, "\r%s %s", frames[i%len(frames)], dimStyle.Render("waiting for login… press ctrl-c to abort"))
+		fmt.Fprintf(out, "\r%s %s", spinnerFrames[i%len(spinnerFrames)], dimStyle.Render("waiting for login… press ctrl-c to abort"))
 		select {
 		case <-ctx.Done():
 			fmt.Fprint(out, "\r\x1b[K")
