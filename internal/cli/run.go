@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -31,7 +32,10 @@ instead of auto-selecting.
 
 This is the imperative equivalent of:
 
-    CLAUDE_CONFIG_DIR=$(ccp select) claude ...`,
+    CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp select) claude ...
+
+(The plugin var keeps the session writing canonical ~/.claude plugin paths into
+the shared plugin state; ` + "`ccp run`" + ` sets it for you.)`,
 		// Pass every argument straight through to claude; ccp owns no flags here.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -89,14 +93,32 @@ func execClaude(configDir string, args []string) error {
 // execEnv returns environ with any existing CLAUDE_CONFIG_DIR dropped and
 // CLAUDE_CONFIG_DIR=configDir appended, so the launched claude sees exactly one
 // (a duplicate key has platform-dependent getenv precedence).
+//
+// It also pins CLAUDE_CODE_PLUGIN_CACHE_DIR to the shared base's plugins dir.
+// claude otherwise derives its plugin root from CLAUDE_CONFIG_DIR and stamps
+// account-anchored installLocation/installPath strings into the SHARED plugin
+// state files (acct-NN/plugins is a whole-dir share of ~/.claude/plugins), and
+// its marketplace validator string-compares stored paths against the canonical
+// root without resolving symlinks — so every such entry is later rejected as
+// "corrupted installLocation". Pinning the root makes pooled sessions write
+// the same canonical spellings as plain claude. A value already present in
+// environ is respected: a user-set global plugin root applies to plain claude
+// too, and overriding it here would split the roots this pin exists to unify.
 func execEnv(environ []string, configDir string) []string {
-	const key = "CLAUDE_CONFIG_DIR="
-	out := make([]string, 0, len(environ)+1)
+	const cfgKey = "CLAUDE_CONFIG_DIR="
+	const pluginKey = "CLAUDE_CODE_PLUGIN_CACHE_DIR="
+	out := make([]string, 0, len(environ)+2)
+	havePlugin := false
 	for _, e := range environ {
-		if strings.HasPrefix(e, key) {
+		if strings.HasPrefix(e, cfgKey) {
 			continue
 		}
+		havePlugin = havePlugin || strings.HasPrefix(e, pluginKey)
 		out = append(out, e)
 	}
-	return append(out, key+configDir)
+	out = append(out, cfgKey+configDir)
+	if !havePlugin {
+		out = append(out, pluginKey+filepath.Join(pool.ClaudeDir(), "plugins"))
+	}
+	return out
 }

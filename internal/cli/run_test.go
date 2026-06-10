@@ -11,13 +11,22 @@ import (
 )
 
 func TestExecEnv(t *testing.T) {
-	t.Run("appends CLAUDE_CONFIG_DIR when absent", func(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	pluginRoot := "CLAUDE_CODE_PLUGIN_CACHE_DIR=" + filepath.Join(pool.ClaudeDir(), "plugins")
+
+	t.Run("appends CLAUDE_CONFIG_DIR and the plugin root when absent", func(t *testing.T) {
 		got := execEnv([]string{"PATH=/bin", "HOME=/home/me"}, "/cfg")
-		if last := got[len(got)-1]; last != "CLAUDE_CONFIG_DIR=/cfg" {
-			t.Errorf("last env = %q, want CLAUDE_CONFIG_DIR=/cfg", last)
+		if !contains(got, "CLAUDE_CONFIG_DIR=/cfg") {
+			t.Errorf("CLAUDE_CONFIG_DIR=/cfg missing: %v", got)
 		}
 		if n := countPrefix(got, "CLAUDE_CONFIG_DIR="); n != 1 {
 			t.Errorf("CLAUDE_CONFIG_DIR count = %d, want 1", n)
+		}
+		if !contains(got, pluginRoot) {
+			t.Errorf("%s missing: %v", pluginRoot, got)
+		}
+		if n := countPrefix(got, "CLAUDE_CODE_PLUGIN_CACHE_DIR="); n != 1 {
+			t.Errorf("CLAUDE_CODE_PLUGIN_CACHE_DIR count = %d, want 1", n)
 		}
 		if !contains(got, "PATH=/bin") || !contains(got, "HOME=/home/me") {
 			t.Errorf("dropped a passthrough var: %v", got)
@@ -34,6 +43,16 @@ func TestExecEnv(t *testing.T) {
 		}
 		if !contains(got, "CLAUDE_CONFIG_DIR=/new") {
 			t.Errorf("CLAUDE_CONFIG_DIR=/new missing: %v", got)
+		}
+	})
+
+	t.Run("preserves a user-set plugin root untouched", func(t *testing.T) {
+		got := execEnv([]string{"CLAUDE_CODE_PLUGIN_CACHE_DIR=/custom/plugins", "PATH=/bin"}, "/cfg")
+		if n := countPrefix(got, "CLAUDE_CODE_PLUGIN_CACHE_DIR="); n != 1 {
+			t.Fatalf("CLAUDE_CODE_PLUGIN_CACHE_DIR count = %d, want exactly 1 (no override append)", n)
+		}
+		if !contains(got, "CLAUDE_CODE_PLUGIN_CACHE_DIR=/custom/plugins") {
+			t.Errorf("user-set plugin root was overridden: %v", got)
 		}
 	})
 }

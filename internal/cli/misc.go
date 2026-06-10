@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -97,6 +98,9 @@ func newEnvCmd() *cobra.Command {
 				}
 				out := cmd.OutOrStdout()
 				fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
+				// Pin claude's plugin root to the shared base so the session
+				// writes canonical ~/.claude plugin paths; see execEnv.
+				fmt.Fprintf(out, "export CLAUDE_CODE_PLUGIN_CACHE_DIR=%s\n", shellQuote(filepath.Join(pool.ClaudeDir(), "plugins")))
 				return nil
 			})
 		},

@@ -85,16 +85,17 @@ func fileExists(path string) bool {
 }
 
 // aliasLine returns the exact rc-file line that wraps `claude` for the given
-// shell. bash/zsh use POSIX $(...) command substitution; fish uses its (...)
-// form. `command claude` execs the real binary so the wrapper never recurses,
-// and trailing args forward through (fish's alias appends $argv). shellUnknown
-// returns "".
+// shell. `ccp run` owns the full launch environment (CLAUDE_CONFIG_DIR plus
+// CLAUDE_CODE_PLUGIN_CACHE_DIR — see execEnv) so the alias never goes stale
+// when that environment grows; it execs the real binary via PATH lookup, which
+// aliases don't affect, so the wrapper never recurses. Trailing args forward
+// through (fish's alias appends $argv). shellUnknown returns "".
 func aliasLine(kind shellKind) string {
 	switch kind {
 	case shellBash, shellZsh:
-		return `alias claude='CLAUDE_CONFIG_DIR=$(ccp select) command claude'`
+		return `alias claude='ccp run'`
 	case shellFish:
-		return `alias claude 'CLAUDE_CONFIG_DIR=(ccp select) command claude'`
+		return `alias claude 'ccp run'`
 	default:
 		return ""
 	}
@@ -179,15 +180,10 @@ func appendAlias(kind shellKind, home string) (aliasResult, error) {
 	return aliasResult{Path: path, Wrote: true}, nil
 }
 
-// printNextSteps prints the canonical launch command for the pool, adapting
-// command substitution to the user's shell. It runs after at least one
-// successful add, on a TTY or not.
-func printNextSteps(w io.Writer, kind shellKind) {
-	sub := "$(ccp select)"
-	if kind == shellFish {
-		sub = "(ccp select)"
-	}
-	step(w, "\nLaunch Claude on the emptiest account:\n\n    CLAUDE_CONFIG_DIR=%s claude\n", sub)
+// printNextSteps prints the canonical launch command for the pool. It runs
+// after at least one successful add, on a TTY or not.
+func printNextSteps(w io.Writer) {
+	step(w, "\nLaunch Claude on the emptiest account:\n\n    ccp run\n")
 }
 
 // offerAlias prints the next-steps hint and, when appropriate, wraps `claude`
@@ -198,7 +194,7 @@ func printNextSteps(w io.Writer, kind shellKind) {
 func offerAlias(cmd *cobra.Command, opts addOptions) {
 	out := cmd.OutOrStdout()
 	kind := detectShell(os.Getenv("SHELL"))
-	printNextSteps(out, kind)
+	printNextSteps(out)
 
 	if opts.noAlias {
 		return

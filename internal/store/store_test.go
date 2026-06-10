@@ -122,7 +122,6 @@ func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 	}
 }
 
-
 func TestSessionsReconcile(t *testing.T) {
 	s := openTest(t)
 	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})

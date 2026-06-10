@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/keychain"
@@ -137,8 +138,13 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		ConfigDir:       acctDir,
 		KeychainService: svc,
 		OverlayKind:     kind,
-		LoginCommand:    fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude /login", acctDir),
-		ClaudeJSONSeed:  seed,
+		// The plugin var pins claude's plugin root to the shared base so the
+		// login session (where first-launch marketplace auto-install can run)
+		// writes canonical ~/.claude plugin paths, not acct-anchored ones that
+		// claude's marketplace validator later rejects; see cli.execEnv.
+		LoginCommand: fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude /login",
+			filepath.Join(ClaudeDir(), "plugins"), acctDir),
+		ClaudeJSONSeed: seed,
 	}, nil
 }
 

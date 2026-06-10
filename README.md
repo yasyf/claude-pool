@@ -10,7 +10,7 @@ session on the **emptiest** account, so you stop hitting 5-hour and weekly
 limits on one account while another sits idle:
 
 ```sh
-CLAUDE_CONFIG_DIR=$(ccp select) claude
+ccp run
 ```
 
 Unlike reactive proxies or manual switchers, `ccp select` predicts the best
@@ -35,7 +35,7 @@ ccp add                                    # log in your first subscription (aut
 ccp add                                    # ...and another (acct-02)
 ccp status                                 # live table: per-account 5h/7d remaining, score, sessions
 
-CLAUDE_CONFIG_DIR=$(ccp select) claude     # launch on the emptiest account
+ccp run                                    # launch on the emptiest account
 claude                                     # plain claude STILL works, fully decoupled (~/.claude)
 ```
 
@@ -48,14 +48,22 @@ Make `claude` use the pool by default — `ccp add` offers to do this for you, a
 that forwards every argument:
 
 ```sh
-alias claude='CLAUDE_CONFIG_DIR=$(ccp select) command claude'
+alias claude='ccp run'
 ```
 
 `command claude` keeps plain `claude` (on `~/.claude`) one keystroke away. Prefer a separate
 command and leave `claude` untouched? Add your own alias instead:
 
 ```sh
-alias cl='CLAUDE_CONFIG_DIR=$(ccp select) claude'
+alias cl='ccp run'
+```
+
+Prefer composing the launch yourself? `ccp select` prints the chosen config dir,
+but set the plugin root too so the session writes canonical plugin paths into
+the shared `~/.claude/plugins` state (`ccp run` and `ccp env` do this for you):
+
+```sh
+CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp select) claude
 ```
 
 ## How it works

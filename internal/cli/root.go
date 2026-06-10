@@ -18,7 +18,7 @@ func NewRootCmd() *cobra.Command {
 		Long: `cc-pool (ccp) pools several Claude subscriptions and launches each session
 on the emptiest account:
 
-    CLAUDE_CONFIG_DIR=$(ccp select) claude
+    ccp run
 
 Run bare ` + "`ccp`" + ` to get started. On an empty pool it walks you through adding
 your subscriptions; once accounts exist it shows the status table.

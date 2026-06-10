@@ -105,7 +105,7 @@ func TestListenEvictsSkewedHolder(t *testing.T) {
 // holder that acknowledges but never releases times out (rather than wedging),
 // so the successor exits and launchd retries.
 func TestListenSkewedHolderIgnoresShutdown(t *testing.T) {
-	guardKillProc(t) // KillHolder is reached here; the in-process peer is us (self-guarded), but pin no real signal
+	guardKillProc(t)                          // KillHolder is reached here; the in-process peer is us (self-guarded), but pin no real signal
 	f := newFakeDaemon(t, "0.0.0-old", false) // acks OpShutdown but keeps listening
 	s := testServer(f.socket, 500*time.Millisecond)
 	if _, err := s.listen(); err == nil || !strings.Contains(err.Error(), "did not release") {

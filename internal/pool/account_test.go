@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -166,6 +167,13 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	}
 	if pending.ClaudeJSONSeed != SeedCopied {
 		t.Fatalf("seed outcome = %q, want %q (stub must be overwritten)", pending.ClaudeJSONSeed, SeedCopied)
+	}
+	// The login command must pin claude's plugin root to the shared base, or
+	// the login session stamps acct-anchored paths into shared plugin state.
+	wantLogin := fmt.Sprintf("CLAUDE_CODE_PLUGIN_CACHE_DIR=%s CLAUDE_CONFIG_DIR=%s claude /login",
+		filepath.Join(base, "plugins"), acct)
+	if pending.LoginCommand != wantLogin {
+		t.Fatalf("LoginCommand = %q, want %q", pending.LoginCommand, wantLogin)
 	}
 	// backups: the existing private dir is left intact; base is never touched.
 	fi, err := os.Lstat(filepath.Join(acct, "backups"))
