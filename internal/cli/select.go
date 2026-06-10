@@ -53,7 +53,7 @@ scores; otherwise it samples usage live.`,
 		},
 	}
 	cmd.Flags().BoolVar(&noDaemon, "no-daemon", false, "do not use the daemon; sample usage live")
-	cmd.Flags().BoolVar(&wait, "wait", false, "wait until an account is available instead of failing")
+	cmd.Flags().BoolVar(&wait, "wait", false, "wait for an account with headroom instead of failing or using an exhausted one")
 	cmd.Flags().IntVar(&account, "account", 0, "force a specific account id")
 	cmd.Flags().DurationVar(&fresh, "fresh", pool.DefaultFreshFor, "reuse cached usage newer than this (live mode)")
 	return cmd
@@ -100,18 +100,23 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		if cl.EnsureRunning(2*time.Second) && daemonAt(version.String()) {
 			// pid 0, no session row: ccp exits before claude starts, so procscan
 			// attributes the live process. We still reserve (anti-thundering-herd).
-			if resp, ok := cl.Select(nil, 0, false, req.cwd); ok {
-				switch {
-				case resp.OK && resp.Dir != "":
+			// --wait refuses exhausted fallback picks (it would discard them, and
+			// the daemon must not commit their sticky/reservation side effects).
+			if resp, ok := cl.Select(nil, 0, false, req.cwd, req.wait); ok {
+				switch daemonSelectOutcome(resp, req.wait) {
+				case outcomePicked:
+					if resp.ExhaustedFallback {
+						warnExhaustedFallback(cmd, daemonAccountName(m, resp.SelectedID), resp.ExtraEnabled, derefTime(resp.SoonestReset))
+					}
 					return resp.Dir, daemonSelectionLine(m, resp), nil
-				case resp.Error != "":
+				case outcomeError:
 					return "", "", errors.New(resp.Error)
-				case req.wait:
+				case outcomeWait:
 					if resp.SoonestReset != nil {
 						step(cmd.ErrOrStderr(), "All accounts are busy; waiting until %s.", humanizeReset(*resp.SoonestReset))
 					}
 					// fall through to the live waiting loop
-				default:
+				case outcomeFail:
 					return "", "", pool.ErrNoneAvailable
 				}
 			}
@@ -120,18 +125,18 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 
 	// Live path (no daemon, or waiting): sample + score synchronously. Select
 	// records stickiness itself.
-	opts := pool.SelectOptions{Live: true, FreshFor: req.fresh, Cwd: req.cwd}
+	opts := pool.SelectOptions{Live: true, FreshFor: req.fresh, Cwd: req.cwd, NoFallback: req.wait}
 	for {
 		sr, err := m.Select(cmd.Context(), opts)
 		if errors.Is(err, pool.ErrNoneAvailable) {
 			if !req.wait {
-				step(cmd.ErrOrStderr(), "No account is available right now; all are rate-limited.")
+				step(cmd.ErrOrStderr(), "No account is available right now; all are exhausted or rate-limited.")
 				return "", "", err
 			}
 			reset, ok := sr.SoonestReset()
 			d := 15 * time.Second
 			if ok {
-				step(cmd.ErrOrStderr(), "All accounts are rate-limited; soonest reset at %s.", humanizeReset(reset))
+				step(cmd.ErrOrStderr(), "All accounts are exhausted or rate-limited; soonest reset at %s.", humanizeReset(reset))
 				if until := time.Until(reset); until > 0 && until < d {
 					d = until
 				}
@@ -146,9 +151,73 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		if err != nil {
 			return "", "", err
 		}
+		if sr.ExhaustedFallback {
+			warnExhaustedFallback(cmd, accountName(sr.Best.Label), sr.ExtraEnabled, sr.Result.ExhaustedUntil)
+		}
 		dir, err := prepareAccount(cmd, m, sr.Best)
 		return dir, liveSelectionLine(sr), err
 	}
+}
+
+// selectOutcome classifies a daemon select reply for resolveSelection.
+type selectOutcome int
+
+const (
+	outcomePicked selectOutcome = iota // use resp.Dir
+	outcomeWait                        // none available, caller waits via the live loop
+	outcomeFail                        // none available, caller errors
+	outcomeError                       // a real daemon error
+)
+
+// daemonSelectOutcome classifies a daemon select reply. NoneAvailable is
+// checked before Error — the daemon sets both for a none-available result, and
+// matching on Error first made the --wait arm unreachable. The first arm is a
+// backstop: a --wait request sends NoFallback so the daemon should never offer
+// an exhausted fallback pick, but if one arrives anyway the caller's explicit
+// choice of waiting over billing extra-usage credits must win.
+func daemonSelectOutcome(resp *daemon.Response, wait bool) selectOutcome {
+	switch {
+	case resp.OK && resp.Dir != "" && resp.ExhaustedFallback && wait:
+		return outcomeWait
+	case resp.OK && resp.Dir != "":
+		return outcomePicked
+	case resp.NoneAvailable && wait:
+		return outcomeWait
+	case resp.NoneAvailable:
+		return outcomeFail
+	case resp.Error != "":
+		return outcomeError
+	case wait:
+		return outcomeWait
+	default:
+		return outcomeFail
+	}
+}
+
+// warnExhaustedFallback prints the loud warning for an all-exhausted fallback
+// pick: the launched session bills pay-as-you-go credits (extra usage enabled)
+// or just rate-limits until the account recovers. recoversAt is the binding
+// reset — the latest among the pegged windows, not necessarily the 5h one.
+// Always written to stderr — this is the one selection outcome that can
+// silently cost money.
+func warnExhaustedFallback(cmd *cobra.Command, name string, extraEnabled bool, recoversAt time.Time) {
+	until := ""
+	if !recoversAt.IsZero() {
+		until = fmt.Sprintf(" (resets at %s)", humanizeReset(recoversAt))
+	}
+	if extraEnabled {
+		warn(cmd.ErrOrStderr(), "all accounts have exhausted their plan limits — using %s; this WILL bill extra-usage credits%s", name, until)
+		return
+	}
+	warn(cmd.ErrOrStderr(), "all accounts have exhausted their plan limits — using %s; it will be rate-limited until its window resets%s", name, until)
+}
+
+// derefTime returns the pointed-to time, or the zero time for nil.
+func derefTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
 }
 
 // prepareAccount re-asserts the account's overlay and preflight-refreshes its

@@ -104,9 +104,13 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 			Util7d:         100 - a.Remaining7d,
 			ActiveSessions: a.ActiveSessions,
 			RateLimited:    a.RateLimited,
+			Exhausted:      a.Exhausted,
 			Stale:          a.Stale,
 			Resets5h:       a.Resets5h,
 			Resets7d:       a.Resets7d,
+			ExtraEnabled:   a.ExtraEnabled,
+			ExtraUsed:      a.ExtraUsed,
+			ExtraLimit:     a.ExtraLimit,
 			Components:     a.Components,
 		}
 		s.Account.ID = a.ID
@@ -158,8 +162,8 @@ func renderTable(snaps []pool.Snapshot) string {
 }
 
 // snapshotFlags renders the colored status tokens (stale / rate-limited /
-// no-data) for one account, or "" when the account is healthy. Shared by the
-// plain table and the TUI.
+// exhausted / overage / no-data) for one account, or "" when the account is
+// healthy. Shared by the plain table and the TUI.
 func snapshotFlags(s pool.Snapshot) string {
 	var flags []string
 	if s.Stale {
@@ -167,6 +171,15 @@ func snapshotFlags(s pool.Snapshot) string {
 	}
 	if s.RateLimited {
 		flags = append(flags, badStyle.Render("rate-limited"))
+	}
+	if s.Exhausted {
+		flags = append(flags, badStyle.Render("exhausted"))
+	}
+	if s.ExtraEnabled && s.ExtraUsed > 0 {
+		// Only actual spend earns the badge — overage merely being enabled is
+		// not an alert, and a permanent flag would train the eye to ignore it.
+		// API amounts are currency cents (e.g. 177 of 5000 == $1.77 of $50).
+		flags = append(flags, warnStyle.Render(fmt.Sprintf("overage $%.2f/$%.2f", s.ExtraUsed/100, s.ExtraLimit/100)))
 	}
 	if !s.HasUsage {
 		flags = append(flags, dimStyle.Render("no-data"))

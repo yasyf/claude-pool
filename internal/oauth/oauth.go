@@ -183,17 +183,32 @@ func (w Window) Remaining() float64 {
 }
 
 // Usage is the parsed /api/oauth/usage response. The API returns many windows
-// (per-model 7-day limits, credit overage, promo buckets); cc-pool consumes only
-// the 5-hour and aggregate 7-day windows, and the decoder ignores the rest.
+// (per-model 7-day limits, promo buckets); cc-pool consumes the 5-hour and
+// aggregate 7-day windows plus the extra-usage (credit overage) block, and the
+// decoder ignores the rest.
 type Usage struct {
-	FiveHour Window
-	SevenDay Window
+	FiveHour   Window
+	SevenDay   Window
+	ExtraUsage ExtraUsage
 }
 
-// rawWindow matches the API JSON: utilization is a fraction in [0,1] and
-// resets_at is the reset time. The API has been observed to encode resets_at
-// three ways across versions — a JSON number of epoch seconds, a numeric string
-// of epoch seconds, or an RFC3339 string — so resetTime tolerates all three.
+// ExtraUsage is the pay-as-you-go overage block: when enabled, an account whose
+// plan windows are exhausted keeps serving by billing credits instead of
+// returning 429s — which is why exhaustion is invisible to rate-limit checks.
+// The zero value means absent or disabled.
+type ExtraUsage struct {
+	IsEnabled    bool
+	MonthlyLimit float64 // credit cap for the month, in Currency cents
+	UsedCredits  float64 // credits consumed this month, in Currency cents
+	Utilization  float64 // percent of MonthlyLimit used, [0,100]
+	Currency     string  // e.g. "USD"
+}
+
+// rawWindow matches the API JSON: utilization is a percent in [0,100] (e.g.
+// 13.0 == 13%) and resets_at is the reset time. The API has been observed to
+// encode resets_at three ways across versions — a JSON number of epoch seconds,
+// a numeric string of epoch seconds, or an RFC3339 string — so resetTime
+// tolerates all three.
 type rawWindow struct {
 	Utilization *float64  `json:"utilization"`
 	ResetsAt    resetTime `json:"resets_at"`
@@ -256,8 +271,34 @@ func (r *resetTime) UnmarshalJSON(b []byte) error {
 }
 
 type rawUsage struct {
-	FiveHour *rawWindow `json:"five_hour"`
-	SevenDay *rawWindow `json:"seven_day"`
+	FiveHour   *rawWindow     `json:"five_hour"`
+	SevenDay   *rawWindow     `json:"seven_day"`
+	ExtraUsage *rawExtraUsage `json:"extra_usage"`
+}
+
+type rawExtraUsage struct {
+	IsEnabled    bool     `json:"is_enabled"`
+	MonthlyLimit *float64 `json:"monthly_limit"`
+	UsedCredits  *float64 `json:"used_credits"`
+	Utilization  *float64 `json:"utilization"`
+	Currency     string   `json:"currency"`
+}
+
+func (re *rawExtraUsage) toExtraUsage() ExtraUsage {
+	if re == nil {
+		return ExtraUsage{}
+	}
+	e := ExtraUsage{IsEnabled: re.IsEnabled, Currency: re.Currency}
+	if re.MonthlyLimit != nil {
+		e.MonthlyLimit = *re.MonthlyLimit
+	}
+	if re.UsedCredits != nil {
+		e.UsedCredits = *re.UsedCredits
+	}
+	if re.Utilization != nil {
+		e.Utilization = *re.Utilization
+	}
+	return e
 }
 
 // UsageError carries the HTTP status from a failed usage fetch.
@@ -303,8 +344,9 @@ func (c *Client) Usage(ctx context.Context, accessToken string) (*Usage, error) 
 		return nil, fmt.Errorf("decode usage response: %w", err)
 	}
 	return &Usage{
-		FiveHour: ru.FiveHour.toWindow(),
-		SevenDay: ru.SevenDay.toWindow(),
+		FiveHour:   ru.FiveHour.toWindow(),
+		SevenDay:   ru.SevenDay.toWindow(),
+		ExtraUsage: ru.ExtraUsage.toExtraUsage(),
 	}, nil
 }
 

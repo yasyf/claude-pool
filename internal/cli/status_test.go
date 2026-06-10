@@ -147,6 +147,31 @@ func TestFromDaemonHasUsageIndependentOfStale(t *testing.T) {
 	}
 }
 
+// TestSnapshotFlagsExhaustedAndOverage: an exhausted account is badged, overage
+// spend renders in dollars (the API reports currency cents), and overage merely
+// being enabled — with $0 spent — earns no badge (a permanent flag would train
+// the eye to ignore the alert color).
+func TestSnapshotFlagsExhaustedAndOverage(t *testing.T) {
+	snaps := fromDaemon([]daemon.AccountStatus{
+		{ID: 1, Label: "pegged", HasUsage: true, Exhausted: true, ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000},
+		{ID: 2, Label: "healthy", HasUsage: true, Remaining5h: 60, Remaining7d: 90},
+		{ID: 3, Label: "enabled-unused", HasUsage: true, Remaining5h: 60, Remaining7d: 90, ExtraEnabled: true, ExtraLimit: 5000},
+	})
+	f := stripANSI(snapshotFlags(snaps[0]))
+	if !strings.Contains(f, "exhausted") {
+		t.Fatalf("exhausted account must be badged, got %q", f)
+	}
+	if !strings.Contains(f, "overage $1.77/$50.00") {
+		t.Fatalf("overage must render in dollars, got %q", f)
+	}
+	if f := stripANSI(snapshotFlags(snaps[1])); f != "" {
+		t.Fatalf("healthy account must have no flags, got %q", f)
+	}
+	if f := stripANSI(snapshotFlags(snaps[2])); f != "" {
+		t.Fatalf("overage enabled with $0 spent must not be badged, got %q", f)
+	}
+}
+
 // TestDaemonStatusUsable pins the version gate: only an OK response from a
 // daemon at the exact current binary version is rendered directly; anything
 // else (error, not-OK, empty/mismatched version) falls back to live sampling so

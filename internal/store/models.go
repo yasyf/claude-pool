@@ -14,15 +14,20 @@ type Account struct {
 }
 
 // UsageSample is one poll of an account's quota windows. Utilization fields are
-// stored as 0..100 "percent used" to feed scoring directly.
+// stored as 0..100 "percent used" to feed scoring directly. The Extra* fields
+// mirror the API's extra_usage (pay-as-you-go overage) block, for status
+// display only — scoring ignores them.
 type UsageSample struct {
-	AccountID   int
-	TS          time.Time
-	Util5h      float64
-	Util7d      float64
-	Resets5h    time.Time
-	Resets7d    time.Time
-	RateLimited bool
+	AccountID    int
+	TS           time.Time
+	Util5h       float64
+	Util7d       float64
+	Resets5h     time.Time
+	Resets7d     time.Time
+	RateLimited  bool
+	ExtraEnabled bool
+	ExtraUsed    float64 // overage credits consumed this month (currency cents)
+	ExtraLimit   float64 // overage credit cap (currency cents)
 }
 
 // Session is a checkout of an account to a live claude process.

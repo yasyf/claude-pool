@@ -115,7 +115,12 @@ func (f *fakeOAuth) Refresh(_ context.Context, _, refreshToken string) (*oauth.T
 }
 
 func (f *fakeOAuth) Usage(context.Context, string) (*oauth.Usage, error) {
-	return &oauth.Usage{}, nil
+	// Non-zero values so tests can pin the oauth→store join in recordSample.
+	return &oauth.Usage{
+		FiveHour:   oauth.Window{Utilization: 31},
+		SevenDay:   oauth.Window{Utilization: 7},
+		ExtraUsage: oauth.ExtraUsage{IsEnabled: true, MonthlyLimit: 5000, UsedCredits: 177, Utilization: 3.54, Currency: "USD"},
+	}, nil
 }
 
 // TestPerAccountLockSerializesCredentialCycle hammers one account's credential

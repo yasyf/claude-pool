@@ -200,13 +200,16 @@ func (m *Manager) fetchUsage(ctx context.Context, a store.Account, src keychain.
 // recordSample persists a usage sample (utilization stored as 0..100 percent).
 func (m *Manager) recordSample(accountID int, u *oauth.Usage, rateLimited bool) {
 	s := store.UsageSample{
-		AccountID:   accountID,
-		TS:          time.Now(),
-		Util5h:      u.FiveHour.Used(),
-		Util7d:      u.SevenDay.Used(),
-		Resets5h:    u.FiveHour.ResetsAt,
-		Resets7d:    u.SevenDay.ResetsAt,
-		RateLimited: rateLimited,
+		AccountID:    accountID,
+		TS:           time.Now(),
+		Util5h:       u.FiveHour.Used(),
+		Util7d:       u.SevenDay.Used(),
+		Resets5h:     u.FiveHour.ResetsAt,
+		Resets7d:     u.SevenDay.ResetsAt,
+		RateLimited:  rateLimited,
+		ExtraEnabled: u.ExtraUsage.IsEnabled,
+		ExtraUsed:    u.ExtraUsage.UsedCredits,
+		ExtraLimit:   u.ExtraUsage.MonthlyLimit,
 	}
 	// Best-effort: a failed insert self-heals on the next poll and surfaces as
 	// the account going stale, so it is intentionally not escalated here.

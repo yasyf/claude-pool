@@ -22,11 +22,18 @@ type Snapshot struct {
 	Remaining7d    float64
 	ActiveSessions int
 	RateLimited    bool
+	Exhausted      bool // a window is fully used and its reset is still pending
 	Stale          bool
 	Resets5h       time.Time
 	Resets7d       time.Time
 	Burn5hPerHour  float64
 	SampleAge      time.Duration
+	// Extra-usage (pay-as-you-go overage) state from the latest sample, for
+	// status display: an exhausted account with ExtraEnabled bills credits
+	// instead of rate-limiting.
+	ExtraEnabled bool
+	ExtraUsed    float64 // credits consumed this month (currency cents)
+	ExtraLimit   float64 // credit cap (currency cents)
 	// Components is the per-term score breakdown, so status can explain why an
 	// account scored what it did without recomputing.
 	Components score.Components
@@ -46,12 +53,14 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	now := time.Now()
 
 	inputs := make([]score.Input, len(accts))
+	samples := make([]store.UsageSample, len(accts))
 	for i, a := range accts {
-		in, err := m.scoreInput(a, sessions, now)
+		in, sample, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
 		inputs[i] = in
+		samples[i] = sample
 	}
 	results := make(map[int]score.Result)
 	for _, r := range score.Rank(inputs, now) {
@@ -72,10 +81,14 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			Remaining7d:    100 - in.Util7d,
 			ActiveSessions: in.ActiveSessions,
 			RateLimited:    in.RateLimited,
+			Exhausted:      r.Exhausted,
 			Stale:          r.Stale,
 			Resets5h:       in.Resets5h,
 			Resets7d:       in.Resets7d,
 			Burn5hPerHour:  in.Burn5hPerHour,
+			ExtraEnabled:   samples[i].ExtraEnabled,
+			ExtraUsed:      samples[i].ExtraUsed,
+			ExtraLimit:     samples[i].ExtraLimit,
 			Components:     r.Components,
 		}
 		if in.HasUsage {

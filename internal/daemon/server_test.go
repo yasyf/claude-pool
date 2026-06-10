@@ -113,6 +113,175 @@ func TestHandleSelectHonorsSticky(t *testing.T) {
 	}
 }
 
+// TestHandleSelectSkipsExhaustedStickyPin replays the 2026-06-10 incident: the
+// cwd is pinned to an account whose 5h window is pegged with the reset ~21
+// minutes out (reset credit keeps its eff5 ≈ 93). The pin must be abandoned,
+// the pick must be a healthy account, and the sticky row rewritten.
+func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
+	s, dirs := newTestServer(t)
+	now := time.Now().Add(time.Minute) // newer than the harness samples
+	if err := s.m.Store.InsertUsageSample(store.UsageSample{
+		AccountID: 2, TS: now, Util5h: 100, Util7d: 21,
+		Resets5h: now.Add(21 * time.Minute), Resets7d: now.Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.Store.UpsertSticky("/proj", 2, now); err != nil {
+		t.Fatal(err)
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	if !resp.OK || resp.Dir != dirs[1] {
+		t.Fatalf("expected healthy acct-1 (%s) over the exhausted pin, got %+v", dirs[1], resp)
+	}
+	if resp.Sticky || resp.ExhaustedFallback {
+		t.Fatalf("a fresh healthy pick must report neither sticky nor fallback: %+v", resp)
+	}
+	st, ok, err := s.m.Store.GetSticky("/proj")
+	if err != nil || !ok || st.AccountID != 1 {
+		t.Fatalf("sticky row not rewritten to the winner: %+v ok=%v err=%v", st, ok, err)
+	}
+}
+
+// TestHandleSelectExhaustedFallback: with every account exhausted, select must
+// return the least-bad one flagged ExhaustedFallback (never an error), carrying
+// the pick's extra-usage flag and recovery time for the client warning, and the
+// log must name the exhausted runner-up (no Available candidates exist).
+func TestHandleSelectExhaustedFallback(t *testing.T) {
+	s, dirs := newTestServer(t)
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+	now := time.Now().Add(time.Minute)
+	reset := now.Add(20 * time.Minute)
+	for id, util7 := range map[int]float64{1: 90, 2: 10} {
+		if err := s.m.Store.InsertUsageSample(store.UsageSample{
+			AccountID: id, TS: now, Util5h: 100, Util7d: util7,
+			Resets5h: reset, ExtraEnabled: id == 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	if !resp.OK || !resp.ExhaustedFallback {
+		t.Fatalf("expected a flagged fallback pick, got %+v", resp)
+	}
+	if resp.Dir != dirs[2] || !resp.ExtraEnabled {
+		t.Fatalf("expected least-bad acct-2 (%s) with extra usage surfaced, got %+v", dirs[2], resp)
+	}
+	if resp.SoonestReset == nil || !resp.SoonestReset.Equal(reset.Truncate(time.Second)) {
+		t.Fatalf("fallback must carry the pick's recovery time %v for the warning, got %v", reset, resp.SoonestReset)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "select (exhausted-fallback): /proj -> acct-02") {
+		t.Fatalf("fallback pick not logged as such: %q", logged)
+	}
+	if !strings.Contains(logged, "runner-up acct-01") {
+		t.Fatalf("fallback log must name the exhausted runner-up: %q", logged)
+	}
+}
+
+// TestHandleSelectNoFallback: a --wait client (NoFallback) refuses the
+// least-bad exhausted pick, and the daemon must not commit the discarded
+// pick's side effects — no sticky rewrite, no reservation.
+func TestHandleSelectNoFallback(t *testing.T) {
+	s, _ := newTestServer(t)
+	now := time.Now().Add(time.Minute)
+	for id := 1; id <= 2; id++ {
+		if err := s.m.Store.InsertUsageSample(store.UsageSample{
+			AccountID: id, TS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Cwd: "/proj", NoFallback: true})
+	if resp.OK || !resp.NoneAvailable {
+		t.Fatalf("NoFallback over an exhausted pool must report none available, got %+v", resp)
+	}
+	if _, ok, _ := s.m.Store.GetSticky("/proj"); ok {
+		t.Fatal("a refused fallback pick must not rewrite the sticky record")
+	}
+	for id := 1; id <= 2; id++ {
+		if s.reservedCount(id) != 0 {
+			t.Fatalf("a refused fallback pick must not reserve acct-%d", id)
+		}
+	}
+}
+
+// TestHandleStatusPropagatesExhaustionAndOverage pins the status pipeline both
+// the pool layer (sample → Snapshot) and the wire layer (Snapshot → toStatuses)
+// — the operator-facing signal for exactly the state this fix gates on.
+func TestHandleStatusPropagatesExhaustionAndOverage(t *testing.T) {
+	s, _ := newTestServer(t)
+	now := time.Now().Add(time.Minute)
+	if err := s.m.Store.InsertUsageSample(store.UsageSample{
+		AccountID: 1, TS: now, Util5h: 100, Util7d: 21,
+		Resets5h:     now.Add(20 * time.Minute),
+		ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp := s.handleStatus(t.Context())
+	if !resp.OK || len(resp.Accounts) != 2 {
+		t.Fatalf("status failed: %+v", resp)
+	}
+	var acct1 *AccountStatus
+	for i := range resp.Accounts {
+		if resp.Accounts[i].ID == 1 {
+			acct1 = &resp.Accounts[i]
+		} else if resp.Accounts[i].Exhausted || resp.Accounts[i].ExtraEnabled {
+			t.Fatalf("healthy acct must carry no exhaustion/overage: %+v", resp.Accounts[i])
+		}
+	}
+	if acct1 == nil {
+		t.Fatal("acct-1 missing from status")
+	}
+	if !acct1.Exhausted {
+		t.Fatalf("pegged account must report exhausted: %+v", acct1)
+	}
+	if !acct1.ExtraEnabled || acct1.ExtraUsed != 177 || acct1.ExtraLimit != 5000 {
+		t.Fatalf("overage state must survive the wire: %+v", acct1)
+	}
+}
+
+// TestHandleSelectNoneAvailable: all rate-limited → structured NoneAvailable
+// (not just an error string) plus the soonest reset for --wait.
+func TestHandleSelectNoneAvailable(t *testing.T) {
+	s, _ := newTestServer(t)
+	now := time.Now().Add(time.Minute)
+	reset := now.Add(30 * time.Minute)
+	for id := 1; id <= 2; id++ {
+		if err := s.m.Store.InsertUsageSample(store.UsageSample{
+			AccountID: id, TS: now, Util5h: 50, Resets5h: reset, RateLimited: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	if resp.OK || !resp.NoneAvailable {
+		t.Fatalf("expected structured none-available, got %+v", resp)
+	}
+	if resp.SoonestReset == nil || !resp.SoonestReset.Equal(reset.Truncate(time.Second)) {
+		t.Fatalf("expected soonest reset %v, got %v", reset, resp.SoonestReset)
+	}
+}
+
+// TestHandleSelectLogsPick: every select logs its outcome — the 2026-06-10
+// incident needed DB forensics because fresh picks logged nothing.
+func TestHandleSelectLogsPick(t *testing.T) {
+	s, _ := newTestServer(t)
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+	if resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"}); !resp.OK {
+		t.Fatalf("select failed: %+v", resp)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "select: /proj -> acct-01") {
+		t.Fatalf("fresh pick not logged: %q", logged)
+	}
+	if !strings.Contains(logged, "5h 10% used") || !strings.Contains(logged, "runner-up acct-02") {
+		t.Fatalf("log line missing usage/runner-up: %q", logged)
+	}
+}
+
 func TestHandleSelectForcedRecordsSticky(t *testing.T) {
 	s, dirs := newTestServer(t)
 	acct := 2

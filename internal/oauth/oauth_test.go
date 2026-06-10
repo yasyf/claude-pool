@@ -130,6 +130,35 @@ func TestUsageIgnoresUnknownWindows(t *testing.T) {
 	if u.SevenDay.Remaining() != 44 {
 		t.Errorf("seven_day remaining = %.2f, want 44", u.SevenDay.Remaining())
 	}
+	want := ExtraUsage{IsEnabled: true, MonthlyLimit: 5000, UsedCredits: 177.0, Utilization: 3.54, Currency: "USD"}
+	if u.ExtraUsage != want {
+		t.Errorf("extra_usage = %+v, want %+v", u.ExtraUsage, want)
+	}
+}
+
+// TestUsageExtraUsageAbsent: payloads without an extra_usage block (or with
+// null) decode to the zero value, which reads as disabled.
+func TestUsageExtraUsageAbsent(t *testing.T) {
+	for name, body := range map[string]string{
+		"omitted": `{"five_hour":{"utilization":10.0,"resets_at":null},"seven_day":{"utilization":5.0,"resets_at":null}}`,
+		"null":    `{"five_hour":{"utilization":10.0,"resets_at":null},"seven_day":{"utilization":5.0,"resets_at":null},"extra_usage":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				io.WriteString(w, body)
+			}))
+			defer srv.Close()
+			c := New()
+			c.usageURL = srv.URL
+			u, err := c.Usage(context.Background(), "abc")
+			if err != nil {
+				t.Fatalf("Usage: %v", err)
+			}
+			if u.ExtraUsage != (ExtraUsage{}) {
+				t.Errorf("extra_usage = %+v, want zero value", u.ExtraUsage)
+			}
+		})
+	}
 }
 
 // TestResetTimeDecoding covers every resets_at encoding the usage endpoint has

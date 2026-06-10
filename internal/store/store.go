@@ -32,13 +32,16 @@ CREATE TABLE IF NOT EXISTS accounts (
   created_at       INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS usage_samples (
-  account_id   INTEGER NOT NULL,
-  ts           INTEGER NOT NULL,
-  util_5h      REAL,
-  util_7d      REAL,
-  resets_5h    INTEGER,
-  resets_7d    INTEGER,
-  rate_limited INTEGER NOT NULL DEFAULT 0,
+  account_id    INTEGER NOT NULL,
+  ts            INTEGER NOT NULL,
+  util_5h       REAL,
+  util_7d       REAL,
+  resets_5h     INTEGER,
+  resets_7d     INTEGER,
+  rate_limited  INTEGER NOT NULL DEFAULT 0,
+  extra_enabled INTEGER NOT NULL DEFAULT 0,
+  extra_used    REAL NOT NULL DEFAULT 0,
+  extra_limit   REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (account_id, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_acct_ts ON usage_samples(account_id, ts DESC);
@@ -229,36 +232,36 @@ func tsOrNil(t time.Time) any {
 	return t.Unix()
 }
 
+const usageSampleCols = `account_id,ts,util_5h,util_7d,resets_5h,resets_7d,rate_limited,extra_enabled,extra_used,extra_limit`
+
 // InsertUsageSample records one usage poll.
 func (s *Store) InsertUsageSample(u UsageSample) error {
-	rl := 0
+	rl, xe := 0, 0
 	if u.RateLimited {
 		rl = 1
 	}
+	if u.ExtraEnabled {
+		xe = 1
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO usage_samples(account_id,ts,util_5h,util_7d,resets_5h,resets_7d,rate_limited)
-		 VALUES(?,?,?,?,?,?,?)
+		`INSERT INTO usage_samples(`+usageSampleCols+`)
+		 VALUES(?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(account_id,ts) DO NOTHING`,
 		u.AccountID, u.TS.Unix(), u.Util5h, u.Util7d,
-		tsOrNil(u.Resets5h), tsOrNil(u.Resets7d), rl)
+		tsOrNil(u.Resets5h), tsOrNil(u.Resets7d), rl, xe, u.ExtraUsed, u.ExtraLimit)
 	return err
 }
 
-// LatestUsageSample returns the most recent sample for an account, or ok=false.
-func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
-	row := s.db.QueryRow(
-		`SELECT account_id,ts,util_5h,util_7d,resets_5h,resets_7d,rate_limited
-		 FROM usage_samples WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID)
+// scanUsageSample decodes one usage_samples row; the parameter is satisfied by
+// both *sql.Row and *sql.Rows.
+func scanUsageSample(row interface{ Scan(...any) error }) (UsageSample, error) {
 	var u UsageSample
 	var ts int64
 	var u5, u7 sql.NullFloat64
 	var r5, r7 sql.NullInt64
-	var rl int
-	if err := row.Scan(&u.AccountID, &ts, &u5, &u7, &r5, &r7, &rl); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return u, false, nil
-		}
-		return u, false, err
+	var rl, xe int
+	if err := row.Scan(&u.AccountID, &ts, &u5, &u7, &r5, &r7, &rl, &xe, &u.ExtraUsed, &u.ExtraLimit); err != nil {
+		return u, err
 	}
 	u.TS = time.Unix(ts, 0)
 	u.Util5h, u.Util7d = u5.Float64, u7.Float64
@@ -269,6 +272,22 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 		u.Resets7d = time.Unix(r7.Int64, 0)
 	}
 	u.RateLimited = rl != 0
+	u.ExtraEnabled = xe != 0
+	return u, nil
+}
+
+// LatestUsageSample returns the most recent sample for an account, or ok=false.
+func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
+	row := s.db.QueryRow(
+		`SELECT `+usageSampleCols+`
+		 FROM usage_samples WHERE account_id=? ORDER BY ts DESC LIMIT 1`, accountID)
+	u, err := scanUsageSample(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return u, false, nil
+	}
+	if err != nil {
+		return u, false, err
+	}
 	return u, true, nil
 }
 
@@ -276,7 +295,7 @@ func (s *Store) LatestUsageSample(accountID int) (UsageSample, bool, error) {
 // newest first. Used to estimate the utilization burn rate.
 func (s *Store) RecentUsageSamples(accountID, limit int) ([]UsageSample, error) {
 	rows, err := s.db.Query(
-		`SELECT account_id,ts,util_5h,util_7d,resets_5h,resets_7d,rate_limited
+		`SELECT `+usageSampleCols+`
 		 FROM usage_samples WHERE account_id=? ORDER BY ts DESC LIMIT ?`, accountID, limit)
 	if err != nil {
 		return nil, err
@@ -284,23 +303,10 @@ func (s *Store) RecentUsageSamples(accountID, limit int) ([]UsageSample, error) 
 	defer rows.Close()
 	var out []UsageSample
 	for rows.Next() {
-		var u UsageSample
-		var ts int64
-		var u5, u7 sql.NullFloat64
-		var r5, r7 sql.NullInt64
-		var rl int
-		if err := rows.Scan(&u.AccountID, &ts, &u5, &u7, &r5, &r7, &rl); err != nil {
+		u, err := scanUsageSample(rows)
+		if err != nil {
 			return nil, err
 		}
-		u.TS = time.Unix(ts, 0)
-		u.Util5h, u.Util7d = u5.Float64, u7.Float64
-		if r5.Valid {
-			u.Resets5h = time.Unix(r5.Int64, 0)
-		}
-		if r7.Valid {
-			u.Resets7d = time.Unix(r7.Int64, 0)
-		}
-		u.RateLimited = rl != 0
 		out = append(out, u)
 	}
 	return out, rows.Err()

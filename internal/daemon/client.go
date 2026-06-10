@@ -53,10 +53,11 @@ func (c *Client) do(req Request, timeout time.Duration) (*Response, error) {
 }
 
 // Select asks the daemon for the best account dir. cwd keys best-effort
-// session stickiness; empty disables it. ok=false means the caller should
-// fall back to a live, daemonless selection.
-func (c *Client) Select(account *int, pid int, noMark bool, cwd string) (resp *Response, ok bool) {
-	r, err := c.do(Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd}, 3*time.Second)
+// session stickiness; empty disables it. noFallback rejects a least-bad
+// exhausted pick (set by --wait callers, which would discard it). ok=false
+// means the caller should fall back to a live, daemonless selection.
+func (c *Client) Select(account *int, pid int, noMark bool, cwd string, noFallback bool) (resp *Response, ok bool) {
+	r, err := c.do(Request{Op: OpSelect, Account: account, PID: pid, NoMark: noMark, Cwd: cwd, NoFallback: noFallback}, 3*time.Second)
 	if err != nil {
 		return nil, false
 	}

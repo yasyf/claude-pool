@@ -206,10 +206,16 @@ func TestUsableForSticky(t *testing.T) {
 		r    Result
 		want bool
 	}{
-		{"healthy", Result{Available: true, Components: Components{Eff5: 90}}, true},
-		{"rate-limited despite headroom", Result{Available: false, Components: Components{Eff5: 90}}, false},
-		{"just below floor", Result{Available: true, Components: Components{Eff5: StickyMinEff5 - 0.1}}, false},
-		{"exactly at floor", Result{Available: true, Components: Components{Eff5: StickyMinEff5}}, true},
+		{"healthy", Result{Available: true, Components: Components{RawRemaining5h: 90}}, true},
+		{"rate-limited despite headroom", Result{Available: false, Components: Components{RawRemaining5h: 90}}, false},
+		{"just below floor", Result{Available: true, Components: Components{RawRemaining5h: StickyMinRemaining5h - 0.1}}, false},
+		{"exactly at floor", Result{Available: true, Components: Components{RawRemaining5h: StickyMinRemaining5h}}, true},
+		// The incident shape: exhausted with an imminent reset — eff5 is high but
+		// the pin must be abandoned. Raw remaining, not eff, drives the floor.
+		{"exhausted despite high eff5", Result{Available: false, Exhausted: true,
+			Components: Components{Eff5: 93, RawRemaining5h: 0}}, false},
+		{"high eff cannot mask low raw", Result{Available: true,
+			Components: Components{Eff5: 95, RawRemaining5h: 5}}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -217,5 +223,218 @@ func TestUsableForSticky(t *testing.T) {
 				t.Fatalf("UsableForSticky(%+v) = %v, want %v", tc.r, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestExhaustedGate(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name          string
+		in            Input
+		wantExhausted bool
+		wantAvailable bool
+	}{
+		{"pegged 5h, future reset",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute)},
+			true, false},
+		{"pegged 5h, past reset (stale pre-poll sample)",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute), Util5h: 100, Resets5h: now.Add(-time.Minute)},
+			false, true},
+		{"pegged 5h, unknown reset",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100},
+			false, true},
+		{"util 99 below threshold",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 99, Resets5h: now.Add(20 * time.Minute)},
+			false, true},
+		{"pegged 7d, future reset",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util7d: 100, Resets7d: now.Add(24 * time.Hour)},
+			true, false},
+		{"never sampled",
+			Input{AccountID: 1, HasUsage: false},
+			false, true},
+		{"rate-limited and exhausted",
+			Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute), RateLimited: true},
+			true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Score(tc.in, now)
+			if r.Exhausted != tc.wantExhausted || r.Available != tc.wantAvailable {
+				t.Fatalf("exhausted=%v available=%v, want exhausted=%v available=%v",
+					r.Exhausted, r.Available, tc.wantExhausted, tc.wantAvailable)
+			}
+			if r.Exhausted == r.ExhaustedUntil.IsZero() {
+				t.Fatalf("ExhaustedUntil must be set exactly when exhausted: exhausted=%v until=%v",
+					r.Exhausted, r.ExhaustedUntil)
+			}
+		})
+	}
+}
+
+// TestExhaustedUntilBindingReset: recovery is the latest reset among the
+// windows that tripped the gate — a 7d-exhausted account does not recover at
+// its (sooner) 5h reset.
+func TestExhaustedUntilBindingReset(t *testing.T) {
+	now := time.Now()
+	reset5, reset7 := now.Add(20*time.Minute), now.Add(3*24*time.Hour)
+
+	sevenOnly := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now,
+		Util5h: 20, Util7d: 100, Resets5h: reset5, Resets7d: reset7}, now)
+	if !sevenOnly.Exhausted || !sevenOnly.ExhaustedUntil.Equal(reset7) {
+		t.Fatalf("7d-only exhaustion must recover at the 7d reset: %+v", sevenOnly)
+	}
+
+	both := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now,
+		Util5h: 100, Util7d: 100, Resets5h: reset5, Resets7d: reset7}, now)
+	if !both.ExhaustedUntil.Equal(reset7) {
+		t.Fatalf("both-windows exhaustion must recover at the LATEST reset, got %v", both.ExhaustedUntil)
+	}
+
+	fiveOnly := Score(Input{AccountID: 3, HasUsage: true, SampleTS: now,
+		Util5h: 100, Util7d: 10, Resets5h: reset5, Resets7d: reset7}, now)
+	if !fiveOnly.ExhaustedUntil.Equal(reset5) {
+		t.Fatalf("5h-only exhaustion must recover at the 5h reset, got %v", fiveOnly.ExhaustedUntil)
+	}
+}
+
+// TestRawRemainingSelfLiftsAtReset: a stale pegged sample whose reset has
+// passed must not barrier, runway-penalize, or sticky-floor the account — the
+// window already refilled, mirroring the gate's and windowFrac's self-lift.
+func TestRawRemainingSelfLiftsAtReset(t *testing.T) {
+	now := time.Now()
+	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute),
+		Util5h: 100, Resets5h: now.Add(-time.Minute), Burn5hPerHour: 50}, now)
+	if r.Components.RawRemaining5h != 100 {
+		t.Fatalf("raw remaining must self-lift at the reset, got %.1f", r.Components.RawRemaining5h)
+	}
+	// The refilled window scores exactly like a genuinely-full one with the
+	// same burn (the burn-derived runway penalty legitimately remains).
+	full := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now.Add(-2 * time.Minute),
+		Util5h: 0, Burn5hPerHour: 50}, now)
+	if r.Components.Barrier5h != 0 || r.Components.RunwayPenalty != full.Components.RunwayPenalty {
+		t.Fatalf("post-reset sample must score as a full window: barrier=%.1f runway=%.1f want runway=%.1f",
+			r.Components.Barrier5h, r.Components.RunwayPenalty, full.Components.RunwayPenalty)
+	}
+	if !UsableForSticky(r) {
+		t.Fatal("a sticky pin must survive the post-reset poll gap")
+	}
+	// Control: the same sample pre-reset keeps the full penalties.
+	pre := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now,
+		Util5h: 100, Resets5h: now.Add(time.Minute), Burn5hPerHour: 50}, now)
+	if pre.Components.RawRemaining5h != 0 || pre.Components.Barrier5h != BarrierKnee {
+		t.Fatalf("pre-reset pegged sample must keep raw=0/full barrier: %+v", pre.Components)
+	}
+}
+
+// TestBarrierOnRawRemaining pins the fix: a pegged window with an imminent
+// reset takes the FULL barrier penalty — the reset credit (eff5≈93) must not
+// mask zero current headroom. The old eff-based barrier was exactly 0 here.
+func TestBarrierOnRawRemaining(t *testing.T) {
+	now := time.Now()
+	pegged := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Resets5h: now.Add(21 * time.Minute)}, now)
+	if pegged.Components.Barrier5h != BarrierKnee {
+		t.Fatalf("pegged window must take the full barrier %v, got %v", BarrierKnee, pegged.Components.Barrier5h)
+	}
+	if pegged.Components.Eff5 <= 90 {
+		t.Fatalf("precondition: imminent reset should keep eff5 high (got %.1f) — otherwise this test proves nothing", pegged.Components.Eff5)
+	}
+	healthy := Score(Input{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 40, Resets5h: now.Add(21 * time.Minute)}, now)
+	if healthy.Components.Barrier5h != 0 {
+		t.Fatalf("healthy window must take no barrier, got %v", healthy.Components.Barrier5h)
+	}
+}
+
+// TestRunwayUsesRawRemaining: time-to-wall is raw remaining over burn; the
+// reset-credited eff5 understated the penalty for a nearly-pegged window.
+func TestRunwayUsesRawRemaining(t *testing.T) {
+	now := time.Now()
+	r := Score(Input{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 95, Resets5h: now.Add(10 * time.Minute), Burn5hPerHour: 30}, now)
+	// raw5=5 → runway 5/30 h ≈ 0.167h → frac = 1 − 0.167/5 → penalty ≈ 14.5.
+	want := RunwayWeight * (1 - (5.0/30.0)/RunwayHorizon.Hours())
+	if got := r.Components.RunwayPenalty; got != want {
+		t.Fatalf("runway penalty = %.4f, want %.4f (raw-remaining based)", got, want)
+	}
+}
+
+func TestPickFallback(t *testing.T) {
+	now := time.Now()
+	reset := now.Add(20 * time.Minute)
+	t.Run("prefers best exhausted over rate-limited", func(t *testing.T) {
+		inputs := []Input{
+			{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Util7d: 90, Resets5h: reset},
+			{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 100, Util7d: 10, Resets5h: reset},
+			{AccountID: 3, HasUsage: true, SampleTS: now, Util5h: 0, RateLimited: true},
+		}
+		ranked := Rank(inputs, now)
+		if _, ok := Pick(ranked); ok {
+			t.Fatal("precondition: no account should be available")
+		}
+		fb, ok := PickFallback(ranked)
+		if !ok || fb.AccountID != 2 {
+			t.Fatalf("expected fallback to best exhausted acct 2, got ok=%v id=%d", ok, fb.AccountID)
+		}
+	})
+	t.Run("none when all rate-limited", func(t *testing.T) {
+		inputs := []Input{
+			{AccountID: 1, HasUsage: true, SampleTS: now, RateLimited: true},
+			{AccountID: 2, HasUsage: true, SampleTS: now, RateLimited: true},
+		}
+		if _, ok := PickFallback(Rank(inputs, now)); ok {
+			t.Fatal("expected no fallback when every account is rate-limited")
+		}
+	})
+}
+
+// TestIncidentRegression20260610 replays the real 2026-06-10 05:18 selection
+// (from ~/.cc-pool/pool.db forensics) where acct-1 — 100% 5h-used, reset 21
+// minutes out — outranked acct-2 (31% used) via reset credit and was launched,
+// silently billing extra-usage credits. It must never be picked again.
+func TestIncidentRegression20260610(t *testing.T) {
+	now := time.Now()
+	in21m, in2h42m, in4h41m := now.Add(21*time.Minute), now.Add(2*time.Hour+42*time.Minute), now.Add(4*time.Hour+41*time.Minute)
+	nextDay := now.Add(24*time.Hour + 41*time.Minute)
+	incident := func(sessions1, sessions2, sessions3 int) []Input {
+		return []Input{
+			{AccountID: 1, HasUsage: true, SampleTS: now, Util5h: 100, Util7d: 21, Resets5h: in21m, Resets7d: nextDay, ActiveSessions: sessions1},
+			{AccountID: 2, HasUsage: true, SampleTS: now, Util5h: 31, Util7d: 6, Resets5h: in2h42m, Resets7d: now.Add(7*time.Hour + 41*time.Minute), ActiveSessions: sessions2},
+			{AccountID: 3, HasUsage: true, SampleTS: now, Util5h: 40, Util7d: 8, Resets5h: in21m, Resets7d: in4h41m, ActiveSessions: sessions3},
+		}
+	}
+
+	ranked := Rank(incident(0, 0, 0), now)
+	best, ok := Pick(ranked)
+	if !ok || best.AccountID == 1 {
+		t.Fatalf("exhausted acct-1 must never win: ok=%v picked=%d", ok, best.AccountID)
+	}
+	if best.AccountID != 3 {
+		t.Fatalf("expected acct-3 (highest headroom) to win, got acct-%d", best.AccountID)
+	}
+	for _, r := range ranked {
+		if r.AccountID == 1 {
+			if !r.Exhausted || r.Available {
+				t.Fatalf("acct-1 must be exhausted+unavailable, got %+v", r)
+			}
+			// Defense in depth: even pre-gate, barrier-on-raw must rank it last.
+			for _, other := range ranked {
+				if other.AccountID != 1 && other.Score <= r.Score {
+					t.Fatalf("acct-1 (%.1f) must score below acct-%d (%.1f) via the raw barrier alone",
+						r.Score, other.AccountID, other.Score)
+				}
+			}
+		}
+	}
+
+	// Heavy sessions on the healthy accounts (the real tiebreaker that night)
+	// still must not route to the exhausted one.
+	best, ok = Pick(Rank(incident(0, 4, 6), now))
+	if !ok || best.AccountID == 1 {
+		t.Fatalf("exhausted acct-1 must never win even under session pressure: ok=%v picked=%d", ok, best.AccountID)
+	}
+
+	// Sticky pin on acct-1 (cc-skills had one) must be abandoned.
+	for _, r := range Rank(incident(0, 0, 0), now) {
+		if r.AccountID == 1 && UsableForSticky(r) {
+			t.Fatal("sticky pin on the exhausted account must be abandoned")
+		}
 	}
 }

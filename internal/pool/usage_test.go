@@ -73,3 +73,44 @@ func TestPoolNeverTouchesDefaultKeychainItem(t *testing.T) {
 		t.Errorf("deletes = %v, want exactly [%q]", del, svc)
 	}
 }
+
+// TestSampleUsagePersistsExtraUsage pins the oauth→store join in recordSample:
+// the usage windows AND the extra-usage block fetched from the API must land in
+// the latest stored sample verbatim — status and the exhausted-fallback billing
+// warning read them from there, and each layer's isolated tests would stay
+// green if this mapping were dropped.
+func TestSampleUsagePersistsExtraUsage(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "pool.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	a := store.Account{ID: 1, ConfigDir: t.TempDir(), KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+
+	fk := newFakeKeychain()
+	cred := &keychain.Credential{}
+	cred.ClaudeAiOauth.AccessToken = "at-0"
+	cred.ClaudeAiOauth.RefreshToken = "rt-0"
+	cred.ClaudeAiOauth.ExpiresAt = time.Now().Add(2 * time.Hour).UnixMilli() // fresh: no refresh needed
+	if err := fk.Write(a.KeychainService, a.KeychainAccount, cred); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Store: st, OAuth: &fakeOAuth{currentRT: "rt-0"}, Keychain: fk, LockDir: t.TempDir()}
+
+	if _, _, err := m.SampleUsage(context.Background(), a, false); err != nil {
+		t.Fatalf("SampleUsage: %v", err)
+	}
+	got, ok, err := st.LatestUsageSample(1)
+	if err != nil || !ok {
+		t.Fatalf("latest sample: ok=%v err=%v", ok, err)
+	}
+	if got.Util5h != 31 || got.Util7d != 7 {
+		t.Fatalf("windows not persisted: %+v", got)
+	}
+	if !got.ExtraEnabled || got.ExtraUsed != 177 || got.ExtraLimit != 5000 {
+		t.Fatalf("extra usage not persisted: %+v", got)
+	}
+}

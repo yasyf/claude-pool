@@ -305,15 +305,25 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 
 	ranked, bySnap := s.rankWithReservations(snaps)
 	r, sticky := s.m.StickyPick(req.Cwd, ranked, time.Now())
+	fallback := false
 	if !sticky {
 		var ok bool
 		r, ok = score.Pick(ranked)
+		if !ok && !req.NoFallback {
+			// Every account is exhausted (or worse): launch on the least-bad
+			// exhausted one rather than refusing; the client warns loudly.
+			r, ok = score.PickFallback(ranked)
+			fallback = true
+		}
 		if !ok {
 			soonest := soonestReset(snaps)
-			resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error()}
+			resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error(), NoneAvailable: true}
+			when := "unknown"
 			if !soonest.IsZero() {
 				resp.SoonestReset = &soonest
+				when = soonest.Format(time.RFC3339)
 			}
+			s.log.Printf("select: %s -> none available (soonest reset %s)", req.Cwd, when)
 			return resp
 		}
 	}
@@ -329,9 +339,9 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	// Record regardless of NoMark: cache continuity is established by
 	// `ccp run`'s no-mark select too.
 	s.recordSticky(req.Cwd, best.Account.ID)
-	if sticky {
-		s.log.Printf("sticky select: %s -> acct-%02d", req.Cwd, best.Account.ID)
-	}
+	s.log.Printf("select%s: %s -> acct-%02d (score %.1f · 5h %.0f%% used · 7d %.0f%% used%s)",
+		selectKind(sticky, fallback), req.Cwd, best.Account.ID,
+		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	id := best.Account.ID
 	// Preflight refresh the winner if idle and expiring soon (best-effort).
 	// The Add(1) runs inside an already-tracked handler goroutine, so the
@@ -345,8 +355,45 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 			s.log.Printf("acct-%02d preflight refresh: %v", best.Account.ID, err)
 		}
 	}()
-	return Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id, Sticky: sticky,
-		Remaining5h: best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage}
+	resp := Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id, Sticky: sticky,
+		Remaining5h: best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage,
+		ExhaustedFallback: fallback, ExtraEnabled: best.ExtraEnabled}
+	if fallback && !r.ExhaustedUntil.IsZero() {
+		// Tell the client when the fallback pick actually recovers — the latest
+		// reset among its pegged windows, not necessarily the 5h one.
+		resp.SoonestReset = &r.ExhaustedUntil
+	}
+	return resp
+}
+
+// selectKind renders the select log qualifier: sticky and fallback picks are
+// mutually exclusive (a sticky pin is abandoned before the fallback engages).
+func selectKind(sticky, fallback bool) string {
+	switch {
+	case sticky:
+		return " (sticky)"
+	case fallback:
+		return " (exhausted-fallback)"
+	default:
+		return ""
+	}
+}
+
+// runnerUp renders the next-best servable account after winnerID for the
+// select log, empty when there is none. A fallback pick means nothing is
+// Available, so candidates widen to PickFallback's own predicate — otherwise
+// the one select kind that most needs forensic context would never log one.
+func runnerUp(ranked []score.Result, winnerID int, fallback bool) string {
+	for _, r := range ranked {
+		if r.AccountID == winnerID {
+			continue
+		}
+		if !r.Available && !(fallback && !r.RateLimited) {
+			continue
+		}
+		return fmt.Sprintf(" · runner-up acct-%02d %.1f", r.AccountID, r.Score)
+	}
+	return ""
 }
 
 // recordSticky upserts the cwd->account sticky record, logging (not failing)
@@ -454,11 +501,15 @@ func toStatuses(snaps []pool.Snapshot) []AccountStatus {
 			Remaining7d:    sn.Remaining7d,
 			ActiveSessions: sn.ActiveSessions,
 			RateLimited:    sn.RateLimited,
+			Exhausted:      sn.Exhausted,
 			HasUsage:       sn.HasUsage,
 			Stale:          sn.Stale,
 			Resets5h:       sn.Resets5h,
 			Resets7d:       sn.Resets7d,
 			SampleAge:      sn.SampleAge.Round(time.Second).String(),
+			ExtraEnabled:   sn.ExtraEnabled,
+			ExtraUsed:      sn.ExtraUsed,
+			ExtraLimit:     sn.ExtraLimit,
 			Components:     sn.Components,
 		})
 	}

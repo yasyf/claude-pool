@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,8 +27,8 @@ func TestStickyPick(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	// acct-1 ranks first; acct-2 is the sticky target the record points at.
 	healthy := []score.Result{
-		{AccountID: 1, Score: 80, Available: true, Components: score.Components{Eff5: 90}},
-		{AccountID: 2, Score: 50, Available: true, Components: score.Components{Eff5: 50}},
+		{AccountID: 1, Score: 80, Available: true, Components: score.Components{RawRemaining5h: 90}},
+		{AccountID: 2, Score: 50, Available: true, Components: score.Components{RawRemaining5h: 50}},
 	}
 	cases := []struct {
 		name       string
@@ -43,12 +44,18 @@ func TestStickyPick(t *testing.T) {
 		{"expired", "/proj", true, 2, now.Add(-StickyTTL - time.Minute), healthy, 0, false},
 		{"exactly at TTL still sticky", "/proj", true, 2, now.Add(-StickyTTL), healthy, 2, true},
 		{"near-full abandoned", "/proj", true, 2, now, []score.Result{
-			{AccountID: 1, Score: 80, Available: true, Components: score.Components{Eff5: 90}},
-			{AccountID: 2, Score: 5, Available: true, Components: score.Components{Eff5: score.StickyMinEff5 - 1}},
+			{AccountID: 1, Score: 80, Available: true, Components: score.Components{RawRemaining5h: 90}},
+			{AccountID: 2, Score: 5, Available: true, Components: score.Components{RawRemaining5h: score.StickyMinRemaining5h - 1}},
 		}, 0, false},
 		{"rate-limited abandoned", "/proj", true, 2, now, []score.Result{
-			{AccountID: 1, Score: 80, Available: true, Components: score.Components{Eff5: 90}},
-			{AccountID: 2, Score: -50, Available: false, Components: score.Components{Eff5: 50}},
+			{AccountID: 1, Score: 80, Available: true, Components: score.Components{RawRemaining5h: 90}},
+			{AccountID: 2, Score: -50, Available: false, Components: score.Components{RawRemaining5h: 50}},
+		}, 0, false},
+		// The 2026-06-10 incident: the pinned account is exhausted but its
+		// imminent reset keeps eff5 high — the pin must still be abandoned.
+		{"exhausted pin abandoned", "/proj", true, 2, now, []score.Result{
+			{AccountID: 1, Score: 80, Available: true, Components: score.Components{RawRemaining5h: 60}},
+			{AccountID: 2, Score: 65, Available: false, Exhausted: true, Components: score.Components{Eff5: 93, RawRemaining5h: 0}},
 		}, 0, false},
 		{"account deleted", "/proj", true, 9, now, healthy, 0, false},
 		{"empty cwd disabled", "", true, 2, now, healthy, 0, false},
@@ -76,7 +83,7 @@ func TestStickyPick(t *testing.T) {
 func TestRecordStickySlidingTTL(t *testing.T) {
 	m := openTestManager(t)
 	t0 := time.Now()
-	ranked := []score.Result{{AccountID: 2, Score: 50, Available: true, Components: score.Components{Eff5: 50}}}
+	ranked := []score.Result{{AccountID: 2, Score: 50, Available: true, Components: score.Components{RawRemaining5h: 50}}}
 
 	if err := m.RecordSticky("/proj", 2, t0); err != nil {
 		t.Fatal(err)
@@ -170,4 +177,55 @@ func TestSelectHonorsSticky(t *testing.T) {
 			t.Fatal("empty cwd must not be recorded")
 		}
 	})
+}
+
+// TestSelectAllExhaustedFallback: when every account's 5h window is pegged with
+// a pending reset, Select must still return the least-bad one — flagged so the
+// caller warns — rather than erroring; only all-rate-limited errors.
+func TestSelectAllExhaustedFallback(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	m := openTestManager(t)
+	dir := t.TempDir()
+	for id, util7 := range map[int]float64{1: 90, 2: 10} {
+		if err := m.Store.UpsertAccount(store.Account{
+			ID: id, ConfigDir: filepath.Join(dir, "acct", string(rune('a'+id))),
+			KeychainService: "svc", KeychainAccount: "u",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Store.InsertUsageSample(store.UsageSample{
+			AccountID: id, TS: now, Util5h: 100, Util7d: util7,
+			Resets5h: now.Add(20 * time.Minute), ExtraEnabled: id == 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sr, err := m.Select(ctx, SelectOptions{})
+	if err != nil {
+		t.Fatalf("all-exhausted select must fall back, got %v", err)
+	}
+	if !sr.ExhaustedFallback || !sr.Result.Exhausted {
+		t.Fatalf("fallback pick must be flagged: %+v", sr)
+	}
+	if sr.Best.ID != 2 {
+		t.Fatalf("expected least-bad acct 2 (emptier 7d), got %d", sr.Best.ID)
+	}
+	if !sr.ExtraEnabled {
+		t.Fatal("pick's extra-usage flag must surface for the warning")
+	}
+
+	// Negative control: rate-limited accounts cannot serve at all.
+	m2 := openTestManager(t)
+	if err := m2.Store.UpsertAccount(store.Account{ID: 1, ConfigDir: filepath.Join(dir, "rl"), KeychainService: "svc", KeychainAccount: "u"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m2.Store.InsertUsageSample(store.UsageSample{AccountID: 1, TS: now, Util5h: 100, Resets5h: now.Add(20 * time.Minute), RateLimited: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m2.Select(ctx, SelectOptions{}); !errors.Is(err, ErrNoneAvailable) {
+		t.Fatalf("all-rate-limited must error ErrNoneAvailable, got %v", err)
+	}
 }

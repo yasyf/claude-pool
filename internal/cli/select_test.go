@@ -2,11 +2,16 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
+	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -56,6 +61,148 @@ func TestSelectionLine(t *testing.T) {
 				t.Errorf("daemonSelectionLine = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDaemonSelectOutcome pins the daemon-reply dispatch, in particular that a
+// none-available reply with --wait reaches the wait loop: the daemon sets BOTH
+// NoneAvailable and Error, and the old Error-first match made --wait dead code.
+func TestDaemonSelectOutcome(t *testing.T) {
+	cases := map[string]struct {
+		resp daemon.Response
+		wait bool
+		want selectOutcome
+	}{
+		"picked":                        {daemon.Response{OK: true, Dir: "/d"}, false, outcomePicked},
+		"picked ignores wait":           {daemon.Response{OK: true, Dir: "/d"}, true, outcomePicked},
+		"fallback pick accepted":        {daemon.Response{OK: true, Dir: "/d", ExhaustedFallback: true}, false, outcomePicked},
+		"fallback pick waits with wait": {daemon.Response{OK: true, Dir: "/d", ExhaustedFallback: true}, true, outcomeWait},
+		"none available, no wait":       {daemon.Response{NoneAvailable: true, Error: "no account is currently available"}, false, outcomeFail},
+		"none available, wait":          {daemon.Response{NoneAvailable: true, Error: "no account is currently available"}, true, outcomeWait},
+		"real error":                    {daemon.Response{Error: "boom"}, false, outcomeError},
+		"real error not masked by wait": {daemon.Response{Error: "boom"}, true, outcomeError},
+		"empty reply, wait":             {daemon.Response{}, true, outcomeWait},
+		"empty reply, no wait":          {daemon.Response{}, false, outcomeFail},
+	}
+	for name, tc := range cases {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			if got := daemonSelectOutcome(&tc.resp, tc.wait); got != tc.want {
+				t.Errorf("daemonSelectOutcome = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWarnExhaustedFallback pins the billing warning wording: credits when
+// overage is enabled, rate-limit otherwise, reset time when known.
+func TestWarnExhaustedFallback(t *testing.T) {
+	run := func(extraEnabled bool) string {
+		var stderr bytes.Buffer
+		cmd := &cobra.Command{}
+		cmd.SetErr(&stderr)
+		warnExhaustedFallback(cmd, "work@example.com", extraEnabled, time.Now().Add(20*time.Minute))
+		return stripANSI(stderr.String())
+	}
+	if got := run(true); !strings.Contains(got, "WILL bill extra-usage credits") || !strings.Contains(got, "resets at") {
+		t.Errorf("overage warning wrong: %q", got)
+	}
+	if got := run(false); !strings.Contains(got, "rate-limited until") {
+		t.Errorf("rate-limit warning wrong: %q", got)
+	}
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&stderr)
+	warnExhaustedFallback(cmd, "x", true, time.Time{})
+	if got := stripANSI(stderr.String()); strings.Contains(got, "resets at") {
+		t.Errorf("unknown reset must omit the reset clause: %q", got)
+	}
+}
+
+// exhaustedPoolManager builds a Manager over a temp store whose two accounts
+// are both 5h-pegged with pending resets and fresh samples — the all-exhausted
+// state — with acct-2 the least-bad (emptier 7d, overage enabled). The fake
+// keychain is empty, so any preflight refresh is a harmless needs-login miss.
+func exhaustedPoolManager(t *testing.T) *pool.Manager {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir()) // SyncOverlay resolves ~/.claude from HOME
+	t.Setenv("USER", "user")
+	st := openTestStore(t)
+	now := time.Now()
+	for id, util7 := range map[int]float64{1: 90, 2: 10} {
+		if err := st.UpsertAccount(store.Account{
+			ID: id, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
+			KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test", OverlayKind: "symlink",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.InsertUsageSample(store.UsageSample{
+			AccountID: id, TS: now, Util5h: 100, Util7d: util7,
+			Resets5h: now.Add(20 * time.Minute), ExtraEnabled: id == 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &pool.Manager{Store: st, Keychain: emptyKeychain{}, LockDir: t.TempDir()}
+}
+
+// emptyKeychain satisfies pool.CredentialStore with no items, turning the
+// preflight refresh into the needs-login warning path.
+type emptyKeychain struct{}
+
+func (emptyKeychain) Read(string, string) (*keychain.Credential, error) {
+	return nil, keychain.ErrNotFound
+}
+func (emptyKeychain) Write(string, string, *keychain.Credential) error { return nil }
+func (emptyKeychain) Delete(string, string) error                      { return nil }
+func (emptyKeychain) Discover(string) (string, error)                  { return "", keychain.ErrNotFound }
+
+// TestResolveSelectionWarnsOnExhaustedFallback pins the warning at the
+// integration point: a live all-exhausted selection must emit the billing
+// warning on stderr and still hand back the least-bad dir. Deleting the
+// warnExhaustedFallback call site fails this test.
+func TestResolveSelectionWarnsOnExhaustedFallback(t *testing.T) {
+	m := exhaustedPoolManager(t)
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&stderr)
+	cmd.SetContext(context.Background())
+
+	dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
+	if err != nil || dir == "" {
+		t.Fatalf("fallback selection must succeed: dir=%q err=%v", dir, err)
+	}
+	out := stripANSI(stderr.String())
+	if !strings.Contains(out, "WILL bill extra-usage credits") {
+		t.Fatalf("billing warning missing from stderr: %q", out)
+	}
+	if !strings.Contains(out, "resets at") {
+		t.Fatalf("warning must name the recovery time: %q", out)
+	}
+}
+
+// TestResolveSelectionWaitRefusesExhaustedFallback pins --wait's contract:
+// over an all-exhausted pool it must wait (here: until the context cancels),
+// never hand back the exhausted pick that a non-wait call accepts.
+func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
+	m := exhaustedPoolManager(t)
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&stderr)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled: the wait loop must exit on its first sleep
+	cmd.SetContext(ctx)
+
+	_, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, wait: true, cwd: "/proj"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait must block until cancelled, got %v", err)
+	}
+	out := stripANSI(stderr.String())
+	if !strings.Contains(out, "soonest reset at") {
+		t.Fatalf("wait message missing from stderr: %q", out)
+	}
+	if strings.Contains(out, "WILL bill") {
+		t.Fatalf("--wait must never accept (or warn about) a billing fallback: %q", out)
 	}
 }
 

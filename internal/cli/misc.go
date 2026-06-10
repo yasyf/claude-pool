@@ -86,6 +86,10 @@ func newEnvCmd() *cobra.Command {
 					sr, err = m.Select(cmd.Context(), pool.SelectOptions{Live: true})
 					if err == nil {
 						a = sr.Best
+						if sr.ExhaustedFallback {
+							// stderr, so an eval'd stdout capture is unaffected.
+							warnExhaustedFallback(cmd, accountName(a.Label), sr.ExtraEnabled, sr.Result.ExhaustedUntil)
+						}
 					}
 				}
 				if err != nil {

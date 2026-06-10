@@ -102,6 +102,27 @@ func TestUsageSampleLatest(t *testing.T) {
 	}
 }
 
+func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
+	s := openTest(t)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	in := UsageSample{AccountID: 1, TS: time.Now(), Util5h: 100, ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000}
+	if err := s.InsertUsageSample(in); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.LatestUsageSample(1)
+	if err != nil || !ok {
+		t.Fatalf("latest: ok=%v err=%v", ok, err)
+	}
+	if !got.ExtraEnabled || got.ExtraUsed != 177 || got.ExtraLimit != 5000 {
+		t.Fatalf("extra usage did not round-trip: %+v", got)
+	}
+	recent, err := s.RecentUsageSamples(1, 1)
+	if err != nil || len(recent) != 1 || !recent[0].ExtraEnabled {
+		t.Fatalf("recent samples missing extra usage: %+v err=%v", recent, err)
+	}
+}
+
+
 func TestSessionsReconcile(t *testing.T) {
 	s := openTest(t)
 	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
