@@ -17,7 +17,27 @@ and reload the widget when the snapshot changes. Without the app running, the
 widget still works on WidgetKit's lazier schedule. Add the app to
 System Settings → Login Items for always-fresh updates.
 
-## Build
+## Install
+
+```sh
+ccp widget
+```
+
+That installs the prebuilt app from the `cc-pool-status` Homebrew cask
+(passing `--no-quarantine` — the app is ad-hoc signed, and Gatekeeper blocks a
+quarantined copy), launches it once so macOS discovers the widget, and prints
+the enable steps:
+
+Open Notification Center (click the menu-bar clock), scroll down →
+**Edit Widgets** → search "cc-pool" → add the small or medium widget. Desktop
+widgets work too: right-click the desktop → Edit Widgets.
+
+If the widget doesn't appear in the gallery: `killall NotificationCenter
+chronod`, relaunch the app, and re-open the gallery.
+
+To remove it: `brew uninstall --cask cc-pool-status`.
+
+## Build from source (development)
 
 Requires full Xcode (CommandLineTools alone cannot build app targets) and
 [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
@@ -27,32 +47,20 @@ cd widget
 xcodegen generate
 xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
   -configuration Release -derivedDataPath build build
+ditto build/Build/Products/Release/CCPoolStatus.app ~/Applications/CCPoolStatus.app
+open ~/Applications/CCPoolStatus.app
 ```
 
 `project.yml` is the source of truth; the `.xcodeproj` and everything under
 `Generated/` are emitted by xcodegen and gitignored. To work in the Xcode UI:
 `xcodegen generate && open CCPoolStatus.xcodeproj`.
 
-## Install
-
-```sh
-rm -rf ~/Applications/CCPoolStatus.app   # ad-hoc signatures change every build
-ditto build/Build/Products/Release/CCPoolStatus.app ~/Applications/CCPoolStatus.app
-open ~/Applications/CCPoolStatus.app     # launch once → the system discovers the widget
-```
-
-Then open Notification Center (click the menu-bar clock), scroll down →
-**Edit Widgets** → search "cc-pool" → add the small or medium widget. Desktop
-widgets work too: right-click the desktop → Edit Widgets.
-
-If the widget doesn't appear in the gallery: `killall NotificationCenter
-chronod`, relaunch the app, and re-open the gallery.
-
 ## Signing
 
-Builds are ad-hoc signed (`CODE_SIGN_IDENTITY=-`) — fine for the machine that
-built them. If chronod refuses to load the ad-hoc-signed widget, build with a
-free personal team instead:
+Builds are ad-hoc signed (`CODE_SIGN_IDENTITY=-`) — fine for an app that is
+never quarantined (the cask installs with `--no-quarantine`; local builds
+never get the quarantine bit). If chronod refuses to load the ad-hoc-signed
+widget, build with a free personal team instead:
 
 ```sh
 xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \

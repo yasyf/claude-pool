@@ -243,6 +243,7 @@ prints the same per command.
 | `ccp remove <id>` | Remove an account from the pool |
 | `ccp init` | Set up the pool and start the daemon (optional — `ccp add` does this) |
 | `ccp service install\|uninstall\|status` | Manage the daemon (delegates to `brew services` on Homebrew installs) |
+| `ccp widget` | Install the Notification Center status widget (Homebrew cask) and show how to enable it |
 
 Flags, by command:
 

@@ -69,6 +69,7 @@ pool.`,
 		newDoctorCmd(),
 		newRemoveCmd(),
 		newServiceCmd(),
+		newWidgetCmd(),
 		newDaemonCmd(),
 	)
 	return root

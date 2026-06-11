@@ -35,6 +35,7 @@ jobs:
     outputs:
       pure_sha256: ${{ steps.shas.outputs.pure }}
       fuse_sha256: ${{ steps.shas.outputs.fuse }}
+      app_sha256: ${{ steps.shas.outputs.app }}
     steps:
       - uses: actions/checkout@v6
 
@@ -76,19 +77,40 @@ jobs:
           tar -czf "dist/cc-pool-${VERSION}-darwin-universal.tar.gz" -C dist/pure cc-pool
           tar -czf "dist/cc-pool-${VERSION}-darwin-universal-fuse.tar.gz" -C dist/fuse cc-pool
           tar -czf "dist/cc-pool-${VERSION}-darwin-arm64.tar.gz" -C dist/arm64 cc-pool
+
+      - name: Build the Notification Center widget app (cc-pool-status cask payload)
+        run: |
+          brew install xcodegen
+          cd widget
+          xcodegen generate
+          xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
+            -configuration Release -derivedDataPath build build
+          APP=build/Build/Products/Release/CCPoolStatus.app
+          # The appex must carry the sandbox + ~/.cc-pool read exception, or the
+          # widget silently can't read status.json — fail the release instead.
+          codesign --verify --strict "$APP"
+          codesign -d --entitlements - "$APP/Contents/PlugIns/CCPoolStatusWidget.appex" 2>&1 |
+            grep -q "temporary-exception.files.home-relative-path.read-only"
+          # ditto -c -k preserves the bundle metadata a plain zip would drop.
+          ditto -c -k --keepParent "$APP" "../dist/cc-pool-status-${GITHUB_REF_NAME}-darwin.zip"
+
+      - name: Checksum the release assets
+        run: |
           cd dist
-          shasum -a 256 -- *.tar.gz > SHA256SUMS.txt
+          shasum -a 256 -- *.tar.gz *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Export tarball checksums for the formula bump
+      - name: Export checksums for the formula and cask bumps
         id: shas
         run: |
           cd dist
           PURE="$(grep -E 'darwin-universal\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
           FUSE="$(grep -E 'darwin-universal-fuse\.tar\.gz$' SHA256SUMS.txt | awk '{print $1}')"
-          test -n "$PURE" && test -n "$FUSE"
+          APP="$(grep -E 'cc-pool-status-.*-darwin\.zip$' SHA256SUMS.txt | awk '{print $1}')"
+          test -n "$PURE" && test -n "$FUSE" && test -n "$APP"
           echo "pure=${PURE}" >> "$GITHUB_OUTPUT"
           echo "fuse=${FUSE}" >> "$GITHUB_OUTPUT"
+          echo "app=${APP}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -100,6 +122,7 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -132,28 +155,36 @@ jobs:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Bump Formula to the release binary tarballs
+      - name: Bump Formula and Cask to the release assets
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           PURE_SHA="${{ needs.build.outputs.pure_sha256 }}"
           FUSE_SHA="${{ needs.build.outputs.fuse_sha256 }}"
-          test -n "$PURE_SHA" && test -n "$FUSE_SHA"
+          APP_SHA="${{ needs.build.outputs.app_sha256 }}"
+          test -n "$PURE_SHA" && test -n "$FUSE_SHA" && test -n "$APP_SHA"
           F=Formula/cc-pool.rb
           # Rewrite the release version embedded in both download urls (brew
           # infers the formula version from the /vX.Y.Z/ path segment).
           sed -i -E "/releases\/download/ s|v[0-9]+\.[0-9]+\.[0-9]+|v${VERSION}|g" "$F"
           sed -i -E "s|sha256 \"[0-9a-f]{64}\" # pure|sha256 \"${PURE_SHA}\" # pure|" "$F"
           sed -i -E "s|sha256 \"[0-9a-f]{64}\" # fuse|sha256 \"${FUSE_SHA}\" # fuse|" "$F"
+          # The cask url interpolates #{version}, so only the version line and
+          # the `# app` sha need rewriting.
+          C=Casks/cc-pool-status.rb
+          sed -i -E "s|version \"[0-9]+\.[0-9]+\.[0-9]+\"|version \"${VERSION}\"|" "$C"
+          sed -i -E "s|sha256 \"[0-9a-f]{64}\" # app|sha256 \"${APP_SHA}\" # app|" "$C"
           # Fail loud if a sed anchor stopped matching; allow idempotent re-runs.
           grep -q "releases/download/v${VERSION}/" "$F"
           grep -q "${PURE_SHA}\" # pure" "$F"
           grep -q "${FUSE_SHA}\" # fuse" "$F"
+          grep -q "version \"${VERSION}\"" "$C"
+          grep -q "${APP_SHA}\" # app" "$C"
           if git diff --quiet; then
-            echo "formula already at ${GITHUB_REF_NAME}; nothing to push"
+            echo "formula and cask already at ${GITHUB_REF_NAME}; nothing to push"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$F"
+          git add "$F" "$C"
           git commit -m "Formula: bump to ${GITHUB_REF_NAME}"
           git push origin main

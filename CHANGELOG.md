@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ccp widget` installs the Notification Center widget with one command: it
+  pulls the prebuilt app from the new `cc-pool-status` Homebrew cask (with
+  `--no-quarantine`, which the ad-hoc-signed app needs), launches it so macOS
+  discovers the widget, and walks through enabling it. Releases now build and
+  publish the app zip, and the formula-bump job keeps the cask current.
+
 ## [0.17.0] - 2026-06-11
 
 ### Added
