@@ -6,12 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-06-11
+
+### Fixed
+- The daemon no longer logs a `cannot link .../remote-settings.json` error on
+  every overlay sync. claude's new `remote-settings.json` file caches
+  per-subscription settings from claude.ai, so each account now keeps its own
+  private copy instead of sharing one; a leftover shared link from an earlier
+  version is cleaned up automatically.
+- An overlay sync that hits a conflict on one entry now still repairs every
+  other entry and reports all conflicts at once, instead of stopping at the
+  first one.
+
 ## [0.15.0] - 2026-06-10
 
 ### Changed
 - The generated shell alias (and docs) wrap `ccp run` instead of the
-  `ccp select` compose form, so the wrapper owns the full launch environment
-  and never goes stale as it grows.
+  `ccp select` compose form, so the alias always launches with the full
+  environment cc-pool sets up, even as future versions add to it.
 
 ### Fixed
 - Pooled sessions stamped account-anchored install paths into the shared
@@ -34,10 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surprising picks can be audited after the fact.
 
 ### Changed
-- The usage-sample store schema changed clean-slate, with no column
-  migration — a `~/.cc-pool` database created before 0.14.0 needs to be
-  recreated. The database holds only regenerable cache and state, never
-  secrets.
+- The format of the internal usage database changed incompatibly, and
+  cc-pool does not migrate old databases. If you upgraded from an earlier
+  version and see database errors, delete `~/.cc-pool/pool.db*` and restart
+  the daemon; it rebuilds the database from scratch. The database holds only
+  regenerable cache and state, never secrets.
 
 ### Fixed
 - `ccp` could launch a session on an account whose 5-hour window was 100%
@@ -46,9 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pegged window and a pending reset are now unavailable, and the headroom
   barrier, runway, and sticky floor score raw current remaining, so an
   imminent reset can no longer mask zero headroom.
-- `ccp select --wait` now actually waits: its daemon arm was dead code. It
-  refuses exhausted-pool fallback picks and keeps waiting for headroom, and
-  the daemon commits no side effects for a pick the client discards.
+- `ccp select --wait` now actually waits instead of returning immediately.
+  It refuses exhausted-pool fallback picks and keeps waiting for headroom,
+  and a pick it discards while waiting no longer counts against the account.
 
 ## [0.13.2] - 2026-06-08
 
@@ -67,11 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.13.1] - 2026-06-08
 
 ### Fixed
-- `ccp add` no longer hangs silently before the login prompt: the daemon
-  binds its socket before probing `claude --version` so readiness checks
-  return immediately, a redundant `launchctl kickstart -k` (which killed the
-  fresh daemon and cold-started a second instance) is gone, and the remaining
-  daemon/overlay waits show a spinner so they read as progress.
+- `ccp add` no longer hangs silently before the login prompt: the daemon now
+  answers readiness checks immediately on startup, a restart race that could
+  kill the fresh daemon and start a second instance is gone, and the
+  remaining startup waits show a spinner so they read as progress.
 
 ## [0.13.0] - 2026-06-08
 
@@ -97,11 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Upgrading no longer prints a `pkill -f 'cc-pool daemon'` instruction when
-  an old daemon is slow to release the socket — `ccp` auto-evicts a wedged
-  version-skewed daemon, booting it out via launchd first and, for a true
-  orphan, killing the exact process holding `~/.cc-pool/daemon.sock`
-  (identified by socket peer credentials, never by process name, so only the
-  socket holder can ever be targeted).
+  an old daemon is slow to release the socket: `ccp` now evicts the stale
+  daemon itself, asking launchd first and, for a true orphan, stopping only
+  the exact process holding `~/.cc-pool/daemon.sock`, never anything matched
+  by name.
 
 ## [0.12.2] - 2026-06-08
 
@@ -127,10 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overlay's symlink with a real file that sync refused to relink. The
   auto-update result is now a private per-account entry — it stays
   instance-local and never lands in the shared `~/.claude` base.
-- Starting the daemon via brew (`ccp service install`) now forces it to
-  actually run with `launchctl kickstart` — `brew services start` only loads
-  the launchd job, and a stop/start race could leave it loaded but never
-  executing.
+- Starting the daemon via brew (`ccp service install`) now makes sure it is
+  actually running: `brew services start` only loads the launchd job, and a
+  stop/start race could leave it loaded but never executing.
 
 ## [0.12.0] - 2026-06-08
 
@@ -147,9 +157,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemon on every run without converging. A starting daemon now evicts a
   version-skewed holder (refusing to bind only against a genuine same-version
   peer), and `ccp` asks the old daemon to step down before restarting it.
-  Along the way: a late listener close can no longer delete a successor's
-  socket, fuse mounts moved off the accept path so daemon health checks
-  respond immediately on boot, and fuse teardown is bounded and forced.
+  Along the way: an exiting daemon can no longer delete its successor's
+  socket, health checks respond immediately on boot even while fuse mounts
+  are still coming up, and fuse unmounts can no longer hang shutdown.
 
 ## [0.11.0] - 2026-06-08
 
@@ -174,10 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports whether usage data actually exists instead of inferring it from
   staleness, so an account whose poll is merely overdue keeps showing its
   real utilization.
-- Accounts no longer read "stale" for most of every poll cycle: the displayed
-  staleness threshold (90s) sat below the daemon's ~3-minute poll interval
-  and is now 5 minutes; the 90s threshold remains only as the selection
-  penalty, where it applies uniformly and doesn't skew ranking.
+- Accounts no longer read "stale" for most of every poll cycle: the
+  staleness label used a 90-second threshold against a ~3-minute poll
+  interval, and now allows 5 minutes before flagging an account.
 - `ccp status`, `ccp select`, and `ccp run` detect and reject a daemon left
   running from a previous version instead of rendering garbage; the status
   TUI restarts the skewed daemon automatically.
@@ -202,8 +211,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separator needed (e.g. `ccp run --resume`).
 - `ccp run` picks its account the same way `ccp select` does — taking the
   daemon's reserved pick and falling back to a live selection only when the
-  daemon is unreachable — and token refresh for run sessions is handled by
-  the daemon's idle-account path.
+  daemon is unreachable — and the daemon keeps the chosen account's token
+  fresh in the background.
 
 ### Removed
 - The `--account` flag on `ccp run`, which cannot coexist with literal
@@ -250,10 +259,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs warn and proceed so automation is never blocked.
 
 ### Changed
-- Trimmed the add flow to what the user can act on: dropped the seeding,
-  overlay, and cleanup chatter and the redundant "closed claude" line. "Add
-  another account?" now defaults to yes after the first account, and the
-  closing line just reports the pool total.
+- Trimmed the add flow to what you can act on: internal setup chatter and
+  the redundant "closed claude" line are gone. "Add another account?" now
+  defaults to yes after the first account, and the closing line just reports
+  the pool total.
 
 ### Fixed
 - Usage headroom was inflated 100x: the `/api/oauth/usage` endpoint reports
@@ -277,9 +286,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into a pool account. Adopting meant refreshing plain claude's single-use
   OAuth refresh token, which rotation invalidated — silently logging plain
   claude out. Every account now logs in with its own `claude /login`, so plain
-  claude's token is never read or spent. The `keychain.ReadCanonical` /
-  `CanonicalExists` accessors and the `pool.CanonicalReader` seam are gone; no
-  code path can name the canonical Keychain item anymore.
+  claude's token is never read or spent; no code path in cc-pool can even
+  name plain claude's Keychain item anymore.
 
 ### Fixed
 - Usage decode crashed when the API returned `resets_at` as a string. The field
@@ -294,7 +302,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Credential adoption in `ccp add`: when plain claude's current login isn't
   pooled yet, offer to copy its credential (read-only) into the new account's
   own Keychain item and refresh the copy onto its own token chain — no new
-  login. Removed again in 0.5.0.
+  login (removed again in 0.5.0; see above).
 - Watched login: `ccp add` owns the `claude /login` it spawns and closes it
   for you once the credential lands, with full terminal restoration; the
   manual other-terminal path polls with a spinner. Account labels prefill
@@ -341,7 +349,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/yasyf/cc-pool/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/yasyf/cc-pool/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/yasyf/cc-pool/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/yasyf/cc-pool/compare/v0.13.1...v0.13.2
