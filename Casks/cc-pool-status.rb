@@ -1,10 +1,11 @@
 # Homebrew cask for the cc-pool Notification Center widget (CCPoolStatus.app).
 #
-# Install with `ccp widget` — it passes --no-quarantine, which this app needs:
+# Install with `ccp widget` — it disables quarantine, which this app needs:
 # it is ad-hoc signed (no Developer ID), so a quarantined copy is blocked by
-# Gatekeeper. Installing the cask by hand works too:
+# Gatekeeper. Installing the cask by hand works too (Homebrew 5 dropped the
+# --no-quarantine install flag; only the env-var spelling remains):
 #
-#   brew install --cask --no-quarantine yasyf/cc-pool/cc-pool-status
+#   HOMEBREW_CASK_OPTS=--no-quarantine brew install --cask yasyf/cc-pool/cc-pool-status
 #
 # release.yml's bump-formula job rewrites the version line and the `# app`
 # sha256 on every tagged release — keep the marker, never hand-edit them.

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -16,6 +17,7 @@ const (
 	widgetTap     = "yasyf/cc-pool"
 	widgetTapURL  = "https://github.com/yasyf/cc-pool"
 	widgetAppName = "CCPoolStatus"
+	widgetAppPath = "/Applications/CCPoolStatus.app" // the cask's default appdir
 )
 
 func newWidgetCmd() *cobra.Command {
@@ -42,11 +44,18 @@ func runWidget(cmd *cobra.Command) error {
 	if err := brewInstallWidget(cmd); err != nil {
 		return err
 	}
+	if err := dequarantineWidget(cmd); err != nil {
+		return err
+	}
 	// Launching once registers the embedded widget extension with macOS so it
 	// shows up in the widget gallery. -g keeps the agent app in the background.
+	// By path first: LaunchServices hasn't indexed a freshly installed app yet,
+	// so the by-name lookup fails on exactly the first (registering) launch.
 	step(out, "Launching it so macOS discovers the widget…")
-	if err := runStreamed(cmd, "open", "-g", "-a", widgetAppName); err != nil {
-		return fmt.Errorf("launch %s: %w", widgetAppName, err)
+	if err := runStreamed(cmd, "open", "-g", widgetAppPath); err != nil {
+		if err := runStreamed(cmd, "open", "-g", "-a", widgetAppName); err != nil {
+			return fmt.Errorf("launch %s (is the cask appdir customized?): %w", widgetAppName, err)
+		}
 	}
 	success(out, "Widget installed.")
 	fmt.Fprint(out, widgetInstructions())
@@ -73,18 +82,46 @@ func ensureWidgetTap(cmd *cobra.Command) error {
 }
 
 // brewInstallWidget installs the cask, or upgrades it when already present.
-// --no-quarantine is required: the app is ad-hoc signed (no Developer ID), so
-// a quarantined copy would be blocked by Gatekeeper on launch.
 func brewInstallWidget(cmd *cobra.Command) error {
 	installed := exec.Command("brew", "list", "--cask", widgetCask).Run() == nil
 	if installed {
-		if err := runStreamed(cmd, "brew", "upgrade", "--cask", "--no-quarantine", widgetCask); err != nil {
+		if err := brewCask(cmd, "upgrade", "--cask", widgetCask); err != nil {
 			return fmt.Errorf("brew upgrade --cask %s: %w", widgetCask, err)
 		}
 		return nil
 	}
-	if err := runStreamed(cmd, "brew", "install", "--cask", "--no-quarantine", widgetTap+"/"+widgetCask); err != nil {
+	if err := brewCask(cmd, "install", "--cask", widgetTap+"/"+widgetCask); err != nil {
 		return fmt.Errorf("brew install --cask %s: %w", widgetCask, err)
+	}
+	return nil
+}
+
+// brewCask runs a brew cask install/upgrade with quarantine disabled. The app
+// is ad-hoc signed (no Developer ID), so a quarantined copy is blocked by
+// Gatekeeper on launch. Homebrew 5 removed the --no-quarantine install flag;
+// only the HOMEBREW_CASK_OPTS option survives (env_config's
+// cask_opts_quarantine?), appended here so existing user opts are kept.
+// dequarantineWidget backstops it after the install.
+func brewCask(cmd *cobra.Command, args ...string) error {
+	c := exec.Command("brew", args...)
+	opts := strings.TrimSpace(os.Getenv("HOMEBREW_CASK_OPTS") + " --no-quarantine")
+	c.Env = append(os.Environ(), "HOMEBREW_CASK_OPTS="+opts)
+	c.Stdin = cmd.InOrStdin() // Homebrew 5 ask-mode may prompt before installing
+	c.Stdout, c.Stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
+	return c.Run()
+}
+
+// dequarantineWidget strips the quarantine attribute if the install picked it
+// up anyway — a second line of defense should brew change its quarantine
+// knobs again. Without it, launching the ad-hoc-signed app fails loud at the
+// Gatekeeper prompt rather than silently, but fails all the same.
+func dequarantineWidget(cmd *cobra.Command) error {
+	if exec.Command("xattr", "-p", "com.apple.quarantine", widgetAppPath).Run() != nil {
+		return nil // not quarantined (or not at the default appdir)
+	}
+	note(cmd.OutOrStdout(), "Removing the quarantine flag (the app is ad-hoc signed)…")
+	if err := runStreamed(cmd, "xattr", "-dr", "com.apple.quarantine", widgetAppPath); err != nil {
+		return fmt.Errorf("remove quarantine from %s: %w", widgetAppPath, err)
 	}
 	return nil
 }

@@ -23,10 +23,10 @@ System Settings → Login Items for always-fresh updates.
 ccp widget
 ```
 
-That installs the prebuilt app from the `cc-pool-status` Homebrew cask
-(passing `--no-quarantine` — the app is ad-hoc signed, and Gatekeeper blocks a
-quarantined copy), launches it once so macOS discovers the widget, and prints
-the enable steps:
+That installs the prebuilt app from the `cc-pool-status` Homebrew cask with
+quarantine disabled (`HOMEBREW_CASK_OPTS=--no-quarantine` — the app is ad-hoc
+signed, and Gatekeeper blocks a quarantined copy), launches it once so macOS
+discovers the widget, and prints the enable steps:
 
 Open Notification Center (click the menu-bar clock), scroll down →
 **Edit Widgets** → search "cc-pool" → add the small or medium widget. Desktop
