@@ -17,7 +17,7 @@ cask "cc-pool-status" do
   desc "Notification Center widget showing cc-pool account status"
   homepage "https://github.com/yasyf/cc-pool"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma # parsed with a ">=" comparator: sonoma or newer
   depends_on formula: "cc-pool"
 
   app "CCPoolStatus.app"
