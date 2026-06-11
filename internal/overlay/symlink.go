@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,9 +27,12 @@ func (p *SymlinkProvider) Setup(base, accountDir string) error {
 }
 
 // Sync walks base's top-level entries and asserts the correct shape in
-// accountDir: a symlink for shared entries, a private dir for excluded ones.
-// Like Teardown, it refuses to operate on base itself — overlaying base onto
-// itself would replace the user's real entries with self-referential links.
+// accountDir: a symlink for shared entries, a private dir for excluded ones,
+// and no symlink for private entries. Per-entry failures are collected and
+// returned joined, so one conflicting entry neither blocks unrelated entries
+// nor masks other conflicts. Like Teardown, it refuses to operate on base
+// itself — overlaying base onto itself would replace the user's real entries
+// with self-referential links.
 func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to overlay base dir %q onto itself", accountDir)
@@ -47,6 +51,7 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
 		return err
 	}
+	var errs []error
 	for _, e := range entries {
 		name := e.Name()
 		if skipEntries[name] {
@@ -55,18 +60,22 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 		dst := filepath.Join(accountDir, name)
 		if ExcludedEntries[name] {
 			if err := assertPrivateDir(dst); err != nil {
-				return err
+				errs = append(errs, err)
 			}
 			continue
 		}
 		if PrivateEntry(name) {
-			continue // private file (e.g. .claude.json): never linked into accounts
+			// Private file (e.g. .claude.json): never linked into accounts.
+			if err := assertNoSymlink(dst); err != nil {
+				errs = append(errs, err)
+			}
+			continue
 		}
 		if err := assertSymlink(filepath.Join(base, name), dst); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Health verifies every shared top-level entry of base is correctly linked in
@@ -89,7 +98,12 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 			continue
 		}
 		if PrivateEntry(name) {
-			continue // private files are account-local; nothing to verify against base
+			// Private files are account-local; the only bad state is a stale
+			// symlink left from before the name was classified private.
+			if fi, err := os.Lstat(dst); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("private entry %q is a symlink (stale shared link; run doctor --fix)", name)
+			}
+			continue
 		}
 		target, err := os.Readlink(dst)
 		if err != nil {
@@ -149,6 +163,22 @@ func assertSymlink(target, dst string) error {
 	}
 	if err := os.Symlink(target, dst); err != nil {
 		return fmt.Errorf("symlink %q -> %q: %w", dst, target, err)
+	}
+	return nil
+}
+
+// assertNoSymlink ensures dst is not a symlink, removing one if present. A
+// symlink at a private name is necessarily our own stale artifact from before
+// the name was classified private — claude never creates symlinks at these
+// names — so removing it never touches base or real data; claude rewrites the
+// file on its own.
+func assertNoSymlink(dst string) error {
+	fi, err := os.Lstat(dst)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	if err := os.Remove(dst); err != nil {
+		return fmt.Errorf("remove stale private link %q: %w", dst, err)
 	}
 	return nil
 }

@@ -67,12 +67,17 @@ var skipEntries = map[string]bool{
 // it — the exact thing the pool must never do. Plus .last-update-result.json
 // (claude's auto-update result, instance-local), which claude rewrites
 // atomically — replacing the overlay's symlink with a real file that Sync would
-// otherwise refuse to relink on every poll.
+// otherwise refuse to relink on every poll. Plus remote-settings.json (and its
+// atomic-write temp siblings), claude's cached per-subscription settings
+// fetched from claude.ai — per-account state claude writes directly into
+// $CONFIG_DIR with the same atomic-rewrite symlink-clobbering mode as
+// .last-update-result.json.
 func PrivateEntry(name string) bool {
 	return ExcludedEntries[name] ||
 		name == ".claude.json" || strings.HasPrefix(name, ".claude.json.") ||
 		name == ".credentials.json" || strings.HasPrefix(name, ".credentials.json.") ||
-		strings.HasPrefix(name, ".last-update-result")
+		strings.HasPrefix(name, ".last-update-result") ||
+		name == "remote-settings.json" || strings.HasPrefix(name, "remote-settings.json.")
 }
 
 // Provider establishes and maintains an overlay of base at accountDir.

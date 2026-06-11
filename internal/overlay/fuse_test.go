@@ -73,17 +73,19 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 func TestMirrorRealRedirectsLocalEntries(t *testing.T) {
 	fs := newMirrorFS("/base", "/priv")
 	cases := map[string]string{
-		"/.claude.json":              "/priv/.claude.json",
-		"/.claude.json.tmp.ab12cd34": "/priv/.claude.json.tmp.ab12cd34",
-		"/.credentials.json":         "/priv/.credentials.json",
-		"/.credentials.json.lock":    "/priv/.credentials.json.lock",
-		"/backups":                   "/priv/backups",
-		"/backups/x.bak":             "/priv/backups/x.bak",
-		"/daemon/roster.json":        "/priv/daemon/roster.json",
-		"/ide/lock":                  "/priv/ide/lock",
-		"/projects/p.json":           "/base/projects/p.json",
-		"/settings.json":             "/base/settings.json",
-		"/":                          "/base",
+		"/.claude.json":                      "/priv/.claude.json",
+		"/.claude.json.tmp.ab12cd34":         "/priv/.claude.json.tmp.ab12cd34",
+		"/.credentials.json":                 "/priv/.credentials.json",
+		"/.credentials.json.lock":            "/priv/.credentials.json.lock",
+		"/remote-settings.json":              "/priv/remote-settings.json",
+		"/remote-settings.json.tmp.ab12cd34": "/priv/remote-settings.json.tmp.ab12cd34",
+		"/backups":                           "/priv/backups",
+		"/backups/x.bak":                     "/priv/backups/x.bak",
+		"/daemon/roster.json":                "/priv/daemon/roster.json",
+		"/ide/lock":                          "/priv/ide/lock",
+		"/projects/p.json":                   "/base/projects/p.json",
+		"/settings.json":                     "/base/settings.json",
+		"/":                                  "/base",
 	}
 	for in, want := range cases {
 		if got := fs.real(in); got != want {

@@ -3,6 +3,7 @@ package overlay
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +29,10 @@ func makeBase(t *testing.T) string {
 	// Plain claude's plaintext credential store (Keychain-unavailable fallback)
 	// must never be linked into accounts — sharing it leaks the live OAuth token.
 	if err := os.WriteFile(filepath.Join(base, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"plain-claude"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Per-subscription settings cache; must never be linked into accounts.
+	if err := os.WriteFile(filepath.Join(base, "remote-settings.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(base, ".DS_Store"), []byte("x"), 0o644); err != nil {
@@ -85,6 +90,12 @@ func TestSymlinkSetupSharesAndExcludes(t *testing.T) {
 	// or copied into the account dir.
 	if _, err := os.Lstat(filepath.Join(acct, ".credentials.json")); !os.IsNotExist(err) {
 		t.Errorf("base .credentials.json must never be visible in an account dir")
+	}
+
+	// Base's remote-settings.json (per-subscription settings cache) is never
+	// linked into the account dir.
+	if _, err := os.Lstat(filepath.Join(acct, "remote-settings.json")); !os.IsNotExist(err) {
+		t.Errorf("base remote-settings.json should not be linked into the account dir")
 	}
 
 	if err := p.Health(base, acct); err != nil {
@@ -152,6 +163,8 @@ func TestPrivateEntry(t *testing.T) {
 		".credentials.json.lock":         true,
 		".last-update-result.json":       true,
 		".last-update-result.json.tmp.x": true,
+		"remote-settings.json":           true,
+		"remote-settings.json.tmp.ab12":  true,
 		"daemon":                         true,
 		"ide":                            true,
 		"backups":                        true,
@@ -161,6 +174,8 @@ func TestPrivateEntry(t *testing.T) {
 		".claude":                        false,
 		"claude.json":                    false,
 		"credentials.json":               false,
+		"remote-settings":                false,
+		"remote-settings.jsonx":          false,
 	}
 	for name, want := range cases {
 		if got := PrivateEntry(name); got != want {
@@ -199,6 +214,117 @@ func TestSyncSkipsPreexistingLastUpdateResult(t *testing.T) {
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
 		t.Error(".last-update-result.json should stay a private real file, not a symlink")
+	}
+}
+
+// TestSyncSkipsPreexistingRemoteSettings pins the acct-01/acct-02 incident:
+// claude lazily wrote a real remote-settings.json into the account dir before
+// the name existed in base. Once base gains its own copy, Sync must skip the
+// private name instead of erroring on the pre-existing real file.
+func TestSyncSkipsPreexistingRemoteSettings(t *testing.T) {
+	base := makeBase(t)
+	acct := filepath.Join(t.TempDir(), "acct-01")
+	p := &SymlinkProvider{}
+	if err := p.Setup(base, acct); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate claude's direct write into $CONFIG_DIR.
+	if err := os.WriteFile(filepath.Join(acct, "remote-settings.json"), []byte(`{"acct":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Sync(base, acct); err != nil {
+		t.Fatalf("Sync must skip the private remote-settings.json, got: %v", err)
+	}
+	// It stays a private real file with its own content, never symlinked.
+	fi, err := os.Lstat(filepath.Join(acct, "remote-settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("remote-settings.json should stay a private real file, not a symlink")
+	}
+	if got, _ := os.ReadFile(filepath.Join(acct, "remote-settings.json")); string(got) != `{"acct":1}` {
+		t.Errorf("account remote-settings.json content = %q, want %q", got, `{"acct":1}`)
+	}
+}
+
+// TestSyncRemovesStaleLinkAtPrivateName pins the acct-03 incident: an older
+// cc-pool linked remote-settings.json into the account before the name was
+// classified private. Health must flag the stale link, Sync must remove it
+// (claude rewrites the file itself), and base must be untouched.
+func TestSyncRemovesStaleLinkAtPrivateName(t *testing.T) {
+	base := makeBase(t)
+	acct := filepath.Join(t.TempDir(), "acct-01")
+	p := &SymlinkProvider{}
+	if err := p.Setup(base, acct); err != nil {
+		t.Fatal(err)
+	}
+	// The older cc-pool's artifact: a shared link at a now-private name.
+	dst := filepath.Join(acct, "remote-settings.json")
+	if err := os.Symlink(filepath.Join(base, "remote-settings.json"), dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Health(base, acct); err == nil {
+		t.Fatal("Health must flag a symlink at a private name")
+	}
+	if err := p.Sync(base, acct); err != nil {
+		t.Fatalf("Sync must self-heal the stale private link, got: %v", err)
+	}
+	// The link is removed, not replaced with anything.
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Errorf("stale private link should be removed, Lstat err = %v", err)
+	}
+	if err := p.Health(base, acct); err != nil {
+		t.Fatalf("Health after self-heal: %v", err)
+	}
+	// Base's copy survives untouched.
+	if got, _ := os.ReadFile(filepath.Join(base, "remote-settings.json")); string(got) != "{}" {
+		t.Errorf("base remote-settings.json content = %q, want %q", got, "{}")
+	}
+}
+
+// TestSyncContinuesPastConflictAndJoinsErrors pins the aggregation behavior:
+// a pre-existing real file at one shared name must neither block linking of
+// entries sorting after it nor mask a second conflict — Sync reports both and
+// still links everything else.
+func TestSyncContinuesPastConflictAndJoinsErrors(t *testing.T) {
+	base := makeBase(t)
+	acct := filepath.Join(t.TempDir(), "acct-01")
+	p := &SymlinkProvider{}
+	if err := p.Setup(base, acct); err != nil {
+		t.Fatal(err)
+	}
+	// Claude lazily writes two real files into the account dir...
+	for _, name := range []string{"aaa.json", "mmm.json"} {
+		if err := os.WriteFile(filepath.Join(acct, name), []byte("acct"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// ...then base gains the same names plus one that sorts after both.
+	for _, name := range []string{"aaa.json", "mmm.json", "zzz.json"} {
+		if err := os.WriteFile(filepath.Join(base, name), []byte("base"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := p.Sync(base, acct)
+	if err == nil {
+		t.Fatal("Sync must report the conflicting real files")
+	}
+	// Both conflicts are named — the first must not mask the second.
+	for _, name := range []string{"aaa.json", "mmm.json"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("Sync error does not name conflict %q: %v", name, err)
+		}
+	}
+	// The entry sorting after the conflicts is still linked.
+	if target, lerr := os.Readlink(filepath.Join(acct, "zzz.json")); lerr != nil || target != filepath.Join(base, "zzz.json") {
+		t.Errorf("zzz.json not linked past the conflicts: target=%q err=%v", target, lerr)
+	}
+	// The conflicting real files are never clobbered.
+	for _, name := range []string{"aaa.json", "mmm.json"} {
+		if got, _ := os.ReadFile(filepath.Join(acct, name)); string(got) != "acct" {
+			t.Errorf("conflict file %q clobbered: content = %q, want %q", name, got, "acct")
+		}
 	}
 }
 
