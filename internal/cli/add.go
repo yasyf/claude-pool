@@ -138,8 +138,8 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 	if prompt {
 		_ = huh.NewInput().
 			Title("Name for this account (optional)").
-			Placeholder("e.g. work@example.com").
-			Value(&label). // prefilled with the account email when known
+			Placeholder("e.g. Work, or an email").
+			Value(&label). // prefilled with a name derived from the account email when known
 			WithTheme(ccpTheme()).
 			Run()
 	}
@@ -172,8 +172,9 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 }
 
 // defaultLabel resolves a new account's label: an explicit --label wins;
-// otherwise the account's logged-in email when readable, else empty (the
-// prefill is decorative — identity-read failures stay silent).
+// otherwise a friendly name derived from the account's logged-in email when
+// readable, else empty (the prefill is decorative — identity-read failures
+// stay silent).
 func defaultLabel(explicit string, kind overlay.Kind, configDir string) string {
 	if explicit != "" {
 		return explicit
@@ -182,7 +183,7 @@ func defaultLabel(explicit string, kind overlay.Kind, configDir string) string {
 	if err != nil {
 		return ""
 	}
-	return id.EmailAddress
+	return pool.LabelForEmail(id.EmailAddress)
 }
 
 // checkDuplicate reports whether the just-logged-in account should be skipped

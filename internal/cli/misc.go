@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -46,9 +45,9 @@ func newRemoveCmd() *cobra.Command {
 		Short: "Remove an account from the pool",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := strconv.Atoi(args[0])
+			id, err := parseAccountRef(args[0])
 			if err != nil {
-				return fmt.Errorf("%q is not a valid account id", args[0])
+				return err
 			}
 			return withManager(func(m *pool.Manager) error {
 				if err := m.Remove(id, !keepCred); err != nil {

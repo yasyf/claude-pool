@@ -241,6 +241,7 @@ prints the same per command.
 | `ccp list` | Static account list: ids, paths, Keychain items |
 | `ccp doctor` | Check accounts' Keychain items and overlays; repair drift |
 | `ccp remove <id>` | Remove an account from the pool |
+| `ccp rename <id> <name>` | Rename an account; `--auto` derives names from account emails |
 | `ccp init` | Set up the pool and start the daemon (optional — `ccp add` does this) |
 | `ccp service install\|uninstall\|status` | Manage the daemon (delegates to `brew services` on Homebrew installs) |
 | `ccp widget` | Install the Notification Center status widget (Homebrew cask) and show how to enable it |
@@ -265,6 +266,8 @@ Flags, by command:
 | `env` | `--account <id>` | Account id (defaults to the best account) |
 | `doctor` | `--fix` | Attempt to repair detected drift |
 | `remove` | `--keep-credential` | Keep the account's Keychain item |
+| `rename` | `--auto` | Derive labels from account emails (skips custom labels) |
+| `rename` | `--force` | With `--auto`, overwrite custom labels too |
 | `init` | `--no-service` | Don't start the daemon now; `ccp add` starts it |
 | `service uninstall` | `--purge` | Also remove all pool accounts and state; never touches `~/.claude` |
 

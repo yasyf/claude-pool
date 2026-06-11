@@ -28,10 +28,17 @@ func TestDefaultLabel(t *testing.T) {
 		}
 	})
 
-	t.Run("empty label prefills the account email", func(t *testing.T) {
+	t.Run("empty label prefills a name derived from an org email", func(t *testing.T) {
 		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me@example.com"}`)
-		if got := defaultLabel("", overlay.KindSymlink, dir); got != "me@example.com" {
-			t.Errorf("defaultLabel = %q, want the account email", got)
+		if got := defaultLabel("", overlay.KindSymlink, dir); got != "Example" {
+			t.Errorf("defaultLabel = %q, want %q", got, "Example")
+		}
+	})
+
+	t.Run("empty label prefills the local part of a consumer email", func(t *testing.T) {
+		dir := withIdentity(t, `{"accountUuid": "u-1", "emailAddress": "me@gmail.com"}`)
+		if got := defaultLabel("", overlay.KindSymlink, dir); got != "me" {
+			t.Errorf("defaultLabel = %q, want %q", got, "me")
 		}
 	})
 

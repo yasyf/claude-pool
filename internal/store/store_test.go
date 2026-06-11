@@ -44,6 +44,43 @@ func TestAccountCRUD(t *testing.T) {
 	}
 }
 
+func TestSetAccountLabel(t *testing.T) {
+	s := openTest(t)
+	a := Account{ID: 1, ConfigDir: "/home/.cc-pool/accounts/acct-01", KeychainService: "svc1", KeychainAccount: "me", Label: "me@example.com", OverlayKind: "symlink"}
+	if err := s.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetAccountLabel(1, "Example"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Label != "Example" {
+		t.Fatalf("label = %q, want %q", got.Label, "Example")
+	}
+	// Only the label changed.
+	if got.ConfigDir != a.ConfigDir || got.KeychainService != a.KeychainService ||
+		got.KeychainAccount != a.KeychainAccount || got.OverlayKind != a.OverlayKind {
+		t.Fatalf("non-label fields changed: %+v", got)
+	}
+
+	// Idempotent re-set is fine.
+	if err := s.SetAccountLabel(1, "Example"); err != nil {
+		t.Fatalf("idempotent set: %v", err)
+	}
+
+	// Unknown id fails loudly and materializes nothing.
+	if err := s.SetAccountLabel(99, "Ghost"); err == nil {
+		t.Fatal("want error for unknown account, got nil")
+	}
+	if _, err := s.GetAccount(99); err == nil {
+		t.Fatal("unknown id materialized a row")
+	}
+}
+
 func TestNextAccountIndex(t *testing.T) {
 	s := openTest(t)
 	if n, _ := s.NextAccountIndex(); n != 1 {

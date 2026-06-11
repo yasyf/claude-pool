@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-11
+
+### Added
+- New accounts get a friendly default name derived from their logged-in
+  email instead of the raw address: consumer providers keep the username
+  (`yasyfm@gmail.com` → `yasyfm`), org domains become the org name
+  (`rebecca.fang@ucsf.edu` → `UCSF`, `yasyf@aneta.company` → `Aneta`).
+- `ccp rename <account> <new-label>` renames an account, and
+  `ccp rename --auto` applies the derived names to every account whose label
+  is empty or still the raw email (`--force` overwrites custom labels too) —
+  the migration path for pools named under the old default. Renames are live:
+  the daemon and widget pick them up on their next read, no restarts.
+- `ccp remove` and `ccp rename` both accept `acct-NN` account references as
+  printed by `ccp list`, not just bare ids.
+
 ## [0.18.2] - 2026-06-11
 
 ### Fixed

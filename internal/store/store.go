@@ -143,6 +143,22 @@ func (s *Store) UpsertAccount(a Account) error {
 	return nil
 }
 
+// SetAccountLabel updates an account's label.
+func (s *Store) SetAccountLabel(id int, label string) error {
+	res, err := s.db.Exec(`UPDATE accounts SET label=? WHERE id=?`, label, id)
+	if err != nil {
+		return fmt.Errorf("set label for account %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("account %d not found", id)
+	}
+	return nil
+}
+
 // scanAccount decodes one account row; the parameter is satisfied by both
 // *sql.Row and *sql.Rows.
 func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {
