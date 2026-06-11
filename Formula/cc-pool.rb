@@ -91,8 +91,10 @@ class CcPool < Formula
   def caveats
     <<~EOS
       Get started:
-        ccp add         # pool a Claude subscription (auto-inits; plain `claude` keeps working)
-        CLAUDE_CONFIG_DIR=$(ccp select) claude
+        ccp             # walks you through pooling your subscriptions
+        ccp run         # launch claude on the emptiest account
+
+      Plain `claude` on ~/.claude keeps working untouched.
     EOS
   end
 
