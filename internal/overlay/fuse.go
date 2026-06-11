@@ -19,7 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
@@ -32,17 +31,16 @@ func fuseProvider() (Provider, bool) { return &FuseProvider{}, true }
 
 func init() {
 	// This machine (and many dev Macs) may have BOTH macFUSE's libfuse.2.dylib
-	// and fuse-t's libfuse-t.dylib. cgofuse dlopens libfuse.2.dylib first, so
-	// pin fuse-t explicitly unless the user already set the override.
+	// and fuse-t's libfuse-t.dylib. Without the override cgofuse dlopens
+	// macFUSE's kext-backed lib first, so pin fuse-t explicitly unless the user
+	// already set the override. CGOFUSE_LIBFUSE_PATH is honored (and tried
+	// FIRST) only by cgofuse newer than v1.6.0 — go.mod pins a post-v1.6.0
+	// commit for exactly this; v1.6.0 ignored the variable entirely. The
+	// dlopen is lazy (first fuse call), so setting it here is in time, and
+	// os.Setenv updates the C environment under cgo.
 	if os.Getenv("CGOFUSE_LIBFUSE_PATH") == "" {
 		_ = os.Setenv("CGOFUSE_LIBFUSE_PATH", "/usr/local/lib/libfuse-t.dylib")
 	}
-}
-
-// privateRootFor is the per-account backing dir holding the excluded
-// (instance-local) subtrees daemon/ and ide/. It sits beside the mountpoint.
-func privateRootFor(accountDir string) string {
-	return accountDir + ".private"
 }
 
 // mountRegistry tracks live mounts so Teardown can unmount the right host.
@@ -65,7 +63,7 @@ func (p *FuseProvider) Kind() Kind { return KindFuse }
 // files written there are visible through the mount (mirrorFS redirects
 // PrivateEntry names) and survive whether or not the mount is currently up.
 func (p *FuseProvider) PrivateRoot(accountDir string) string {
-	return privateRootFor(accountDir)
+	return FusePrivateRoot(accountDir)
 }
 
 // Setup mounts a passthrough mirror of base at accountDir. It blocks only until
@@ -87,7 +85,7 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	mountMu.Unlock()
 
 	// Private backing for excluded (instance-local) entries.
-	priv := privateRootFor(accountDir)
+	priv := FusePrivateRoot(accountDir)
 	for name := range ExcludedEntries {
 		_ = os.MkdirAll(filepath.Join(priv, name), 0o700)
 	}
@@ -186,23 +184,10 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 	// Honest teardown: confirm the path is no longer a mountpoint. If the
 	// unmount wedged (e.g. fuse-t issue-45), report it so callers do NOT
 	// RemoveAll through a live mount into the backing ~/.claude.
-	if stillMounted(accountDir) {
+	if Mounted(accountDir) {
 		return fmt.Errorf("unmount of %s did not take; refusing to treat it as torn down", accountDir)
 	}
 	return nil
-}
-
-// stillMounted reports whether dir is a mountpoint (its device differs from its
-// parent's).
-func stillMounted(dir string) bool {
-	var ds, ps syscall.Stat_t
-	if syscall.Lstat(dir, &ds) != nil {
-		return false
-	}
-	if syscall.Lstat(filepath.Dir(dir), &ps) != nil {
-		return false
-	}
-	return ds.Dev != ps.Dev
 }
 
 // waitMounted polls until base's contents are visible through accountDir.

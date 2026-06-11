@@ -79,6 +79,17 @@ func (c *Client) Health() (*Response, error) {
 	return c.do(Request{Op: OpHealth}, 2*time.Second)
 }
 
+// migrateTimeout bounds one migrate request: a probe mount, then per account
+// up to an 8s mount wait plus a bounded rollback teardown, across a pool.
+const migrateTimeout = 150 * time.Second
+
+// Migrate asks the daemon to convert accounts to the given overlay kind.
+// account nil means every account not already at the kind; busy accounts are
+// skipped and reported, so re-running sweeps the stragglers.
+func (c *Client) Migrate(account *int, to string) (*Response, error) {
+	return c.do(Request{Op: OpMigrate, Account: account, To: to}, migrateTimeout)
+}
+
 // Shutdown asks the daemon to step down. An OK reply means it accepted and will
 // release the socket shortly; use WaitGone to confirm. This evicts a daemon
 // regardless of launchd tracking — the only way to clear an orphan a `brew

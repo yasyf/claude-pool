@@ -159,6 +159,24 @@ func (s *Store) SetAccountLabel(id int, label string) error {
 	return nil
 }
 
+// SetAccountOverlayKind records an account's overlay provider. A targeted
+// UPDATE, not an upsert: overlay conversions must not clobber concurrent row
+// updates (a rename, say) with their stale snapshot of the other columns.
+func (s *Store) SetAccountOverlayKind(id int, kind string) error {
+	res, err := s.db.Exec(`UPDATE accounts SET overlay_kind=? WHERE id=?`, kind, id)
+	if err != nil {
+		return fmt.Errorf("set overlay kind for account %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("account %d not found", id)
+	}
+	return nil
+}
+
 // scanAccount decodes one account row; the parameter is satisfied by both
 // *sql.Row and *sql.Rows.
 func scanAccount(rows interface{ Scan(...any) error }) (Account, error) {

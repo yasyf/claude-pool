@@ -62,7 +62,7 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(base, ".claude.json")); !os.IsNotExist(err) {
 		t.Fatalf(".claude.json leaked into base")
 	}
-	if _, err := os.Stat(filepath.Join(privateRootFor(mnt), ".claude.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(FusePrivateRoot(mnt), ".claude.json")); err != nil {
 		t.Fatalf(".claude.json not in private backing dir: %v", err)
 	}
 }

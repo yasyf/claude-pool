@@ -59,7 +59,18 @@ type Server struct {
 
 	mu           sync.Mutex
 	reservations map[int]time.Time // accountID -> reserved-at
+	converting   map[int]bool      // accountID -> overlay conversion in flight
+	polling      map[int]bool      // accountID -> scheduler/reconcile owns the dir this iteration
 	rlStreak     map[int]int       // accountID -> consecutive 429 count
+
+	// fuseGateFn overrides the migrate handler's fuse-capability gate; nil
+	// means the real check (FuseBuilt + probe mount). Tests inject outcomes
+	// alongside Manager.OverlayFor.
+	fuseGateFn func() string
+
+	// migrateBudget bounds one migrate request's conversion work; zero means
+	// defaultMigrateBudget. Tests shrink it to pin the out-of-time path.
+	migrateBudget time.Duration
 }
 
 // Run is the entry point for `cc-pool daemon`. It blocks until the process
@@ -78,6 +89,8 @@ func Run(ctx context.Context) error {
 		log:          log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
 		evictTimeout: defaultEvictTimeout,
 		reservations: map[int]time.Time{},
+		converting:   map[int]bool{},
+		polling:      map[int]bool{},
 		rlStreak:     map[int]int{},
 	}
 	return s.serve(ctx)
@@ -127,15 +140,15 @@ func (s *Server) serve(ctx context.Context) error {
 	// to a 3s timeout): kept off the pre-bind path here so a slow probe can't make
 	// a freshly-started daemon look "not responding" to a waiting `ccp add`. It
 	// only stamps the OAuth User-Agent, whose sole consumer is the scheduler's
-	// first poll, so running it before establishMounts/scheduler preserves
+	// first poll, so running it before reconcileOverlays/scheduler preserves
 	// ordering. The three stay sequential in one goroutine — not bare ones —
-	// because establishMounts must finish before the scheduler's first poll, which
-	// can also touch fuse Setup (a check-then-act on the same mountpoint).
+	// because reconcileOverlays must finish before the scheduler's first poll,
+	// which can also touch fuse Setup (a check-then-act on the same mountpoint).
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		oauth.SetUserAgentVersion(detectClaudeVersion())
-		s.establishMounts(ctx)
+		s.reconcileOverlays(ctx)
 		s.scheduler(ctx)
 	}()
 
@@ -232,6 +245,13 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		writeResp(conn, Response{OK: false, Error: "bad request: " + err.Error()})
 		return
 	}
+	if req.Op == OpMigrate {
+		// A migrate legitimately outlives the 10s deadline: a probe mount plus
+		// up to an 8s mount wait (and a bounded rollback) per account. Stay
+		// under the client's 150s so the server, not a dead socket, reports
+		// the outcome.
+		_ = conn.SetDeadline(time.Now().Add(140 * time.Second))
+	}
 	resp := s.dispatch(ctx, req)
 	resp.Proto = ProtocolVersion
 	writeResp(conn, resp)
@@ -252,6 +272,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 		return s.handleSelect(ctx, req)
 	case OpCheckin:
 		return s.handleCheckin(ctx, req)
+	case OpMigrate:
+		return s.handleMigrate(ctx, req)
 	case OpShutdown:
 		return s.handleShutdown()
 	default:
@@ -306,7 +328,15 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	if req.Account != nil {
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
-				s.reserve(sn.Account.ID)
+				if !s.mountReady(sn.Account) {
+					if sn.Account.OverlayKind == string(overlay.KindFuse) {
+						return Response{OK: false, Error: fmt.Sprintf("acct-%02d's fuse mount is not up yet; retry shortly", sn.Account.ID)}
+					}
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d's dir is unexpectedly a mountpoint (wedged unmount?); see `ccp doctor` and the daemon log", sn.Account.ID)}
+				}
+				if !s.tryReserve(sn.Account.ID) {
+					return Response{OK: false, Error: fmt.Sprintf("acct-%02d is migrating overlays; retry shortly", sn.Account.ID)}
+				}
 				if !req.NoMark && req.PID > 0 {
 					if _, err := s.m.Store.OpenSession(sn.Account.ID, req.PID, sn.Account.ConfigDir, req.Cwd, time.Now()); err != nil {
 						s.log.Printf("open session for acct-%02d pid %d: %v", sn.Account.ID, req.PID, err)
@@ -330,7 +360,28 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		}
 	}
 
-	ranked, bySnap := s.rankWithReservations(snaps)
+	// An account mid-conversion or whose mirror is not mounted yet (daemon
+	// still establishing mounts after startup, or a failed mount pending
+	// fallback) cannot serve a session — its config dir is not in a usable
+	// shape. Exclude rather than penalize.
+	usable := make([]pool.Snapshot, 0, len(snaps))
+	for _, sn := range snaps {
+		if s.isConverting(sn.Account.ID) || !s.mountReady(sn.Account) {
+			continue
+		}
+		usable = append(usable, sn)
+	}
+	if len(usable) == 0 {
+		soonest := soonestReset(snaps)
+		resp := Response{OK: false, Error: pool.ErrNoneAvailable.Error(), NoneAvailable: true}
+		if !soonest.IsZero() {
+			resp.SoonestReset = &soonest
+		}
+		s.log.Printf("select: %s -> none available (all accounts migrating or unmounted)", req.Cwd)
+		return resp
+	}
+
+	ranked, bySnap := s.rankWithReservations(usable)
 	pin, outcome := s.m.StickyPick(req.Cwd, ranked, time.Now())
 	r := pin
 	fallback := false
@@ -357,7 +408,11 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	}
 	best := bySnap[r.AccountID]
 	if !req.NoMark {
-		s.reserve(best.Account.ID)
+		if !s.tryReserve(best.Account.ID) {
+			// A conversion claimed the winner between the filter above and
+			// here — vanishingly rare; the client just retries.
+			return Response{OK: false, Error: fmt.Sprintf("acct-%02d began migrating overlays mid-select; retry shortly", best.Account.ID)}
+		}
 		if req.PID > 0 {
 			if _, err := s.m.Store.OpenSession(best.Account.ID, req.PID, best.Account.ConfigDir, req.Cwd, time.Now()); err != nil {
 				s.log.Printf("open session for acct-%02d pid %d: %v", best.Account.ID, req.PID, err)
@@ -468,11 +523,102 @@ func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
 	return Response{OK: true}
 }
 
-// reserve records a short-lived reservation for an account.
-func (s *Server) reserve(id int) {
+// tryReserve records a short-lived reservation for an account, refusing while
+// an overlay conversion holds it (the conversion is about to remake the dir a
+// launching claude would land in).
+func (s *Server) tryReserve(id int) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.converting[id] {
+		return false
+	}
 	s.reservations[id] = time.Now()
+	return true
+}
+
+// beginConvert claims an account for overlay conversion iff it has no live
+// reservation, no conversion already in flight, and the scheduler/reconcile is
+// not mid-iteration on its dir. The check-and-claim is one critical section,
+// closing the race against tryReserve and beginPoll; the converting flag — not
+// the mutex — then owns the account across the conversion's I/O, the same way
+// reservations bridge select→spawn.
+func (s *Server) beginConvert(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.reservations[id]; ok && time.Since(t) <= reservationTTL {
+		return false
+	}
+	if s.converting[id] || s.polling[id] {
+		return false
+	}
+	if s.converting == nil {
+		s.converting = map[int]bool{}
+	}
+	s.converting[id] = true
+	return true
+}
+
+// endConvert releases a conversion claim.
+func (s *Server) endConvert(id int) {
+	s.mu.Lock()
+	delete(s.converting, id)
 	s.mu.Unlock()
+}
+
+// isConverting reports whether an overlay conversion holds the account.
+func (s *Server) isConverting(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.converting[id]
+}
+
+// beginPoll claims an account for one scheduler/reconcile iteration — the
+// Sync/Setup/fallback and refresh work that must never interleave with a
+// conversion's move/teardown/mount sequence. Unlike converting, a poll claim
+// does not hide the account from select (sessions can land on a dir being
+// health-checked); it only excludes conversions, two-sidedly with
+// beginConvert. The claim — not the mutex — owns the account across the
+// iteration's I/O.
+func (s *Server) beginPoll(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.converting[id] || s.polling[id] {
+		return false
+	}
+	if s.polling == nil {
+		s.polling = map[int]bool{}
+	}
+	s.polling[id] = true
+	return true
+}
+
+// endPoll releases a poll claim.
+func (s *Server) endPoll(id int) {
+	s.mu.Lock()
+	delete(s.polling, id)
+	s.mu.Unlock()
+}
+
+// mountReady reports whether an account's overlay can serve a session right
+// now. The check is kind-symmetric: a fuse row needs its mirror actually
+// mounted, and a non-fuse row needs the dir NOT mounted — a live mountpoint
+// under a symlink row is the wreckage of an aborted rollback (wedged unmount),
+// where the dir serves a mirror whose private backing no longer holds the
+// account's identity.
+func (s *Server) mountReady(a store.Account) bool {
+	if a.OverlayKind == string(overlay.KindFuse) {
+		return overlay.Mounted(a.ConfigDir)
+	}
+	return !overlay.Mounted(a.ConfigDir)
+}
+
+// overlayFor resolves a kind through the Manager's injectable seam (tests fake
+// the fuse provider); nil means overlay.For.
+func (s *Server) overlayFor(kind overlay.Kind) overlay.Provider {
+	if s.m.OverlayFor != nil {
+		return s.m.OverlayFor(kind)
+	}
+	return overlay.For(kind)
 }
 
 // reservedCount returns the number of live reservations for an account.
@@ -561,10 +707,11 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 	return out
 }
 
-// establishMounts brings up fuse mounts for fuse-kind accounts at startup. It
+// reconcileOverlays brings each account's on-disk overlay in line with its
+// row at startup. It
 // runs off the accept path; ctx is checked between accounts so a boot-time
 // shutdown doesn't block wg.Wait for the full mount timeout of a slow account.
-func (s *Server) establishMounts(ctx context.Context) {
+func (s *Server) reconcileOverlays(ctx context.Context) {
 	accts, err := s.m.Store.ListAccounts()
 	if err != nil {
 		return
@@ -573,15 +720,81 @@ func (s *Server) establishMounts(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if a.OverlayKind != string(overlay.KindFuse) {
+		if !s.beginPoll(a.ID) {
+			// An OpMigrate landed before startup reconcile reached this
+			// account; the conversion leaves it consistent on its own.
+			s.log.Printf("acct-%02d busy converting; skipping startup reconcile", a.ID)
 			continue
 		}
-		prov := overlay.For(overlay.KindFuse)
-		if err := prov.Setup(pool.ClaudeDir(), a.ConfigDir); err != nil {
+		s.reconcileAccount(a)
+		s.endPoll(a.ID)
+	}
+}
+
+// reconcileAccount brings one account's on-disk overlay in line with its row.
+// Caller holds the poll claim.
+func (s *Server) reconcileAccount(a store.Account) {
+	switch overlay.Kind(a.OverlayKind) {
+	case overlay.KindFuse:
+		if err := s.mountFuse(a); err != nil {
 			s.log.Printf("acct-%02d mount failed, falling back to symlink: %v", a.ID, err)
 			s.fallbackToSymlink(a)
 		}
+	default:
+		// At startup this daemon owns no mounts, so a live mountpoint under a
+		// non-fuse row is wreckage by construction — a dead daemon's stale
+		// mount or an aborted rollback's wedged unmount. It blocks every
+		// symlink repair (they refuse mountpoints); force it down first.
+		if overlay.Mounted(a.ConfigDir) {
+			prov := s.overlayFor(overlay.KindFuse)
+			if prov.Kind() != overlay.KindFuse {
+				s.log.Printf("acct-%02d: dir is a stale mountpoint but this build has no fuse provider to unmount it", a.ID)
+				return
+			}
+			if err := prov.Teardown(pool.ClaudeDir(), a.ConfigDir); err != nil {
+				s.log.Printf("acct-%02d: unmount stale mountpoint: %v", a.ID, err)
+				return
+			}
+			s.log.Printf("acct-%02d: cleared a stale mountpoint", a.ID)
+		}
+		// A symlink account can carry private files stranded in a fuse
+		// backing dir by a conversion (or pre-fix fallback) that died
+		// midway — restore them before anything launches on the account.
+		healed, err := s.m.HealStrandedPrivate(a)
+		if err != nil {
+			s.log.Printf("acct-%02d heal stranded private files: %v", a.ID, err)
+			return
+		}
+		if healed {
+			s.log.Printf("acct-%02d restored private files stranded by an interrupted migration", a.ID)
+		}
 	}
+}
+
+// mountFuse establishes a fuse account's mirror. Before mounting it sweeps any
+// private files out of the mount underlay (the real dir) into the backing dir:
+// a conversion killed between its file moves and its row flip leaves them
+// there, and mounting over them would shadow the account's identity — a
+// session would then mint a divergent one in the backing dir. It also refuses,
+// rather than silently degrades, when this build has no fuse provider.
+func (s *Server) mountFuse(a store.Account) error {
+	prov := s.overlayFor(overlay.KindFuse)
+	if prov.Kind() != overlay.KindFuse {
+		return errors.New("fuse provider unavailable in this build")
+	}
+	dir := a.ConfigDir
+	if !overlay.Mounted(dir) {
+		switch has, err := overlay.HasPrivateEntries(dir); {
+		case err != nil:
+			return fmt.Errorf("check underlay for stranded private files: %w", err)
+		case has:
+			if err := overlay.MovePrivateEntries(dir, overlay.FusePrivateRoot(dir)); err != nil {
+				return fmt.Errorf("sweep stranded private files into backing dir: %w", err)
+			}
+			s.log.Printf("acct-%02d swept private files from the mount underlay into the backing dir", a.ID)
+		}
+	}
+	return prov.Setup(pool.ClaudeDir(), dir)
 }
 
 // teardownMounts unmounts fuse mounts on shutdown.
@@ -591,22 +804,29 @@ func (s *Server) teardownMounts() {
 		return
 	}
 	for _, a := range accts {
-		if a.OverlayKind != string(overlay.KindFuse) {
+		// Keyed on actual mount state, not row kind: a wedged unmount can
+		// leave a live mountpoint under a symlink row, and it must not
+		// outlive this daemon's tracking.
+		if !overlay.Mounted(a.ConfigDir) {
 			continue
 		}
-		_ = overlay.For(overlay.KindFuse).Teardown(pool.ClaudeDir(), a.ConfigDir)
+		prov := s.overlayFor(overlay.KindFuse)
+		if prov.Kind() != overlay.KindFuse {
+			continue // nothing in this build can unmount it
+		}
+		_ = prov.Teardown(pool.ClaudeDir(), a.ConfigDir)
 	}
 }
 
-// fallbackToSymlink switches an account to the symlink provider after a mount
-// failure so its dir is still usable.
+// fallbackToSymlink converts an account to the symlink provider after a mount
+// failure so its dir is fully usable again. ConvertOverlay verifies the
+// unmount before laying any symlink and moves the private files back out of
+// the fuse backing dir — the earlier hand-rolled fallback left them stranded
+// there, severing the account from its .claude.json identity. Callers must
+// hold the account's poll or converting claim; the conversion must not race
+// another overlay mutation on the dir.
 func (s *Server) fallbackToSymlink(a store.Account) {
-	if err := (overlay.For(overlay.KindSymlink)).Setup(pool.ClaudeDir(), a.ConfigDir); err != nil {
-		s.log.Printf("acct-%02d symlink fallback failed: %v", a.ID, err)
-		return
-	}
-	a.OverlayKind = string(overlay.KindSymlink)
-	if err := s.m.Store.UpsertAccount(a); err != nil {
-		s.log.Printf("acct-%02d persist symlink fallback: %v", a.ID, err)
+	if _, err := s.m.ConvertOverlay(a, overlay.KindSymlink); err != nil {
+		s.log.Printf("acct-%02d symlink fallback: %v", a.ID, err)
 	}
 }

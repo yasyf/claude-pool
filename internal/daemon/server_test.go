@@ -36,7 +36,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		dir := filepath.Join(t.TempDir(), "acct")
 		dirs[id] = dir
 		if err := st.UpsertAccount(store.Account{
-			ID: id, ConfigDir: dir,
+			ID: id, ConfigDir: dir, OverlayKind: "symlink",
 			KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
 		}); err != nil {
 			t.Fatal(err)
@@ -52,6 +52,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		reservations: map[int]time.Time{},
+		converting:   map[int]bool{},
 		rlStreak:     map[int]int{},
 	}, dirs
 }
@@ -63,7 +64,7 @@ func TestReservedCountExpiresAfterTTL(t *testing.T) {
 		t.Fatalf("reservedCount before reserve = %d, want 0", got)
 	}
 
-	s.reserve(1)
+	s.tryReserve(1)
 	if got := s.reservedCount(1); got != 1 {
 		t.Fatalf("reservedCount after reserve = %d, want 1", got)
 	}

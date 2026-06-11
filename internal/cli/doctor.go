@@ -118,4 +118,30 @@ func checkAccount(cmd *cobra.Command, m *pool.Manager, a store.Account, fix bool
 	} else {
 		report(prefix+" overlay", true, string(prov.Kind()))
 	}
+
+	// Private files stranded in a fuse backing dir by an interrupted
+	// migration: a non-fuse account must hold its .claude.json (and friends)
+	// in the account dir itself.
+	if overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+		priv := overlay.FusePrivateRoot(a.ConfigDir)
+		switch has, herr := overlay.HasPrivateEntries(priv); {
+		case herr != nil:
+			report(prefix+" private files", false, herr.Error())
+		case has && fix:
+			// Only heal when no daemon holds the pool: a CLI-side heal cannot
+			// see the daemon's converting claim, and racing an in-flight
+			// conversion would move files under its teardown sequence. With a
+			// daemon up, the same recovery runs under the claim via
+			// `ccp migrate` (or the daemon's own startup reconcile).
+			if daemon.NewClient().Available() {
+				report(prefix+" private files", false, "stranded in "+priv+"; the daemon is running — re-run `ccp migrate`, or stop the daemon and re-run doctor --fix")
+			} else if healed, ferr := m.HealStrandedPrivate(a); ferr != nil {
+				report(prefix+" private files", false, ferr.Error())
+			} else if healed {
+				report(prefix+" private files", true, "restored from "+priv)
+			}
+		case has:
+			report(prefix+" private files", false, "stranded in "+priv+" by an interrupted migration")
+		}
+	}
 }

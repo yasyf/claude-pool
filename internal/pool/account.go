@@ -137,7 +137,10 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		Index:           n,
 		ConfigDir:       acctDir,
 		KeychainService: svc,
-		OverlayKind:     kind,
+		// The provider actually established, not the requested kind: in a build
+		// without fuse, For() falls back to symlink, and recording the request
+		// would mint a row promising a mirror the dir doesn't have.
+		OverlayKind: prov.Kind(),
 		// The plugin var pins claude's plugin root to the shared base so the
 		// login session (where first-launch marketplace auto-install can run)
 		// writes canonical ~/.claude plugin paths, not acct-anchored ones that
@@ -268,7 +271,7 @@ func (m *Manager) removeAccountDir(prov overlay.Provider, configDir string) erro
 // time and periodically by the daemon, which is why explicit `ccp sync` is
 // unnecessary.
 func (m *Manager) SyncOverlay(a store.Account) error {
-	return overlay.For(overlay.Kind(a.OverlayKind)).Sync(ClaudeDir(), a.ConfigDir)
+	return m.overlayFor(overlay.Kind(a.OverlayKind)).Sync(ClaudeDir(), a.ConfigDir)
 }
 
 // ensureOverlayKind returns the overlay provider kind for new accounts: the

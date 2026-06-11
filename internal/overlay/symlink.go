@@ -37,6 +37,11 @@ func (p *SymlinkProvider) Sync(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to overlay base dir %q onto itself", accountDir)
 	}
+	// Writing symlinks "into" a live fuse mirror would pass through to the real
+	// ~/.claude (the mirror redirects non-private paths to base) — refuse.
+	if Mounted(accountDir) {
+		return fmt.Errorf("refusing to lay symlinks in %q: it is a live mountpoint", accountDir)
+	}
 	// Materialize guaranteed-shared entries in base so the loop below links them
 	// like any other shared entry, even when claude has not created them yet.
 	for name := range SharedEntries {
@@ -123,6 +128,11 @@ func (p *SymlinkProvider) Health(base, accountDir string) error {
 func (p *SymlinkProvider) Teardown(base, accountDir string) error {
 	if accountDir == base || accountDir == "" {
 		return fmt.Errorf("refusing to tear down base dir %q", accountDir)
+	}
+	// Through a live fuse mirror the excluded dirs resolve to the private
+	// backing root — RemoveAll here would destroy that account state.
+	if Mounted(accountDir) {
+		return fmt.Errorf("refusing to tear down %q: it is a live mountpoint", accountDir)
 	}
 	entries, err := os.ReadDir(accountDir)
 	if err != nil {

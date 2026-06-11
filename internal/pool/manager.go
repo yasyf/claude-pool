@@ -8,6 +8,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/oauth"
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -57,6 +58,10 @@ type Manager struct {
 	Store    *store.Store
 	OAuth    Refresher
 	Keychain CredentialStore
+
+	// OverlayFor resolves an overlay kind to a provider; nil means overlay.For.
+	// Tests inject fakes here so conversion logic runs without a live mount.
+	OverlayFor func(overlay.Kind) overlay.Provider
 
 	// LockDir holds the per-account cross-process refresh lock files. Open sets
 	// it under the state dir; tests point it at a temp dir so they never touch

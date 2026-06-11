@@ -24,6 +24,7 @@ const (
 	OpCheckin  Op = "checkin"  // release a checkout and adopt a rotated token
 	OpHealth   Op = "health"   // liveness + version probe
 	OpShutdown Op = "shutdown" // step down gracefully and release the socket
+	OpMigrate  Op = "migrate"  // convert accounts between overlay providers
 )
 
 // Request is one client request (one JSON object per line).
@@ -38,6 +39,30 @@ type Request struct {
 	// Set by --wait clients, which would discard the pick (and its sticky
 	// rewrite, reservation, and preflight side effects) to keep waiting.
 	NoFallback bool `json:"no_fallback,omitempty"`
+	// To: target overlay kind for migrate ("fuse" or "symlink"). The daemon is
+	// the only process that can perform conversions — it hosts the in-process
+	// fuse mounts and owns the select reservations the conversion gates on.
+	To string `json:"to,omitempty"`
+}
+
+// MigrationOutcome classifies one account's migrate result.
+type MigrationOutcome string
+
+const (
+	MigrationDone    MigrationOutcome = "done"    // converted
+	MigrationAlready MigrationOutcome = "already" // was already the target kind
+	MigrationBusy    MigrationOutcome = "busy"    // live session or reservation; re-run later
+	MigrationFailed  MigrationOutcome = "failed"  // conversion errored (detail says why)
+)
+
+// MigrationResult is one account's outcome in a migrate response.
+type MigrationResult struct {
+	ID      int              `json:"id"`
+	Label   string           `json:"label,omitempty"`
+	From    string           `json:"from,omitempty"`
+	To      string           `json:"to,omitempty"`
+	Outcome MigrationOutcome `json:"outcome"`
+	Detail  string           `json:"detail,omitempty"` // busy reason / failure text
 }
 
 // AccountStatus is the per-account view returned by status/select.
@@ -169,8 +194,9 @@ type Response struct {
 	PinHeldAccount *int `json:"pin_held_account,omitempty"`
 	// NoneAvailable: select found no servable account (all rate-limited or the
 	// pool is empty) — a structured signal so clients don't match error strings.
-	NoneAvailable bool            `json:"none_available,omitempty"`
-	Accounts      []AccountStatus `json:"accounts,omitempty"` // status
-	Version       string          `json:"version,omitempty"`  // health
-	SoonestReset  *time.Time      `json:"soonest_reset,omitempty"`
+	NoneAvailable bool              `json:"none_available,omitempty"`
+	Accounts      []AccountStatus   `json:"accounts,omitempty"`   // status
+	Version       string            `json:"version,omitempty"`    // health
+	Migrations    []MigrationResult `json:"migrations,omitempty"` // migrate
+	SoonestReset  *time.Time        `json:"soonest_reset,omitempty"`
 }

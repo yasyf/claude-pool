@@ -1,0 +1,434 @@
+package pool
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/store"
+)
+
+const (
+	identityJSON      = `{"oauthAccount":{"accountUuid":"u-1","emailAddress":"a@example.com"}}`
+	wrongIdentityJSON = `{"oauthAccount":{"accountUuid":"u-IMPOSTOR","emailAddress":"x@example.com"}}`
+)
+
+// fakeFuse stands in for the fuse provider so conversion logic runs without a
+// live mount. Setup simulates the mirror by linking the account dir's
+// .claude.json to the private backing copy (or, when wrongIdentity is set, by
+// serving a different identity); Teardown removes whatever Setup created,
+// matching a real unmount making the mirrored view vanish.
+type fakeFuse struct {
+	ops           *[]string
+	setupErr      error
+	teardownErr   error
+	wrongIdentity bool
+	created       string
+}
+
+func (f *fakeFuse) Kind() overlay.Kind            { return overlay.KindFuse }
+func (f *fakeFuse) Sync(base, dir string) error   { return nil }
+func (f *fakeFuse) Health(base, dir string) error { return nil }
+func (f *fakeFuse) PrivateRoot(dir string) string { return overlay.FusePrivateRoot(dir) }
+func (f *fakeFuse) Setup(base, dir string) error {
+	privIdentity := false
+	if _, err := os.Stat(filepath.Join(overlay.FusePrivateRoot(dir), ".claude.json")); err == nil {
+		privIdentity = true
+	}
+	*f.ops = append(*f.ops, fmt.Sprintf("fuse.setup(priv-identity=%v)", privIdentity))
+	if f.setupErr != nil {
+		return f.setupErr
+	}
+	mounted := filepath.Join(dir, ".claude.json")
+	if f.wrongIdentity {
+		if err := os.WriteFile(mounted, []byte(wrongIdentityJSON), 0o600); err != nil {
+			return err
+		}
+	} else if privIdentity {
+		if err := os.Symlink(filepath.Join(overlay.FusePrivateRoot(dir), ".claude.json"), mounted); err != nil {
+			return err
+		}
+	} else {
+		return nil
+	}
+	f.created = mounted
+	return nil
+}
+func (f *fakeFuse) Teardown(base, dir string) error {
+	*f.ops = append(*f.ops, "fuse.teardown")
+	if f.teardownErr != nil {
+		return f.teardownErr
+	}
+	if f.created != "" {
+		_ = os.Remove(f.created)
+		f.created = ""
+	}
+	return nil
+}
+
+// newConvertFixture builds a real symlink account over a seeded base and a
+// manager whose fuse provider is the fake.
+func newConvertFixture(t *testing.T, fake *fakeFuse) (*Manager, store.Account, string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	base := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Join(home, "acct-01")
+	if err := (&overlay.SymlinkProvider{}).Setup(base, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(identityJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "backups"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "backups", "b.bak"), []byte("bak"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st := openTestStore(t)
+	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Store: st}
+	if fake != nil {
+		m.OverlayFor = func(kind overlay.Kind) overlay.Provider {
+			if kind == overlay.KindFuse {
+				return fake
+			}
+			return &overlay.SymlinkProvider{}
+		}
+	}
+	return m, a, dir
+}
+
+func storedKind(t *testing.T, m *Manager, id int) string {
+	t.Helper()
+	a, err := m.Store.GetAccount(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a.OverlayKind
+}
+
+func TestConvertOverlayNoopWhenAlreadyTarget(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	got, err := m.ConvertOverlay(a, overlay.KindSymlink)
+	if err != nil {
+		t.Fatalf("ConvertOverlay: %v", err)
+	}
+	if got.OverlayKind != "symlink" || len(ops) != 0 {
+		t.Fatalf("no-op convert: kind=%s ops=%v", got.OverlayKind, ops)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude.json")); err != nil {
+		t.Fatalf("no-op convert disturbed the dir: %v", err)
+	}
+}
+
+func TestConvertOverlayUnsupportedWithoutFuseBuild(t *testing.T) {
+	if overlay.FuseBuilt() {
+		t.Skip("fuse build: For(KindFuse) is real, the fallback guard is moot")
+	}
+	m, a, dir := newConvertFixture(t, nil) // no seam: real overlay.For
+	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if !errors.Is(err, ErrConvertUnsupported) {
+		t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity disturbed by refused convert: %q", got)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row changed by refused convert")
+	}
+}
+
+// TestConvertOverlayRetreatWithoutFuseBuild pins the escape hatch for a
+// machine whose fuse-t was uninstalled (reinstall yields a pure binary while
+// rows still say fuse): the fuse→symlink retreat must work without the fuse
+// provider — no in-process mount can exist, so verifying the dir is unmounted
+// stands in for the unmount — and must never hand the dir to the silently
+// substituted symlink provider's Teardown.
+func TestConvertOverlayRetreatWithoutFuseBuild(t *testing.T) {
+	if overlay.FuseBuilt() {
+		t.Skip("fuse build: the real provider handles the retreat")
+	}
+	m, a, dir := newConvertFixture(t, nil) // no seam: real overlay.For
+	// Stage the fuse rest state: row says fuse, identity and backups live in
+	// the private backing dir, no links in the (unmounted) account dir.
+	priv := overlay.FusePrivateRoot(dir)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "backups"), filepath.Join(priv, "backups")); err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+
+	back, err := m.ConvertOverlay(a, overlay.KindSymlink)
+	if err != nil {
+		t.Fatalf("retreat without fuse build: %v", err)
+	}
+	if back.OverlayKind != "symlink" || storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row not flipped back to symlink")
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(dir, "backups", "b.bak")); got != "bak" {
+		t.Fatalf("backups not restored: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted: %v", err)
+	}
+}
+
+func TestConvertToFuseHappyPath(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := overlay.FusePrivateRoot(dir)
+
+	got, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err != nil {
+		t.Fatalf("ConvertOverlay: %v", err)
+	}
+	if got.OverlayKind != "fuse" || storedKind(t, m, a.ID) != "fuse" {
+		t.Fatalf("row not flipped: returned=%s stored=%s", got.OverlayKind, storedKind(t, m, a.ID))
+	}
+	// Move happened BEFORE the mount: Setup must have seen the identity
+	// already in the private backing dir.
+	if len(ops) != 1 || ops[0] != "fuse.setup(priv-identity=true)" {
+		t.Fatalf("ops = %v, want one setup with private identity in place", ops)
+	}
+	if gotJSON := readFileT(t, filepath.Join(priv, ".claude.json")); gotJSON != identityJSON {
+		t.Fatalf("identity in private root = %q", gotJSON)
+	}
+	if gotBak := readFileT(t, filepath.Join(priv, "backups", "b.bak")); gotBak != "bak" {
+		t.Fatalf("backups content lost: %q", gotBak)
+	}
+	// The old overlay's shared links are gone (teardown ran).
+	if _, err := os.Lstat(filepath.Join(dir, "projects")); !os.IsNotExist(err) {
+		t.Fatal("shared symlink survived conversion")
+	}
+}
+
+func TestConvertToFuseSetupFailureRollsBack(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops, setupErr: errors.New("grant Network Volumes access")}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := overlay.FusePrivateRoot(dir)
+
+	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err == nil || !strings.Contains(err.Error(), "rolled back to symlink") {
+		t.Fatalf("error = %v, want rollback report", err)
+	}
+	if !strings.Contains(err.Error(), "grant Network Volumes access") {
+		t.Fatalf("error %v does not carry the mount cause", err)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(dir, "backups", "b.bak")); got != "bak" {
+		t.Fatalf("backups not restored: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted: %v", err)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite failed mount")
+	}
+	if has, _ := overlay.HasPrivateEntries(priv); has {
+		t.Fatal("private files stranded in backing dir after rollback")
+	}
+}
+
+func TestConvertToFuseUnmountFailureAbortsRollback(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops, setupErr: errors.New("mount timed out"), teardownErr: errors.New("still mounted")}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := overlay.FusePrivateRoot(dir)
+
+	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err == nil || !strings.Contains(err.Error(), "mount timed out") || !strings.Contains(err.Error(), "still mounted") {
+		t.Fatalf("error = %v, want both faults reported", err)
+	}
+	// Rollback aborted: NO symlink re-setup over what may be a live mount, and
+	// the identity stays safe in the private backing dir.
+	if _, err := os.Lstat(filepath.Join(dir, "projects")); !os.IsNotExist(err) {
+		t.Fatal("symlinks were laid despite a failed unmount")
+	}
+	if got := readFileT(t, filepath.Join(priv, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not preserved in private root: %q", got)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite failed mount")
+	}
+}
+
+func TestConvertToFuseIdentityMismatchRollsBack(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops, wrongIdentity: true}
+	m, a, dir := newConvertFixture(t, fake)
+
+	_, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err == nil || !strings.Contains(err.Error(), "identity through mount") {
+		t.Fatalf("error = %v, want identity mismatch", err)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored after mismatch: %q", got)
+	}
+	if storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row flipped despite identity mismatch")
+	}
+}
+
+func TestConvertToSymlink(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	priv := overlay.FusePrivateRoot(dir)
+
+	// Forward first, then reverse — the round trip the rollout rehearses.
+	fwd, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err != nil {
+		t.Fatalf("forward convert: %v", err)
+	}
+	back, err := m.ConvertOverlay(fwd, overlay.KindSymlink)
+	if err != nil {
+		t.Fatalf("reverse convert: %v", err)
+	}
+	if back.OverlayKind != "symlink" || storedKind(t, m, a.ID) != "symlink" {
+		t.Fatal("row not flipped back")
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if got := readFileT(t, filepath.Join(dir, "backups", "b.bak")); got != "bak" {
+		t.Fatalf("backups not restored: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted: %v", err)
+	}
+	if _, err := os.Lstat(priv); !os.IsNotExist(err) {
+		t.Fatal("emptied private root not removed")
+	}
+}
+
+func TestConvertToSymlinkAbortsOnFailedUnmount(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, _ := newConvertFixture(t, fake)
+	fwd, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err != nil {
+		t.Fatalf("forward convert: %v", err)
+	}
+	fake.teardownErr = errors.New("still mounted")
+	_, err = m.ConvertOverlay(fwd, overlay.KindSymlink)
+	if err == nil || !strings.Contains(err.Error(), "still mounted") {
+		t.Fatalf("error = %v, want unmount failure", err)
+	}
+	if storedKind(t, m, a.ID) != "fuse" {
+		t.Fatal("row flipped despite failed unmount")
+	}
+}
+
+func TestHealStrandedPrivate(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil)
+	priv := overlay.FusePrivateRoot(dir)
+
+	// Nothing stranded: no-op.
+	healed, err := m.HealStrandedPrivate(a)
+	if err != nil || healed {
+		t.Fatalf("clean account: healed=%v err=%v, want false,nil", healed, err)
+	}
+
+	// Strand the identity (a conversion that died before rollback finished):
+	// the file is in the backing dir, not the account dir.
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	healed, err = m.HealStrandedPrivate(a)
+	if err != nil || !healed {
+		t.Fatalf("healed=%v err=%v, want true,nil", healed, err)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("identity not restored: %q", got)
+	}
+	if _, err := os.Readlink(filepath.Join(dir, "projects")); err != nil {
+		t.Fatalf("symlink overlay not re-asserted: %v", err)
+	}
+	if _, err := os.Lstat(priv); !os.IsNotExist(err) {
+		t.Fatal("emptied private root not removed")
+	}
+
+	// Second run: nothing left to heal.
+	healed, err = m.HealStrandedPrivate(a)
+	if err != nil || healed {
+		t.Fatalf("re-heal: healed=%v err=%v, want false,nil", healed, err)
+	}
+
+	// Misuse: healing a fuse-kind account is a programmer error.
+	a.OverlayKind = "fuse"
+	if _, err := m.HealStrandedPrivate(a); err == nil {
+		t.Fatal("healing a fuse account did not error")
+	}
+}
+
+func TestSetDefaultOverlayKind(t *testing.T) {
+	st := openTestStore(t)
+	m := &Manager{Store: st}
+
+	if err := m.SetDefaultOverlayKind(overlay.KindSymlink); err != nil {
+		t.Fatalf("set symlink default: %v", err)
+	}
+	v, ok, err := st.GetMeta("overlay_kind")
+	if err != nil || !ok || v != "symlink" {
+		t.Fatalf("meta = %q ok=%v err=%v", v, ok, err)
+	}
+
+	if err := m.SetDefaultOverlayKind("zfs"); err == nil {
+		t.Fatal("unknown kind accepted")
+	}
+
+	err = m.SetDefaultOverlayKind(overlay.KindFuse)
+	if overlay.FuseBuilt() {
+		if err != nil {
+			t.Fatalf("fuse default refused in a fuse build: %v", err)
+		}
+	} else if !errors.Is(err, ErrConvertUnsupported) {
+		t.Fatalf("fuse default in pure build = %v, want ErrConvertUnsupported", err)
+	}
+}
+
+func readFileT(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}

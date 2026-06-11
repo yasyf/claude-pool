@@ -93,11 +93,31 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		if err != nil {
 			return "", "", err
 		}
-		_ = m.RecordSticky(req.cwd, a.ID, time.Now()) // anchor future selects here
-		if req.pid > 0 {
-			// Best-effort bookkeeping, like RecordSticky: the session row feeds
-			// the sticky activity rules.
-			_, _ = m.Store.OpenSession(a.ID, req.pid, a.ConfigDir, req.cwd, time.Now())
+		// Route the pick through the daemon when one is up at-version: its
+		// forced path holds gates a client cannot see — an overlay conversion
+		// mid-flight on the dir, mount state, reservations — and refusing
+		// there beats landing a claude in a dir being remade under it. With
+		// no daemon, no conversion can be running either (conversions are
+		// daemon-only), so the local path below is safe.
+		viaDaemon := false
+		if !req.noDaemon {
+			cl := daemon.NewClient()
+			if cl.EnsureRunning(2*time.Second) && daemonAt(version.String()) {
+				if resp, ok := cl.Select(req.account, req.pid, false, req.cwd, false); ok {
+					if !resp.OK {
+						return "", "", errors.New(resp.Error)
+					}
+					viaDaemon = true // daemon recorded the session, sticky, and reservation
+				}
+			}
+		}
+		if !viaDaemon {
+			_ = m.RecordSticky(req.cwd, a.ID, time.Now()) // anchor future selects here
+			if req.pid > 0 {
+				// Best-effort bookkeeping, like RecordSticky: the session row
+				// feeds the sticky activity rules.
+				_, _ = m.Store.OpenSession(a.ID, req.pid, a.ConfigDir, req.cwd, time.Now())
+			}
 		}
 		dir, err := prepareAccount(cmd, m, a)
 		// Forced pick: no scoring, so no usage to report (hasUsage=false → bare name).

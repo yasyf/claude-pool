@@ -7,6 +7,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
+	"github.com/yasyf/cc-pool/internal/store"
 )
 
 const (
@@ -84,64 +85,17 @@ func (s *Server) pollOnce(ctx context.Context) {
 		return
 	}
 	for i, a := range accts {
-		// Respect an exponential rate-limit backoff keyed on the consecutive-429
-		// streak for this account.
-		if last, ok, _ := s.m.Store.LatestUsageSample(a.ID); ok && last.RateLimited &&
-			time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
+		// Claim the account for this iteration. An overlay conversion owns
+		// the dir while it runs (Sync, the fuse self-heal, and a refresh
+		// would all race its move/teardown/mount sequence), and the claim
+		// makes that exclusion two-sided: beginConvert refuses while the
+		// scheduler holds the dir, closing the check-then-act window a plain
+		// isConverting test would leave open.
+		if !s.beginPoll(a.ID) {
 			continue
 		}
-		if i > 0 {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(perAccountSpacing):
-			}
-		}
-		// Re-assert the overlay so long-lived setups pick up new top-level
-		// ~/.claude entries without an explicit sync (symlink relinks; fuse
-		// health-checks).
-		if err := s.m.SyncOverlay(a); err != nil {
-			s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
-			// The daemon is the only process that can host fuse mounts; an
-			// unhealthy fuse overlay here usually means the account was added
-			// (by a CLI that cannot mount) after this daemon started — bring
-			// the mount up now instead of leaving the dir dead until restart.
-			// A mount that cannot come up falls back to symlink, exactly like
-			// establishMounts at startup.
-			if a.OverlayKind == string(overlay.KindFuse) {
-				if merr := overlay.For(overlay.KindFuse).Setup(pool.ClaudeDir(), a.ConfigDir); merr != nil {
-					s.log.Printf("acct-%02d mount failed, falling back to symlink: %v", a.ID, merr)
-					s.fallbackToSymlink(a)
-				}
-			}
-		}
-
-		// A reserved account was just handed out by handleSelect but its claude
-		// is not yet visible to procscan — treat it as busy so we don't refresh
-		// the token out from under the launching session.
-		idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
-			s.reservedCount(a.ID) == 0
-
-		// A previously checked-out account that is now idle may carry a token
-		// rotated by its live session — adopt it (re-asserting our ACL) before
-		// sampling.
-		if idle {
-			if err := s.m.AdoptRotatedToken(ctx, a); err != nil {
-				s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)
-			}
-		}
-
-		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, rateLimited, err := s.m.SampleUsage(cctx, a, idle)
-		cancel()
-		// rlStreak is scheduler-local (this goroutine only) — no lock needed.
-		if rateLimited {
-			s.rlStreak[a.ID]++
-		} else if err == nil {
-			s.rlStreak[a.ID] = 0
-		}
-		if err != nil {
-			s.log.Printf("acct-%02d sample: %v", a.ID, err)
+		if s.pollAccount(ctx, sessions, i, a) {
+			return
 		}
 	}
 
@@ -151,6 +105,74 @@ func (s *Server) pollOnce(ctx context.Context) {
 	if err := s.writeStatusSnapshot(ctx); err != nil {
 		s.log.Printf("status snapshot: %v", err)
 	}
+}
+
+// pollAccount runs one account's per-poll body — overlay re-assert, idle
+// adopt/refresh, usage sample — under the poll claim taken by pollOnce, which
+// it releases. It reports whether polling should stop (ctx cancelled).
+func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i int, a store.Account) (stop bool) {
+	defer s.endPoll(a.ID)
+
+	// Respect an exponential rate-limit backoff keyed on the consecutive-429
+	// streak for this account.
+	if last, ok, _ := s.m.Store.LatestUsageSample(a.ID); ok && last.RateLimited &&
+		time.Since(last.TS) < rlBackoff(s.rlStreak[a.ID]) {
+		return false
+	}
+	if i > 0 {
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(perAccountSpacing):
+		}
+	}
+	// Re-assert the overlay so long-lived setups pick up new top-level
+	// ~/.claude entries without an explicit sync (symlink relinks; fuse
+	// health-checks).
+	if err := s.m.SyncOverlay(a); err != nil {
+		s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
+		// The daemon is the only process that can host fuse mounts; an
+		// unhealthy fuse overlay here usually means the account was added
+		// (by a CLI that cannot mount) after this daemon started — bring
+		// the mount up now instead of leaving the dir dead until restart.
+		// A mount that cannot come up falls back to symlink, exactly like
+		// reconcileOverlays at startup.
+		if a.OverlayKind == string(overlay.KindFuse) {
+			if merr := s.mountFuse(a); merr != nil {
+				s.log.Printf("acct-%02d mount failed, falling back to symlink: %v", a.ID, merr)
+				s.fallbackToSymlink(a)
+			}
+		}
+	}
+
+	// A reserved account was just handed out by handleSelect but its claude
+	// is not yet visible to procscan — treat it as busy so we don't refresh
+	// the token out from under the launching session.
+	idle := procscan.CountByConfigDir(sessions, a.ConfigDir) == 0 &&
+		s.reservedCount(a.ID) == 0
+
+	// A previously checked-out account that is now idle may carry a token
+	// rotated by its live session — adopt it (re-asserting our ACL) before
+	// sampling.
+	if idle {
+		if err := s.m.AdoptRotatedToken(ctx, a); err != nil {
+			s.log.Printf("acct-%02d adopt rotated token: %v", a.ID, err)
+		}
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	_, rateLimited, err := s.m.SampleUsage(cctx, a, idle)
+	cancel()
+	// rlStreak is scheduler-local (this goroutine only) — no lock needed.
+	if rateLimited {
+		s.rlStreak[a.ID]++
+	} else if err == nil {
+		s.rlStreak[a.ID] = 0
+	}
+	if err != nil {
+		s.log.Printf("acct-%02d sample: %v", a.ID, err)
+	}
+	return false
 }
 
 // jitter returns a deterministic-ish jitter in [0, max) derived from seed,

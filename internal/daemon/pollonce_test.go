@@ -153,7 +153,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 	}
 
 	// Reserved: the poll must neither refresh nor adopt (no credential writes).
-	s.reserve(a.ID)
+	s.tryReserve(a.ID)
 	s.pollOnce(t.Context())
 	if got := fo.refreshCount(); got != 0 {
 		t.Fatalf("reserved account was POST-refreshed %d time(s)", got)
