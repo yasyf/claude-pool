@@ -29,17 +29,15 @@ struct StatusProvider: TimelineProvider {
 
     func getTimeline(in _: Context, completion: @escaping (Timeline<StatusEntry>) -> Void) {
         let now = Date()
-        var entries = [load(at: now)]
-        // Pre-dimmed second entry so the view crosses into stale styling at
-        // generated_at+staleAfter without needing a reload.
-        if case .ok(let status, false) = entries[0].state {
-            entries.append(StatusEntry(
-                date: status.generatedAt.addingTimeInterval(Self.staleAfter),
-                state: .ok(status, stale: true)))
-        }
-        // Best-effort 5-minute cadence; the host app's file watcher is the
-        // real freshness driver (WidgetKit throttles unsolicited reloads).
-        completion(Timeline(entries: entries, policy: .after(now.addingTimeInterval(5 * 60))))
+        // One entry, staleness judged at build time. Deliberately NO
+        // future-dated pre-dimmed entry: reloads are budget-throttled
+        // (reloadAllTimelines included), so a synthetic stale flip at
+        // generated_at+staleAfter false-positives between throttled reloads —
+        // the widget spent most of its life dimmed over a perfectly fresh
+        // file. Stale dimming is therefore best-effort (next rebuild); the
+        // self-updating relative "updated … ago" footer carries true age.
+        let entry = load(at: now)
+        completion(Timeline(entries: [entry], policy: .after(now.addingTimeInterval(5 * 60))))
     }
 
     private func load(at now: Date) -> StatusEntry {

@@ -6,12 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-06-11
+
+### Fixed
+- The widget no longer dims as "stale" while the daemon is healthy. The
+  timeline planted a future-dated pre-dimmed entry 7 minutes after each
+  snapshot, assuming reloads land every poll — but WidgetKit budget-throttles
+  reloads, so the widget spent most of its life dimmed over fresh data.
+  Staleness is now judged when the timeline is rebuilt, and the self-updating
+  "updated … ago" footer always carries the true age.
+
+## [0.18.1] - 2026-06-11
+
+### Fixed
+- `ccp widget` works on Homebrew 5, which removed the `--no-quarantine`
+  install flag: quarantine is now disabled via `HOMEBREW_CASK_OPTS`, and any
+  quarantine attribute that slips through anyway is stripped after install
+  (Gatekeeper blocks the ad-hoc-signed app otherwise). The first launch also
+  opens the app by path — LaunchServices hasn't indexed a freshly installed
+  app yet, so the by-name lookup failed on exactly the registering launch.
+
+## [0.18.0] - 2026-06-11
+
 ### Added
 - `ccp widget` installs the Notification Center widget with one command: it
-  pulls the prebuilt app from the new `cc-pool-status` Homebrew cask (with
-  `--no-quarantine`, which the ad-hoc-signed app needs), launches it so macOS
-  discovers the widget, and walks through enabling it. Releases now build and
-  publish the app zip, and the formula-bump job keeps the cask current.
+  pulls the prebuilt app from the new `cc-pool-status` Homebrew cask with
+  quarantine disabled (which the ad-hoc-signed app needs), launches it so
+  macOS discovers the widget, and walks through enabling it. Releases now
+  build and publish the app zip, and the formula-bump job keeps the cask
+  current.
 
 ## [0.17.0] - 2026-06-11
 
@@ -390,7 +413,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.18.2...HEAD
+[0.18.2]: https://github.com/yasyf/cc-pool/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/yasyf/cc-pool/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/yasyf/cc-pool/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/yasyf/cc-pool/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/yasyf/cc-pool/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/yasyf/cc-pool/compare/v0.15.0...v0.15.1
