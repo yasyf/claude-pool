@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -20,6 +21,7 @@ func newStatusCmd() *cobra.Command {
 	var watch bool
 	var live bool
 	var plain bool
+	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show per-account usage, score, and sessions",
@@ -29,6 +31,9 @@ func newStatusCmd() *cobra.Command {
 				if err := requireInit(m); err != nil {
 					return err
 				}
+				if jsonOut {
+					return runStatusJSON(cmd, m, live)
+				}
 				return runStatus(cmd, m, watch, live, plain)
 			})
 		},
@@ -36,7 +41,42 @@ func newStatusCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "refresh continuously (plain mode)")
 	cmd.Flags().BoolVar(&live, "live", false, "force live sampling even if the daemon is running")
 	cmd.Flags().BoolVar(&plain, "plain", false, "print the plain table instead of the interactive TUI")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "print the status snapshot JSON (same schema as ~/.cc-pool/status.json)")
+	cmd.MarkFlagsMutuallyExclusive("json", "watch")
+	cmd.MarkFlagsMutuallyExclusive("json", "plain")
 	return cmd
+}
+
+// runStatusJSON prints the StatusSnapshot the widget reads — the daemon's
+// cached view when usable, else live sampling.
+func runStatusJSON(cmd *cobra.Command, m *pool.Manager, forceLive bool) error {
+	snap, err := statusSnapshotJSON(cmd.Context(), m, forceLive)
+	if err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode status snapshot: %w", err)
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), string(out))
+	return nil
+}
+
+// statusSnapshotJSON builds the StatusSnapshot for --json. It bypasses
+// gatherStatus/fromDaemon deliberately: that round-trip drops SampleAge, and a
+// re-conversion through ToStatuses would fabricate "sample_age":"0s".
+func statusSnapshotJSON(ctx context.Context, m *pool.Manager, forceLive bool) (daemon.StatusSnapshot, error) {
+	if !forceLive {
+		resp, err := daemon.NewClient().Status()
+		if daemonStatusUsable(resp, err) {
+			return daemon.NewStatusSnapshot(resp.Accounts, time.Now()), nil
+		}
+	}
+	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
+	if err != nil {
+		return daemon.StatusSnapshot{}, err
+	}
+	return daemon.NewStatusSnapshot(daemon.ToStatuses(snaps), time.Now()), nil
 }
 
 // runStatus shows account status. On an interactive terminal it launches the

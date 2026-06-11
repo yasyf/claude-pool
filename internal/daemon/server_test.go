@@ -49,6 +49,7 @@ func newTestServer(t *testing.T) (*Server, map[int]string) {
 		m: &pool.Manager{
 			Store: st, OAuth: &fakeOAuth{}, Keychain: newFakeKeychain(), LockDir: t.TempDir(),
 		},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},
@@ -508,6 +509,7 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	s := &Server{
 		m:            &pool.Manager{Store: st},
 		socket:       filepath.Join(sockDir, "d.sock"),
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(&logBuf, "", 0),
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},

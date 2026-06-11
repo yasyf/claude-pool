@@ -1,0 +1,85 @@
+# XcodeGen spec for the cc-pool Notification Center widget.
+# `xcodegen generate` emits CCPoolStatus.xcodeproj plus the Info.plists and
+# entitlements under Generated/ — all gitignored; this file is the source of truth.
+#
+# Signing: ad-hoc by default (runs locally, no Apple ID). If chronod refuses to
+# load the ad-hoc-signed widget, switch to a free personal team:
+#   xcodebuild ... CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=<TEAMID> -allowProvisioningUpdates
+name: CCPoolStatus
+options:
+  bundleIdPrefix: com.yasyf.cc-pool
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    PRODUCT_NAME: $(TARGET_NAME)
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+
+targets:
+  CCPoolStatus:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/App
+      - path: Sources/Shared
+    info:
+      path: Generated/App-Info.plist
+      properties:
+        CFBundleDisplayName: cc-pool Status
+        LSUIElement: true # agent app: no Dock icon, no menu bar
+        LSApplicationCategoryType: public.app-category.developer-tools
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status
+        # The host app is deliberately NOT sandboxed (non-App-Store): its file
+        # watcher needs to observe ~/.cc-pool freely. No entitlements file.
+    dependencies:
+      - target: CCPoolStatusWidget
+        embed: true
+        codeSign: true
+
+  CCPoolStatusWidget:
+    # Legacy NSExtension-style WidgetKit appex (PlugIns/), the best-trodden
+    # XcodeGen path. If gallery discovery ever breaks, the ExtensionKit
+    # conversion is mechanical: type extensionkit-extension + replace the
+    # NSExtension dict with EXAppExtensionAttributes/EXExtensionPointIdentifier.
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Sources/Widget
+      - path: Sources/Shared
+    info:
+      path: Generated/Widget-Info.plist
+      properties:
+        CFBundleDisplayName: cc-pool Status
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      # macOS requires app extensions to be sandboxed; the temporary exception
+      # grants read-only access to ~/.cc-pool/ (status.json). Sandbox exceptions
+      # are not provisioning-restricted, so this works with local signing.
+      path: Generated/Widget.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.temporary-exception.files.home-relative-path.read-only:
+          - /.cc-pool/
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yasyf.cc-pool.status.widget
+        SKIP_INSTALL: true
+
+schemes:
+  CCPoolStatus:
+    build:
+      targets:
+        CCPoolStatus: all
+    run:
+      config: Debug
+    archive:
+      config: Release

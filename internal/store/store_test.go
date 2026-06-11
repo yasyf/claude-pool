@@ -1,7 +1,6 @@
 package store
 
 import (
-	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,59 +14,6 @@ func openTest(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
-}
-
-// TestMigrationAddsColumns opens a database created with the pre-cwd/manual
-// schema and asserts Open migrates it: both columns exist, legacy rows read
-// with the zero-value semantics the activity rules rely on, and a second Open
-// is a no-op.
-func TestMigrationAddsColumns(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-	old, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().Truncate(time.Second)
-	for _, stmt := range []string{
-		`CREATE TABLE sessions (
-		   id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL,
-		   pid INTEGER, config_dir TEXT, started_at INTEGER NOT NULL, ended_at INTEGER)`,
-		`CREATE TABLE sticky (
-		   cwd TEXT PRIMARY KEY, account_id INTEGER NOT NULL, selected_at INTEGER NOT NULL)`,
-	} {
-		if _, err := old.Exec(stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := old.Exec(`INSERT INTO sessions(account_id,pid,config_dir,started_at) VALUES(1,42,'b',?)`, now.Unix()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := old.Exec(`INSERT INTO sticky(cwd,account_id,selected_at) VALUES('/proj',1,?)`, now.Unix()); err != nil {
-		t.Fatal(err)
-	}
-	if err := old.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	for i := 0; i < 2; i++ { // second pass proves idempotence
-		s, err := Open(path)
-		if err != nil {
-			t.Fatalf("open %d: %v", i, err)
-		}
-		st, ok, err := s.GetSticky("/proj")
-		if err != nil || !ok || st.AccountID != 1 || st.Manual {
-			t.Fatalf("open %d: legacy sticky = %+v ok=%v err=%v", i, st, ok, err)
-		}
-		live, err := s.ListActiveSessions()
-		if err != nil || len(live) != 1 || live[0].Cwd != "" {
-			t.Fatalf("open %d: legacy sessions = %+v err=%v", i, live, err)
-		}
-		// A legacy (cwd='') session row neither matches nor protects any pin.
-		if act, err := s.GetCwdActivity("/proj", 1); err != nil || act.Live != 0 {
-			t.Fatalf("open %d: legacy row leaked into activity: %+v err=%v", i, act, err)
-		}
-		s.Close()
-	}
 }
 
 func TestAccountCRUD(t *testing.T) {
@@ -261,8 +207,8 @@ func TestGetCwdActivity(t *testing.T) {
 		t.Fatalf("empty table: %+v err=%v", act, err)
 	}
 
-	// One live, two ended (the later end must win), one unattributed legacy
-	// row, and one row on a DIFFERENT account in the same directory.
+	// One live, two ended (the later end must win), one unattributed
+	// (cwd-less) row, and one row on a DIFFERENT account in the same directory.
 	s.OpenSession(1, 100, "b", "/proj", now.Add(-3*time.Hour))
 	early, _ := s.OpenSession(1, 200, "b", "/proj", now.Add(-2*time.Hour))
 	late, _ := s.OpenSession(1, 300, "b", "/proj", now.Add(-90*time.Minute))
@@ -284,8 +230,8 @@ func TestGetCwdActivity(t *testing.T) {
 		t.Fatalf("lastEnded = %v, want %v", act.LastEnded, now.Add(-10*time.Minute))
 	}
 
-	// The empty-cwd legacy row is invisible to any real directory, and a
-	// different directory sees nothing.
+	// The empty-cwd row is invisible to any real directory, and a different
+	// directory sees nothing.
 	if act, _ := s.GetCwdActivity("/other", 1); act.Live != 0 || !act.LastEnded.IsZero() {
 		t.Fatalf("unrelated cwd sees activity: %+v", act)
 	}

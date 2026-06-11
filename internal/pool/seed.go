@@ -69,16 +69,16 @@ func seedClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (SeedOutc
 		return "", fmt.Errorf("encode seeded config: %w", err)
 	}
 
-	if err := writeAtomic0600(dst, out); err != nil {
+	if err := WriteAtomic0600(dst, out); err != nil {
 		return "", fmt.Errorf("install seeded config: %w", err)
 	}
 	return SeedCopied, nil
 }
 
-// writeAtomic0600 writes data to dst via temp+rename in dst's directory, so a
+// WriteAtomic0600 writes data to dst via temp+rename in dst's directory, so a
 // concurrent reader never sees a partial file. Creates the directory if
 // missing.
-func writeAtomic0600(dst string, data []byte) error {
+func WriteAtomic0600(dst string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}

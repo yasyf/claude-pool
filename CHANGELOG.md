@@ -6,6 +6,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-11
+
+### Added
+- The daemon now mirrors account status to `~/.cc-pool/status.json` after every
+  completed poll (atomic temp+rename, same per-account shape as the socket
+  `status` op plus a `generated_at` heartbeat), so out-of-process readers can
+  render status without the socket.
+- `ccp status --json` prints that same snapshot schema — the daemon's cached
+  view when available, live sampling otherwise.
+- A macOS Notification Center widget (`widget/`, Swift/WidgetKit via XcodeGen)
+  that visualizes the snapshot: per-account 5h/7d usage bars, live-session
+  counts, and stale/rate-limited/exhausted/overage flags in the CLI's display
+  order. See `widget/README.md` for build and install steps.
+
+## [0.16.0] - 2026-06-11
+
+### Added
+- Manual pin/unpin from the status TUI: the new `p` toggle pins the launch
+  directory to an account, badged in the list, detail pane, and `--plain`
+  table. A manual pin always binds while the account can serve; when it
+  cannot, selection ranks freely, keeps the pin, and reports the bypass.
+
+### Changed
+- Pin expiry is activity-based instead of a flat hour after the last select:
+  a pin survives while a tracked session runs in its directory and dies one
+  TTL after the later of its last select and last session end, so long
+  sessions and the post-session warm-cache hour stay protected.
+
+### Fixed
+- Status never sorts an unusable account above a usable one: display order
+  now mirrors selection preference (available, then exhausted, then
+  rate-limited; score deciding only within a tier), so the ▸ next-pick marker
+  always points at an account that can actually serve.
+
 ## [0.15.1] - 2026-06-11
 
 ### Fixed
@@ -349,7 +383,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/yasyf/cc-pool/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/yasyf/cc-pool/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/yasyf/cc-pool/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/yasyf/cc-pool/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/yasyf/cc-pool/compare/v0.13.2...v0.14.0

@@ -146,6 +146,7 @@ func TestPollOnceSkipsReservedAccountRefresh(t *testing.T) {
 
 	s := &Server{
 		m:            &pool.Manager{Store: st, OAuth: fo, Keychain: fk, LockDir: t.TempDir()},
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		reservations: map[int]time.Time{},
 		rlStreak:     map[int]int{},

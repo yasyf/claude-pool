@@ -129,6 +129,7 @@ func TestHandleShutdownEndsServe(t *testing.T) {
 	s := &Server{
 		m:            &pool.Manager{Store: st},
 		socket:       filepath.Join(sockDir, "d.sock"),
+		snapshot:     filepath.Join(t.TempDir(), "status.json"),
 		log:          log.New(io.Discard, "", 0),
 		evictTimeout: defaultEvictTimeout,
 		reservations: map[int]time.Time{},

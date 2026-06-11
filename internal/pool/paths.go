@@ -75,6 +75,13 @@ func LogPath() string {
 	return filepath.Join(StateDir(), "daemon.log")
 }
 
+// StatusSnapshotPath is the daemon's on-disk status mirror
+// (~/.cc-pool/status.json), rewritten atomically after every completed poll
+// for out-of-process readers like the Notification Center widget.
+func StatusSnapshotPath() string {
+	return filepath.Join(StateDir(), "status.json")
+}
+
 // AccountDirName is the directory basename for account index n (n >= 1).
 func AccountDirName(n int) string {
 	return fmt.Sprintf("acct-%02d", n)

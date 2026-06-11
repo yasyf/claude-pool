@@ -39,9 +39,10 @@ const defaultEvictTimeout = 5 * time.Second
 
 // Server is the running daemon.
 type Server struct {
-	m      *pool.Manager
-	socket string
-	log    *log.Logger
+	m        *pool.Manager
+	socket   string
+	snapshot string // status mirror path; tests point it into a temp dir
+	log      *log.Logger
 
 	// evictTimeout bounds the wait for a skewed holder to release the socket.
 	evictTimeout time.Duration
@@ -73,6 +74,7 @@ func Run(ctx context.Context) error {
 	s := &Server{
 		m:            m,
 		socket:       pool.SocketPath(),
+		snapshot:     pool.StatusSnapshotPath(),
 		log:          log.New(os.Stderr, "[cc-pool] ", log.LstdFlags),
 		evictTimeout: defaultEvictTimeout,
 		reservations: map[int]time.Time{},
@@ -269,13 +271,23 @@ func (s *Server) handleShutdown() Response {
 
 // handleStatus returns scored snapshots from cached samples (no live fetch).
 func (s *Server) handleStatus(ctx context.Context) Response {
-	snaps, err := s.m.Snapshots(ctx, false, 0)
+	accts, err := s.statuses(ctx)
 	if err != nil {
 		return Response{OK: false, Error: err.Error()}
 	}
 	// Version lets the client detect a pre-upgrade daemon (which omits newer wire
 	// fields like Components) and fall back to live sampling.
-	return Response{OK: true, Version: version.String(), Accounts: toStatuses(snaps)}
+	return Response{OK: true, Version: version.String(), Accounts: accts}
+}
+
+// statuses assembles the wire view of every account from cached samples — the
+// single mapping shared by the socket status op and the on-disk snapshot.
+func (s *Server) statuses(ctx context.Context) ([]AccountStatus, error) {
+	snaps, err := s.m.Snapshots(ctx, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	return ToStatuses(snaps), nil
 }
 
 // handleSelect picks the best available account from cached scores, applying
@@ -515,8 +527,8 @@ func soonestReset(snaps []pool.Snapshot) time.Time {
 	return best
 }
 
-// toStatuses converts snapshots into wire AccountStatus values.
-func toStatuses(snaps []pool.Snapshot) []AccountStatus {
+// ToStatuses converts snapshots into wire AccountStatus values.
+func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 	out := make([]AccountStatus, 0, len(snaps))
 	for _, sn := range snaps {
 		out = append(out, AccountStatus{

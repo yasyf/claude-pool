@@ -144,6 +144,13 @@ func (s *Server) pollOnce(ctx context.Context) {
 			s.log.Printf("acct-%02d sample: %v", a.ID, err)
 		}
 	}
+
+	// Mirror the freshly-sampled view for out-of-process readers (the widget).
+	// Deliberately skipped by the early returns above: generated_at means "time
+	// of the last completed poll" and must go stale when polling is broken.
+	if err := s.writeStatusSnapshot(ctx); err != nil {
+		s.log.Printf("status snapshot: %v", err)
+	}
 }
 
 // jitter returns a deterministic-ish jitter in [0, max) derived from seed,

@@ -1,7 +1,11 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
+	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -435,6 +439,142 @@ func TestUsageSuffix(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if got := stripANSI(usageSuffix(tc.hasUsage, tc.used5, tc.used7)); got != tc.want {
 				t.Errorf("usageSuffix = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStatusSnapshotJSONLiveFallback covers --json with no daemon: the client
+// dial fails and the snapshot is assembled from live (cached-fresh) samples.
+func TestStatusSnapshotJSONLiveFallback(t *testing.T) {
+	// HOME isolation FIRST: statusSnapshotJSON dials pool.SocketPath(), and
+	// without this a live daemon on the dev machine would hijack the test.
+	t.Setenv("HOME", t.TempDir())
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.UpsertAccount(store.Account{
+		ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "work@example.com",
+		KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh sample keeps Snapshots(live=true) off the network entirely.
+	if err := st.InsertUsageSample(store.UsageSample{
+		AccountID: 1, TS: time.Now(), Util5h: 40, Util7d: 20,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := statusSnapshotJSON(t.Context(), &pool.Manager{Store: st}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Proto != daemon.ProtocolVersion || snap.Version != version.String() {
+		t.Errorf("proto/version = %d/%q, want %d/%q", snap.Proto, snap.Version, daemon.ProtocolVersion, version.String())
+	}
+	if len(snap.Accounts) != 1 {
+		t.Fatalf("accounts = %+v, want exactly the seeded account", snap.Accounts)
+	}
+	a := snap.Accounts[0]
+	if a.ID != 1 || a.Label != "work@example.com" || a.Remaining5h != 60 || !a.HasUsage {
+		t.Errorf("account = %+v, want id 1, label work@example.com, remaining_5h 60, has_usage", a)
+	}
+	if age := time.Since(snap.GeneratedAt); age < 0 || age > time.Minute {
+		t.Errorf("generated_at %v is not recent (age %v)", snap.GeneratedAt, age)
+	}
+}
+
+// TestStatusSnapshotJSONDaemonBranch pins statusSnapshotJSON's primary branch
+// against a fixture daemon socket: a usable daemon's accounts pass through
+// verbatim — preserving sample_age, which a gatherStatus/fromDaemon round-trip
+// would fabricate as "0s" — while a version-skewed daemon falls back to live
+// sampling from the store.
+func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
+	cases := map[string]struct {
+		daemonVersion string
+		wantLabel     string
+		wantSampleAge string // "" = don't assert (live fallback recomputes it)
+	}{
+		"usable daemon passes accounts through": {
+			daemonVersion: version.String(), wantLabel: "from-daemon", wantSampleAge: "42s",
+		},
+		"version skew falls back to live sampling": {
+			daemonVersion: "0.0.0-old", wantLabel: "from-store",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Short HOME under /tmp: macOS caps sun_path at 104 bytes, and
+			// t.TempDir's /var/folders path plus the test name exceeds it.
+			home, err := os.MkdirTemp("/tmp", "ccp-home")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(home) })
+			t.Setenv("HOME", home)
+
+			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ln, err := net.Listen("unix", pool.SocketPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { ln.Close() })
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					var req daemon.Request
+					_ = json.NewDecoder(conn).Decode(&req)
+					_ = json.NewEncoder(conn).Encode(daemon.Response{
+						Proto: daemon.ProtocolVersion, OK: true, Version: tc.daemonVersion,
+						Accounts: []daemon.AccountStatus{{
+							ID: 1, Label: "from-daemon", SampleAge: "42s",
+							HasUsage: true, Remaining5h: 50, Remaining7d: 50,
+						}},
+					})
+					conn.Close()
+				}
+			}()
+
+			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { st.Close() })
+			if err := st.UpsertAccount(store.Account{
+				ID: 1, ConfigDir: filepath.Join(t.TempDir(), "acct"), Label: "from-store",
+				KeychainService: "ccp-test-missing", KeychainAccount: "ccp-test",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// Fresh sample keeps the fallback's Snapshots(live=true) off the network.
+			if err := st.InsertUsageSample(store.UsageSample{
+				AccountID: 1, TS: time.Now(), Util5h: 50, Util7d: 50,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			snap, err := statusSnapshotJSON(t.Context(), &pool.Manager{Store: st}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snap.Accounts) != 1 {
+				t.Fatalf("accounts = %+v, want exactly one", snap.Accounts)
+			}
+			a := snap.Accounts[0]
+			if a.Label != tc.wantLabel {
+				t.Errorf("label = %q, want %q (wrong branch taken)", a.Label, tc.wantLabel)
+			}
+			if tc.wantSampleAge != "" && a.SampleAge != tc.wantSampleAge {
+				t.Errorf("sample_age = %q, want %q passed through verbatim", a.SampleAge, tc.wantSampleAge)
 			}
 		})
 	}

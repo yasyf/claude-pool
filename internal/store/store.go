@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   ended_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(account_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd, ended_at);
 CREATE TABLE IF NOT EXISTS refresh_log (
   account_id INTEGER NOT NULL,
   ts         INTEGER NOT NULL,
@@ -89,50 +90,6 @@ func Open(path string) (*Store, error) {
 func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
-	}
-	// Columns added after a table first shipped: CREATE TABLE IF NOT EXISTS
-	// never alters an existing table, so pre-existing databases need these.
-	if err := s.ensureColumn("sessions", "cwd", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("sessions", "last_seen_at", "INTEGER"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("sticky", "manual", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	// After the ALTERs: on an old database sessions.cwd does not exist when the
-	// schema const runs, so this index cannot live there.
-	if _, err := s.db.Exec(
-		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd, ended_at)`); err != nil {
-		return fmt.Errorf("apply schema: index sessions.cwd: %w", err)
-	}
-	return nil
-}
-
-// ensureColumn adds column (with declaration decl) to table when it is absent.
-// Errors fail Open — running against a half-migrated schema is never
-// acceptable.
-func (s *Store) ensureColumn(table, column, decl string) error {
-	var n int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
-		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
-	}
-	if n > 0 {
-		return nil
-	}
-	// table/column/decl are compile-time constants; nothing user-controlled.
-	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
-		// Two processes can race the check-then-ALTER on the first open after
-		// an upgrade (sqlite has no ADD COLUMN IF NOT EXISTS). The
-		// postcondition is "column exists" — re-check before failing.
-		var again int
-		if err2 := s.db.QueryRow(
-			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again > 0 {
-			return nil
-		}
-		return fmt.Errorf("add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }

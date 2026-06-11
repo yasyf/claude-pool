@@ -36,7 +36,7 @@ type Session struct {
 	AccountID int
 	PID       int
 	ConfigDir string
-	Cwd       string // launch working directory; "" when unattributed (legacy rows, pid-0 selects)
+	Cwd       string // launch working directory; "" when unknown (never matches a pin)
 	StartedAt time.Time
 	// LastSeenAt is when a reconcile scan last observed the pid alive; nil
 	// when never observed. Dead rows are closed at this time, not at reap

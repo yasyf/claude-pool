@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/score"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 // ProtocolVersion is bumped on incompatible wire changes.
@@ -61,6 +62,38 @@ type AccountStatus struct {
 	ExtraLimit   float64 `json:"extra_limit,omitempty"` // currency cents
 	// Components is the per-term score breakdown, so status can explain the score.
 	Components score.Components `json:"components"`
+}
+
+// StatusSnapshot is the on-disk mirror of the status op, written atomically to
+// pool.StatusSnapshotPath() after every completed poll so out-of-process
+// readers (the Notification Center widget) can render status without the
+// socket. Accounts reuses the wire AccountStatus verbatim; Proto is bumped in
+// lockstep with the socket protocol.
+type StatusSnapshot struct {
+	Proto       int             `json:"proto"`
+	Version     string          `json:"version"`
+	GeneratedAt time.Time       `json:"generated_at"`
+	Accounts    []AccountStatus `json:"accounts"`
+}
+
+// NewStatusSnapshot stamps accounts with the protocol version, build version,
+// and generation time. GeneratedAt is truncated to whole seconds: Go would
+// otherwise emit RFC3339Nano, whose fractional part trips plain ISO-8601
+// decoders (the widget's Swift JSONDecoder among them).
+func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
+	if accounts == nil {
+		// A nil slice reaches here when an empty pool round-trips the socket
+		// (Response.Accounts is omitempty, so a zero-length reply decodes as
+		// nil). The snapshot schema pins "accounts": [] — never null, which
+		// the widget's non-optional array would refuse to decode.
+		accounts = []AccountStatus{}
+	}
+	return StatusSnapshot{
+		Proto:       ProtocolVersion,
+		Version:     version.String(),
+		GeneratedAt: now.Truncate(time.Second),
+		Accounts:    accounts,
+	}
 }
 
 // Response is one server reply (one JSON object per line).
