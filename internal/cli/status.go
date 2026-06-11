@@ -122,13 +122,38 @@ func fromDaemon(accs []daemon.AccountStatus) []pool.Snapshot {
 	return out
 }
 
+// snapshotTier mirrors selection preference: Pick serves available accounts,
+// PickFallback falls back to exhausted-but-not-rate-limited, and a rate-limited
+// account cannot serve at all. Status must never show an unusable account above
+// a usable one, however high its forward-looking score.
+func snapshotTier(s pool.Snapshot) int {
+	switch {
+	case !s.RateLimited && !s.Exhausted:
+		return 0
+	case !s.RateLimited:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// sortSnapshots orders snapshots for display: usability tier first, then score
+// desc — the same order select consults, so the ▸ next-pick marker stays honest.
+func sortSnapshots(snaps []pool.Snapshot) {
+	sort.SliceStable(snaps, func(i, j int) bool {
+		if ti, tj := snapshotTier(snaps[i]), snapshotTier(snaps[j]); ti != tj {
+			return ti < tj
+		}
+		return snaps[i].Score > snaps[j].Score
+	})
+}
+
 // renderTable produces a styled fixed-width table, best account highlighted.
 func renderTable(snaps []pool.Snapshot) string {
 	if len(snaps) == 0 {
 		return "No accounts yet. Run `ccp add` to add one.\n"
 	}
-	// Sort by score desc for display; best first.
-	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].Score > snaps[j].Score })
+	sortSnapshots(snaps)
 
 	var b strings.Builder
 	// Two leading spaces align the header with the rows' marker gutter ("▸ "/"  ").

@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -121,6 +122,103 @@ func TestHumanizeResetAt(t *testing.T) {
 func TestRenderTableEmpty(t *testing.T) {
 	if got := renderTable(nil); !strings.Contains(got, "ccp add") {
 		t.Errorf("empty pool should suggest `ccp add`, got %q", got)
+	}
+}
+
+// TestSortSnapshots pins the display ordering shared by the plain table and the
+// TUI: usability tier first (available, then exhausted, then rate-limited —
+// mirroring Pick/PickFallback), score desc within a tier. A raw-score sort here
+// floats unusable accounts above usable ones: reset credit legitimately keeps an
+// exhausted account's forward-looking score high (observed 31.5 vs a healthy
+// 13.3), but select would never pick it.
+func TestSortSnapshots(t *testing.T) {
+	snap := func(id int, score float64, exhausted, rateLimited bool) pool.Snapshot {
+		s := pool.Snapshot{Score: score, Exhausted: exhausted, RateLimited: rateLimited}
+		s.Account.ID = id
+		return s
+	}
+	cases := map[string]struct {
+		in   []pool.Snapshot
+		want []int
+	}{
+		"exhausted sinks below available despite higher score": {
+			in:   []pool.Snapshot{snap(1, 31.5, true, false), snap(2, 13.3, false, false)},
+			want: []int{2, 1},
+		},
+		"rate-limited sinks below exhausted despite higher score": {
+			in:   []pool.Snapshot{snap(1, 50, false, true), snap(2, 5, true, false)},
+			want: []int{2, 1},
+		},
+		"score still rules within a tier": {
+			in:   []pool.Snapshot{snap(1, 13.3, false, false), snap(2, 72.3, false, false), snap(3, 25.9, true, false), snap(4, 31.5, true, false)},
+			want: []int{2, 1, 4, 3},
+		},
+		"full tie keeps input order": {
+			in:   []pool.Snapshot{snap(1, 40, false, false), snap(2, 40, false, false)},
+			want: []int{1, 2},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			sortSnapshots(tc.in)
+			got := make([]int, len(tc.in))
+			for i, s := range tc.in {
+				got[i] = s.Account.ID
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("order = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRenderTableUnusableSinks: in the rendered table, a usable account must
+// take the first row and the ▸ next-pick marker even when an exhausted account
+// out-scores it — the marker claims "next pick", and select skips exhausted.
+func TestRenderTableUnusableSinks(t *testing.T) {
+	snaps := []pool.Snapshot{
+		{
+			Account:   store.Account{ID: 1, Label: "pegged@example.com"},
+			Score:     31.5,
+			HasUsage:  true,
+			Util5h:    100,
+			Util7d:    20,
+			Exhausted: true,
+		},
+		{
+			Account:  store.Account{ID: 2, Label: "healthy@example.com"},
+			Score:    13.3,
+			HasUsage: true,
+			Util5h:   63,
+			Util7d:   12,
+		},
+	}
+	out := stripANSI(renderTable(snaps))
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if !strings.Contains(lines[1], "healthy@example.com") || !strings.HasPrefix(lines[1], "▸") {
+		t.Errorf("usable account must be row 1 with the next-pick marker\n%s", out)
+	}
+	if !strings.Contains(lines[2], "pegged@example.com") || !strings.Contains(lines[2], "exhausted") {
+		t.Errorf("exhausted account must render below the usable one\n%s", out)
+	}
+}
+
+// TestStatusTUISortsTiered pins that the TUI refresh path uses the shared
+// tiered sort, not a raw-score sort: the detail pane's "next pick" line keys
+// off row 0, so an exhausted account floating to the top would lie.
+func TestStatusTUISortsTiered(t *testing.T) {
+	exhausted := pool.Snapshot{Score: 31.5, Exhausted: true}
+	exhausted.Account.ID = 1
+	healthy := pool.Snapshot{Score: 13.3}
+	healthy.Account.ID = 2
+
+	model, _ := statusTUI{}.Update(snapsMsg{snaps: []pool.Snapshot{exhausted, healthy}, at: time.Now()})
+	tui, ok := model.(statusTUI)
+	if !ok {
+		t.Fatalf("Update returned %T, want statusTUI", model)
+	}
+	if len(tui.snaps) != 2 || tui.snaps[0].Account.ID != 2 || tui.snaps[1].Account.ID != 1 {
+		t.Fatalf("TUI must order the usable account first, got %+v", tui.snaps)
 	}
 }
 

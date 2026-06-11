@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"time"
 
@@ -124,7 +123,7 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return t, nil
 	case snapsMsg:
 		t.snaps = msg.snaps
-		sort.SliceStable(t.snaps, func(i, j int) bool { return t.snaps[i].Score > t.snaps[j].Score })
+		sortSnapshots(t.snaps)
 		t.lastUpdate = msg.at
 		t.err = nil
 		t.ensureCursor()
