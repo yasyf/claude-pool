@@ -9,10 +9,104 @@ struct PoolStatus: Decodable {
     let version: String
     let generatedAt: Date
     let accounts: [AccountStatus]
+    let pool: PoolOutlook? // absent before the daemon ever samples, or pre-forecast daemons
 
     enum CodingKeys: String, CodingKey {
-        case proto, version, accounts
+        case proto, version, accounts, pool
         case generatedAt = "generated_at"
+    }
+}
+
+extension PoolStatus {
+    // The custom decode lives in an extension so the memberwise initializer
+    // survives for the preview fixtures below.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        proto = try c.decode(Int.self, forKey: .proto)
+        version = try c.decode(String.self, forKey: .version)
+        generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        accounts = try c.decode([AccountStatus].self, forKey: .accounts)
+        // A malformed pool block is decorative damage only — degrade to the
+        // derived outlook rather than bricking the whole account list.
+        pool = try? c.decodeIfPresent(PoolOutlook.self, forKey: .pool)
+    }
+
+    /// The daemon-computed outlook, or a local approximation for daemons that
+    /// predate the pool block (widget cask and daemon formula upgrade
+    /// independently, so skew windows are real — and a neutral mascot smiling
+    /// at a dry pool would be actively misleading). Burn and dry-out need
+    /// daemon-side history, so the fallback simply omits them. nil means no
+    /// account has ever been sampled.
+    var outlook: PoolOutlook? {
+        if let pool { return pool }
+        let sampled = accounts.filter(\.hasUsage)
+        if sampled.isEmpty { return nil }
+        let usable = sampled.filter { !$0.rateLimited }
+        let mean5 = usable.map(\.remaining5h).meanClamped
+        let mean7 = usable.map(\.remaining7d).meanClamped
+        let mood: Mood = usable.isEmpty
+            ? .panic : Mood(remaining5h: mean5, dryProjected: false)
+        return PoolOutlook(remaining5hPct: mean5, remaining7dPct: mean7,
+                           burnRaw: nil, dryAtRaw: nil, moodRaw: mood.rawValue)
+    }
+}
+
+/// The pool-wide rollup behind the widget headline and mascot, mirroring the
+/// Go wire PoolOutlook in internal/daemon/protocol.go.
+struct PoolOutlook: Decodable {
+    let remaining5hPct: Double
+    let remaining7dPct: Double
+    // fileprivate, not private: the memberwise initializer inherits the most
+    // restrictive property's access, and the fixtures below must call it.
+    fileprivate let burnRaw: Double? // omitempty
+    fileprivate let dryAtRaw: Date? // omitzero
+    fileprivate let moodRaw: String?
+
+    var burn5hPerHour: Double { burnRaw ?? 0 }
+    var dryAt: Date? { dryAtRaw?.nonZero }
+    /// An unknown future mood name degrades by re-deriving from the numbers
+    /// the daemon shipped, not by failing decode or defaulting to calm.
+    var mood: Mood {
+        moodRaw.flatMap(Mood.init(rawValue:))
+            ?? Mood(remaining5h: remaining5hPct, dryProjected: dryAt != nil)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case remaining5hPct = "remaining_5h_pct"
+        case remaining7dPct = "remaining_7d_pct"
+        case burnRaw = "burn_5h_per_hour"
+        case dryAtRaw = "dry_at"
+        case moodRaw = "mood"
+    }
+}
+
+/// Pool-health alarm level, calmest first. Raw values are the wire strings
+/// the daemon emits (forecast.Mood in internal/forecast/pool.go).
+enum Mood: String, CaseIterable {
+    case chill, easy, uneasy, worried, alarmed, panic
+
+    /// Mirrors forecast.moodOf's thresholds so a locally-derived mood matches
+    /// what the daemon would have computed.
+    init(remaining5h: Double, dryProjected: Bool) {
+        let base: Mood = switch remaining5h {
+        case 60...: .chill
+        case 40...: .easy
+        case 25...: .uneasy
+        case 10...: .worried
+        default: .alarmed
+        }
+        self = dryProjected ? base.worse : base
+    }
+
+    /// The next more-alarmed level; panic is terminal.
+    var worse: Mood {
+        switch self {
+        case .chill: .easy
+        case .easy: .uneasy
+        case .uneasy: .worried
+        case .worried: .alarmed
+        case .alarmed, .panic: .panic
+        }
     }
 }
 
@@ -30,6 +124,9 @@ struct AccountStatus: Decodable, Identifiable {
     let stale: Bool
     let resets5h: Date?
     let resets7d: Date?
+    let burn5hPerHour: Double? // omitempty, %/hr drain
+    let projected5hAtReset: Double? // omitempty, projected REMAINING % at resets5h
+    fileprivate let depleted5hAtRaw: Date? // omitzero when idle or a reset refills first
     let extraEnabled: Bool? // omitempty
     let extraUsed: Double? // omitempty, currency cents
     let extraLimit: Double? // omitempty, currency cents
@@ -47,6 +144,9 @@ struct AccountStatus: Decodable, Identifiable {
         case hasUsage = "has_usage"
         case resets5h = "resets_5h"
         case resets7d = "resets_7d"
+        case burn5hPerHour = "burn_5h_per_hour"
+        case projected5hAtReset = "projected_5h_at_reset"
+        case depleted5hAtRaw = "depleted_5h_at"
         case extraEnabled = "extra_enabled"
         case extraUsed = "extra_used"
         case extraLimit = "extra_limit"
@@ -54,6 +154,7 @@ struct AccountStatus: Decodable, Identifiable {
 
     var isExhausted: Bool { exhausted ?? false }
     var hasOverage: Bool { (extraEnabled ?? false) && (extraUsed ?? 0) > 0 }
+    var depleted5hAt: Date? { depleted5hAtRaw?.nonZero }
 
     /// Display label; empty labels fall back to the acct-NN dir basename.
     var displayName: String {
@@ -74,6 +175,14 @@ extension [AccountStatus] {
     /// `ccp status` uses, so "first" here matches the CLI's ▸ next pick.
     var ranked: [AccountStatus] {
         sorted { ($0.tier, -$0.score) < ($1.tier, -$1.score) }
+    }
+}
+
+private extension [Double] {
+    /// Mean of values clamped to 0...100; 0 when empty — mirroring the Go
+    /// rollup's aggregation.
+    var meanClamped: Double {
+        isEmpty ? 0 : map { Swift.min(Swift.max($0, 0), 100) }.reduce(0, +) / Double(count)
     }
 }
 
@@ -125,13 +234,15 @@ enum StatusFile {
     }
 }
 
-// MARK: - Preview / gallery fixture
+// MARK: - Preview / gallery fixtures
 
 extension PoolStatus {
     /// Hardcoded fixture for the widget-gallery snapshot and Xcode previews.
-    /// Six accounts so the medium preview overflows into "+2 more" and the
-    /// large preview shows a full board: overage, stale, no-data, and
-    /// unusable rows all at once.
+    /// Six accounts so the medium preview overflows into "+N more" and the
+    /// large preview shows a full board: hard burn with a depletion ETA, a
+    /// reset projection, overage, stale, no-data, and unusable rows at once.
+    /// The pool block is mid-alarm (worried, dry-out projected) so the
+    /// gallery shows the mascot earning its keep.
     static let sample = PoolStatus(
         proto: 1,
         version: "dev",
@@ -144,6 +255,8 @@ extension PoolStatus {
                 rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(3 * 3600),
                 resets7d: Date().addingTimeInterval(4 * 86400),
+                burn5hPerHour: 22, projected5hAtReset: nil,
+                depleted5hAtRaw: Date().addingTimeInterval(2.6 * 3600),
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil),
             AccountStatus(
                 id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
@@ -152,6 +265,7 @@ extension PoolStatus {
                 rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(2 * 3600),
                 resets7d: Date().addingTimeInterval(3 * 86400),
+                burn5hPerHour: 6, projected5hAtReset: 48, depleted5hAtRaw: nil,
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil),
             AccountStatus(
                 id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
@@ -160,6 +274,7 @@ extension PoolStatus {
                 rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(90 * 60),
                 resets7d: Date().addingTimeInterval(2 * 86400),
+                burn5hPerHour: 2, projected5hAtReset: 19, depleted5hAtRaw: nil,
                 extraEnabled: true, extraUsed: 5073, extraLimit: 10000),
             AccountStatus(
                 id: 4, configDir: "/Users/you/.cc-pool/accounts/acct-04",
@@ -168,6 +283,7 @@ extension PoolStatus {
                 rateLimited: false, exhausted: nil, hasUsage: true, stale: true,
                 resets5h: Date().addingTimeInterval(3600),
                 resets7d: Date().addingTimeInterval(5 * 86400),
+                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil),
             AccountStatus(
                 id: 5, configDir: "/Users/you/.cc-pool/accounts/acct-05",
@@ -175,6 +291,7 @@ extension PoolStatus {
                 remaining5h: 0, remaining7d: 0, activeSessions: 0,
                 rateLimited: false, exhausted: nil, hasUsage: false, stale: false,
                 resets5h: nil, resets7d: nil,
+                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil),
             AccountStatus(
                 id: 6, configDir: "/Users/you/.cc-pool/accounts/acct-06",
@@ -183,6 +300,62 @@ extension PoolStatus {
                 rateLimited: true, exhausted: true, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(40 * 60),
                 resets7d: Date().addingTimeInterval(86400),
+                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
                 extraEnabled: true, extraUsed: 177, extraLimit: 5000),
-        ])
+        ],
+        pool: PoolOutlook(
+            remaining5hPct: 38, remaining7dPct: 56,
+            burnRaw: 13, dryAtRaw: Date().addingTimeInterval(2.6 * 3600),
+            moodRaw: Mood.worried.rawValue))
+
+    /// Variant of `sample` pinning a specific mascot mood, for the
+    /// mood-sweep preview timeline. (PoolOutlook's raw fields are
+    /// fileprivate, so fixture construction has to live in this file.)
+    static func sample(mood: Mood) -> PoolStatus {
+        PoolStatus(
+            proto: 1, version: "dev",
+            generatedAt: Date().addingTimeInterval(-90),
+            accounts: sample.accounts,
+            pool: PoolOutlook(
+                remaining5hPct: 38, remaining7dPct: 56, burnRaw: 13,
+                dryAtRaw: mood == .chill ? nil : Date().addingTimeInterval(2.6 * 3600),
+                moodRaw: mood.rawValue))
+    }
+
+    /// A pre-forecast daemon's snapshot: no pool block, no per-account
+    /// predictions. Exercises the derived-outlook fallback path in previews.
+    static let sampleLegacy = PoolStatus(
+        proto: 1,
+        version: "dev",
+        generatedAt: Date().addingTimeInterval(-90),
+        accounts: [
+            AccountStatus(
+                id: 1, configDir: "/Users/you/.cc-pool/accounts/acct-01",
+                label: "work@example.com", score: 80.1,
+                remaining5h: 72, remaining7d: 88, activeSessions: 1,
+                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                resets5h: Date().addingTimeInterval(3 * 3600),
+                resets7d: Date().addingTimeInterval(4 * 86400),
+                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+            AccountStatus(
+                id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
+                label: "personal@example.com", score: 55.0,
+                remaining5h: 48, remaining7d: 61, activeSessions: 0,
+                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                resets5h: Date().addingTimeInterval(2 * 3600),
+                resets7d: Date().addingTimeInterval(2 * 86400),
+                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+            AccountStatus(
+                id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
+                label: "", score: 12.0,
+                remaining5h: 15, remaining7d: 30, activeSessions: 0,
+                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                resets5h: Date().addingTimeInterval(3600),
+                resets7d: Date().addingTimeInterval(86400),
+                burn5hPerHour: nil, projected5hAtReset: nil, depleted5hAtRaw: nil,
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+        ],
+        pool: nil)
 }
