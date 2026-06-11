@@ -129,6 +129,9 @@ enum StatusFile {
 
 extension PoolStatus {
     /// Hardcoded fixture for the widget-gallery snapshot and Xcode previews.
+    /// Six accounts so the medium preview overflows into "+2 more" and the
+    /// large preview shows a full board: overage, stale, no-data, and
+    /// unusable rows all at once.
     static let sample = PoolStatus(
         proto: 1,
         version: "dev",
@@ -137,21 +140,44 @@ extension PoolStatus {
             AccountStatus(
                 id: 1, configDir: "/Users/you/.cc-pool/accounts/acct-01",
                 label: "work@example.com", score: 88.4,
-                remaining5h: 72, remaining7d: 64, activeSessions: 2,
+                remaining5h: 58, remaining7d: 91, activeSessions: 4,
                 rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(3 * 3600),
                 resets7d: Date().addingTimeInterval(4 * 86400),
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil),
             AccountStatus(
                 id: 2, configDir: "/Users/you/.cc-pool/accounts/acct-02",
+                label: "rebecca.fallon.engineering@example-corp.com", score: 64.0,
+                remaining5h: 60, remaining7d: 41, activeSessions: 2,
+                rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
+                resets5h: Date().addingTimeInterval(2 * 3600),
+                resets7d: Date().addingTimeInterval(3 * 86400),
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+            AccountStatus(
+                id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
                 label: "personal@example.com", score: 41.0,
                 remaining5h: 22, remaining7d: 58, activeSessions: 0,
                 rateLimited: false, exhausted: nil, hasUsage: true, stale: false,
                 resets5h: Date().addingTimeInterval(90 * 60),
                 resets7d: Date().addingTimeInterval(2 * 86400),
+                extraEnabled: true, extraUsed: 5073, extraLimit: 10000),
+            AccountStatus(
+                id: 4, configDir: "/Users/you/.cc-pool/accounts/acct-04",
+                label: "side@example.com", score: 18.0,
+                remaining5h: 12, remaining7d: 35, activeSessions: 0,
+                rateLimited: false, exhausted: nil, hasUsage: true, stale: true,
+                resets5h: Date().addingTimeInterval(3600),
+                resets7d: Date().addingTimeInterval(5 * 86400),
                 extraEnabled: nil, extraUsed: nil, extraLimit: nil),
             AccountStatus(
-                id: 3, configDir: "/Users/you/.cc-pool/accounts/acct-03",
+                id: 5, configDir: "/Users/you/.cc-pool/accounts/acct-05",
+                label: "fresh@example.com", score: 0.0,
+                remaining5h: 0, remaining7d: 0, activeSessions: 0,
+                rateLimited: false, exhausted: nil, hasUsage: false, stale: false,
+                resets5h: nil, resets7d: nil,
+                extraEnabled: nil, extraUsed: nil, extraLimit: nil),
+            AccountStatus(
+                id: 6, configDir: "/Users/you/.cc-pool/accounts/acct-06",
                 label: "", score: -40.2,
                 remaining5h: 1, remaining7d: 12, activeSessions: 0,
                 rateLimited: true, exhausted: true, hasUsage: true, stale: false,

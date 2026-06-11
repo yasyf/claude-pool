@@ -29,7 +29,7 @@ signed, and Gatekeeper blocks a quarantined copy), launches it once so macOS
 discovers the widget, and prints the enable steps:
 
 Open Notification Center (click the menu-bar clock), scroll down →
-**Edit Widgets** → search "cc-pool" → add the small or medium widget. Desktop
+**Edit Widgets** → search "cc-pool" → add the small, medium, or large widget. Desktop
 widgets work too: right-click the desktop → Edit Widgets.
 
 If the widget doesn't appear in the gallery: `killall NotificationCenter

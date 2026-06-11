@@ -20,59 +20,112 @@ struct StatusWidgetView: View {
             if status.accounts.isEmpty {
                 MessageView(symbol: "person.crop.circle.badge.plus", title: "no accounts",
                             detail: "run ccp add")
-            } else if family == .systemSmall {
-                SmallView(status: status, stale: stale)
             } else {
-                MediumView(status: status, stale: stale)
+                switch family {
+                case .systemSmall:
+                    SmallView(status: status, stale: stale)
+                case .systemLarge:
+                    AccountListView(status: status, stale: stale, maxRows: 6, style: .detailed)
+                default:
+                    AccountListView(status: status, stale: stale, maxRows: 4, style: .compact)
+                }
             }
         }
     }
 }
 
-// MARK: - Medium: all accounts, closest to `ccp status`
+// MARK: - Medium & large: ranked account list, closest to `ccp status`
 
-struct MediumView: View {
+/// Row density per family: medium rows are name + bars; large rows add the
+/// resets/overage detail line.
+enum RowStyle { case compact, detailed }
+
+/// Ranked account list filling the widget. Every row gets an equal flexible
+/// slot (maxHeight .infinity) so surplus height spreads across rows instead
+/// of pooling above the footer; with fewer accounts each row simply breathes.
+struct AccountListView: View {
     let status: PoolStatus
     let stale: Bool
-
-    private static let maxRows = 4
+    let maxRows: Int
+    let style: RowStyle
 
     var body: some View {
         let ranked = status.accounts.ranked
-        VStack(alignment: .leading, spacing: 5) {
-            ForEach(ranked.prefix(Self.maxRows)) { account in
-                AccountRow(account: account)
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(ranked.prefix(maxRows)) { account in
+                AccountRow(account: account, style: style)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             }
-            Spacer(minLength: 0)
             FooterView(generatedAt: status.generatedAt, stale: stale,
-                       overflow: max(0, ranked.count - Self.maxRows))
+                       overflow: max(0, ranked.count - maxRows))
+                .padding(.top, 2)
         }
         .opacity(stale ? 0.55 : 1)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
 struct AccountRow: View {
     let account: AccountStatus
+    let style: RowStyle
+
+    /// Lines below the name align past the live dot: dot (7) + spacing (5).
+    private static let indent: CGFloat = 12
 
     var body: some View {
-        HStack(spacing: 6) {
-            LiveDot(count: account.activeSessions)
-            Text(account.displayName)
-                .font(.caption)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            BadgeRow(account: account)
-            if account.hasUsage {
-                UsageBar(window: "5h", remaining: account.remaining5h, alert: account.unusable)
-                UsageBar(window: "7d", remaining: account.remaining7d, alert: account.unusable)
-            } else {
-                Text("no data")
-                    .font(.caption2)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 5) {
+                LiveDot(count: account.activeSessions)
+                Text(account.displayName)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                BadgeRow(account: account, style: style)
+                    .layoutPriority(1) // badges hug; the name truncates first
+            }
+            Group {
+                if account.hasUsage {
+                    HStack(spacing: 10) {
+                        UsageCell(window: "5h", remaining: account.remaining5h, alert: account.unusable)
+                        UsageCell(window: "7d", remaining: account.remaining7d, alert: account.unusable)
+                    }
+                } else {
+                    Text("no data")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.leading, Self.indent)
+            if style == .detailed, let detail {
+                Text(detail)
+                    .font(.system(size: 10))
+                    .monospacedDigit()
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .padding(.leading, Self.indent)
             }
         }
+    }
+
+    /// Detail line: the CLI's RESETS column for both windows plus overage
+    /// spend — shown for every account, not only unusable ones.
+    private var detail: String? {
+        var parts: [String] = []
+        if let reset = account.resets5h?.nonZero {
+            parts.append("5h resets " + reset.formatted(date: .omitted, time: .shortened))
+        }
+        if let reset = account.resets7d?.nonZero {
+            parts.append("7d resets " + reset.formatted(.dateTime.weekday(.abbreviated).hour().minute()))
+        }
+        if account.hasOverage {
+            let used = (account.extraUsed ?? 0) / 100
+            if let limit = account.extraLimit, limit > 0 {
+                parts.append(String(format: "extra $%.2f of $%.2f", used, limit / 100))
+            } else {
+                parts.append(String(format: "extra $%.2f", used))
+            }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -90,20 +143,20 @@ struct SmallView: View {
             HStack(spacing: 5) {
                 LiveDot(count: liveTotal)
                 Text(best.displayName)
-                    .font(.caption.weight(.semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
             if best.hasUsage {
-                WideUsageBar(window: "5h", remaining: best.remaining5h, alert: best.unusable)
-                WideUsageBar(window: "7d", remaining: best.remaining7d, alert: best.unusable)
+                UsageCell(window: "5h", remaining: best.remaining5h, alert: best.unusable)
+                UsageCell(window: "7d", remaining: best.remaining7d, alert: best.unusable)
             } else {
                 Text("no data yet")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
             HStack(spacing: 4) {
-                BadgeRow(account: best)
+                BadgeRow(account: best, style: .compact)
                 if liveTotal > 0 {
                     Text("\(liveTotal) live")
                         .font(.caption2)
@@ -133,33 +186,35 @@ extension AccountStatus {
     var unusable: Bool { rateLimited || isExhausted }
 }
 
-/// Compact "5h ▮▮▮░ 58%" cell for medium rows. The bar fills with % USED
-/// (matching the `ccp status` columns); color reflects remaining headroom.
-struct UsageBar: View {
-    let window: String
-    let remaining: Double
+/// Capsule gauge. The bar fills with % USED (matching the `ccp status`
+/// columns); color reflects remaining headroom.
+struct HeadroomBar: View {
+    let remaining: Double // clamped to 0...100 by the caller
     let alert: Bool
 
+    private static let height: CGFloat = 6
+
     var body: some View {
-        let clamped = min(max(remaining, 0), 100)
-        HStack(spacing: 3) {
-            Text(window)
-                .font(.system(size: 8))
-                .foregroundStyle(.tertiary)
-            ProgressView(value: 100 - clamped, total: 100)
-                .progressViewStyle(.linear)
-                .tint(headroomColor(remaining: clamped, alert: alert))
-                .frame(width: 34)
-            Text("\(Int((100 - clamped).rounded()))%")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, alignment: .trailing)
+        let usedFraction = (100 - remaining) / 100
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                if usedFraction > 0 {
+                    // Floor at the capsule's own diameter so a barely-used
+                    // account renders a full dot, not a degenerate sliver.
+                    Capsule()
+                        .fill(headroomColor(remaining: remaining, alert: alert))
+                        .frame(width: max(Self.height, geo.size.width * usedFraction))
+                }
+            }
         }
+        .frame(height: Self.height)
     }
 }
 
-/// Full-width bar for the small widget.
-struct WideUsageBar: View {
+/// "5h ▮▮▮░ 58%" cell: fixed label and percent columns around a flexible
+/// bar, so bars align across rows and split leftover width with siblings.
+struct UsageCell: View {
     let window: String
     let remaining: Double
     let alert: Bool
@@ -168,17 +223,16 @@ struct WideUsageBar: View {
         let clamped = min(max(remaining, 0), 100)
         HStack(spacing: 4) {
             Text(window)
-                .font(.system(size: 9))
+                .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
-                .frame(width: 14, alignment: .leading)
-            ProgressView(value: 100 - clamped, total: 100)
-                .progressViewStyle(.linear)
-                .tint(headroomColor(remaining: clamped, alert: alert))
+                .frame(width: 16, alignment: .leading)
+            HeadroomBar(remaining: clamped, alert: alert)
             Text("\(Int((100 - clamped).rounded()))%")
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(.secondary)
-                .frame(width: 32, alignment: .trailing)
+                .frame(width: 30, alignment: .trailing)
         }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -189,10 +243,10 @@ struct LiveDot: View {
         HStack(spacing: 2) {
             Circle()
                 .fill(count > 0 ? Color.green : Color.secondary.opacity(0.35))
-                .frame(width: 6, height: 6)
+                .frame(width: 7, height: 7)
             if count > 0 {
                 Text("\(count)")
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
         }
@@ -202,35 +256,40 @@ struct LiveDot: View {
 /// The CLI's stale / rate-limited / exhausted / overage flags as compact glyphs.
 struct BadgeRow: View {
     let account: AccountStatus
+    let style: RowStyle
 
     var body: some View {
         HStack(spacing: 3) {
             if account.stale {
                 Image(systemName: "clock.badge.exclamationmark")
-                    .font(.system(size: 8))
+                    .font(.system(size: 10))
                     .foregroundStyle(.orange)
             }
             if account.rateLimited {
                 Image(systemName: "exclamationmark.octagon.fill")
-                    .font(.system(size: 8))
+                    .font(.system(size: 10))
                     .foregroundStyle(.red)
             }
             if account.isExhausted {
                 Image(systemName: "hourglass.bottomhalf.filled")
-                    .font(.system(size: 8))
+                    .font(.system(size: 10))
                     .foregroundStyle(.red)
             }
-            if account.hasOverage {
-                Text(String(format: "$%.2f", (account.extraUsed ?? 0) / 100))
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.orange)
-            }
-            // When the account can't serve, the time it recovers is the one
-            // fact that matters — the CLI's RESETS column, shown on demand.
-            if account.unusable, let reset = account.resets5h?.nonZero {
-                Text(reset, format: .dateTime.hour().minute())
-                    .font(.system(size: 8))
-                    .foregroundStyle(.secondary)
+            // Detailed rows carry overage and reset times on their own
+            // detail line; repeating them here would double-print.
+            if style == .compact {
+                if account.hasOverage {
+                    Text(String(format: "$%.2f", (account.extraUsed ?? 0) / 100))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.orange)
+                }
+                // When the account can't serve, the time it recovers is the one
+                // fact that matters — the CLI's RESETS column, shown on demand.
+                if account.unusable, let reset = account.resets5h?.nonZero {
+                    Text(reset, format: .dateTime.hour().minute())
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -309,4 +368,11 @@ struct MessageView: View {
 } timeline: {
     StatusEntry(date: .now, state: .ok(.sample, stale: false))
     StatusEntry(date: .now, state: .unreadable)
+}
+
+#Preview("large", as: .systemLarge) {
+    CCPoolStatusWidget()
+} timeline: {
+    StatusEntry(date: .now, state: .ok(.sample, stale: false))
+    StatusEntry(date: .now, state: .ok(.sample, stale: true))
 }

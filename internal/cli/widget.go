@@ -139,7 +139,7 @@ func widgetInstructions() string {
 To add the widget:
   1. Open Notification Center — click the clock in the menu bar.
   2. Scroll to the bottom and click "Edit Widgets".
-  3. Search "cc-pool" and add the small or medium widget.
+  3. Search "cc-pool" and add the small, medium, or large widget.
      (Desktop widgets work too: right-click the desktop → Edit Widgets.)
 
 The widget refreshes every ~3 minutes while CCPoolStatus is running. To keep

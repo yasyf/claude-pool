@@ -14,6 +14,6 @@ struct CCPoolStatusWidget: Widget {
         }
         .configurationDisplayName("cc-pool")
         .description("Per-account usage of your pooled Claude subscriptions.")
-        .supportedFamilies([.systemSmall, .systemMedium])
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
