@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 )
@@ -171,9 +172,17 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			Score: 95.5, Remaining5h: 90, Remaining7d: 80, ActiveSessions: 2,
 			RateLimited: true, Exhausted: true, HasUsage: true, Stale: true,
 			Resets5h: now, Resets7d: now, SampleAge: "30s",
+			Burn5hPerHour: 12, Projected5hAtReset: 62, Depleted5hAt: now,
 			ExtraEnabled: true, ExtraUsed: 177, ExtraLimit: 5000,
 		}
-		data, err := json.Marshal(NewStatusSnapshot([]AccountStatus{full}, now))
+		// A second usable burning account with no known reset, so the pool
+		// rollup emits every PoolOutlook key (burn, dry_at) for the pin below.
+		burning := AccountStatus{
+			ID: 2, ConfigDir: "/x/acct-02", Label: "b@c.d", OverlayKind: "symlink",
+			HasUsage: true, Remaining5h: 50, Remaining7d: 60, SampleAge: "30s",
+			Burn5hPerHour: 10,
+		}
+		data, err := json.Marshal(NewStatusSnapshot([]AccountStatus{full, burning}, now))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -182,7 +191,7 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		if err := json.Unmarshal(data, &top); err != nil {
 			t.Fatal(err)
 		}
-		assertKeys(t, "top-level", top, []string{"proto", "version", "generated_at", "accounts"})
+		assertKeys(t, "top-level", top, []string{"proto", "version", "generated_at", "accounts", "pool"})
 		if got := string(top["generated_at"]); got != `"2026-06-11T12:00:00Z"` {
 			t.Errorf("generated_at = %s, want whole-second UTC", got)
 		}
@@ -201,8 +210,22 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			"id", "config_dir", "label", "overlay_kind", "score",
 			"remaining_5h", "remaining_7d", "active_sessions", "rate_limited",
 			"exhausted", "has_usage", "stale", "resets_5h", "resets_7d",
-			"sample_age", "extra_enabled", "extra_used", "extra_limit", "components",
+			"sample_age", "burn_5h_per_hour", "projected_5h_at_reset", "depleted_5h_at",
+			"extra_enabled", "extra_used", "extra_limit", "components",
 		})
+
+		var poolBlock map[string]json.RawMessage
+		if err := json.Unmarshal(top["pool"], &poolBlock); err != nil {
+			t.Fatal(err)
+		}
+		assertKeys(t, "pool", poolBlock, []string{
+			"remaining_5h_pct", "remaining_7d_pct", "burn_5h_per_hour", "dry_at", "mood",
+		})
+		// Only acct-2 is usable (acct-1 is rate-limited): mean remaining 50,
+		// projected dry with no reset relief bumps easy to uneasy.
+		if got := string(poolBlock["mood"]); got != `"uneasy"` {
+			t.Errorf("pool mood = %s, want uneasy", got)
+		}
 
 		// score.Components has no json tags, so its keys are PascalCase amid
 		// snake_case siblings — the widget must skip it, never decode it.
@@ -230,7 +253,10 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		if err := json.Unmarshal(top["accounts"], &accounts); err != nil {
 			t.Fatal(err)
 		}
-		for _, absent := range []string{"exhausted", "extra_enabled", "extra_used", "extra_limit"} {
+		for _, absent := range []string{
+			"exhausted", "extra_enabled", "extra_used", "extra_limit",
+			"burn_5h_per_hour", "projected_5h_at_reset", "depleted_5h_at",
+		} {
 			if _, ok := accounts[0][absent]; ok {
 				t.Errorf("zero-value account must omit %q (the widget models it as optional)", absent)
 			}
@@ -239,6 +265,11 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		// must treat it as "no active window".
 		if got := string(accounts[0]["resets_5h"]); got != `"0001-01-01T00:00:00Z"` {
 			t.Errorf("zero resets_5h = %s, want year-1 sentinel", got)
+		}
+		// A never-sampled account yields no rollup: the widget falls back to
+		// its locally-derived outlook when "pool" is absent.
+		if _, ok := top["pool"]; ok {
+			t.Error("never-sampled pool must omit the pool block")
 		}
 	})
 
@@ -258,8 +289,81 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			if !strings.Contains(string(data), `"accounts":[]`) {
 				t.Errorf("%s: empty pool must serialize accounts as [], got %s", name, data)
 			}
+			if strings.Contains(string(data), `"pool"`) {
+				t.Errorf("%s: empty pool must omit the pool block, got %s", name, data)
+			}
 		}
 	})
+}
+
+// TestWriteStatusSnapshotForecast pins the forecast path end to end: seeded
+// burn history must surface as wire predictions and the pool rollup.
+func TestWriteStatusSnapshotForecast(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.snapshot = filepath.Join(t.TempDir(), "status.json")
+
+	// The harness seeded acct-1 at util 10 "now"; extend it backward into a
+	// steady climb of +2%/3min = 40%/hr. Whole-second timestamps survive the
+	// store's integer-second column without skewing the slope.
+	latest, ok, err := s.m.Store.LatestUsageSample(1)
+	if err != nil || !ok {
+		t.Fatalf("latest sample: ok=%v err=%v", ok, err)
+	}
+	for i := 1; i <= 4; i++ {
+		if err := s.m.Store.InsertUsageSample(store.UsageSample{
+			AccountID: 1,
+			TS:        latest.TS.Add(-time.Duration(i) * 3 * time.Minute),
+			Util5h:    latest.Util5h - float64(i)*2,
+			Util7d:    latest.Util7d,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.writeStatusSnapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	snap := readSnapshot(t, s.snapshot)
+
+	var acct1 *AccountStatus
+	for i := range snap.Accounts {
+		if snap.Accounts[i].ID == 1 {
+			acct1 = &snap.Accounts[i]
+		}
+	}
+	if acct1 == nil {
+		t.Fatalf("acct-1 missing from snapshot: %+v", snap.Accounts)
+	}
+	if acct1.Burn5hPerHour != 40 {
+		t.Errorf("acct-1 burn_5h_per_hour = %v, want 40", acct1.Burn5hPerHour)
+	}
+	// No reset is known, so depletion is projected and at-reset is omitted:
+	// 90 points left at 40%/hr = 2h15m from the latest sample.
+	wantDepleted := latest.TS.Add(2*time.Hour + 15*time.Minute).Truncate(time.Second)
+	if !acct1.Depleted5hAt.Equal(wantDepleted) {
+		t.Errorf("acct-1 depleted_5h_at = %v, want %v", acct1.Depleted5hAt, wantDepleted)
+	}
+	if acct1.Projected5hAtReset != 0 {
+		t.Errorf("acct-1 projected_5h_at_reset = %v, want omitted with no known reset", acct1.Projected5hAtReset)
+	}
+
+	if snap.Pool == nil {
+		t.Fatal("pool block missing from a sampled snapshot")
+	}
+	// acct-1 90 remaining + acct-2 50 remaining, combined burn 40%/hr:
+	// 140 points / 40 = dry in 3.5h with no reset relief — chill bumps to easy.
+	if snap.Pool.Remaining5hPct != 70 {
+		t.Errorf("pool remaining_5h_pct = %v, want 70", snap.Pool.Remaining5hPct)
+	}
+	if snap.Pool.Burn5hPerHour != 40 {
+		t.Errorf("pool burn_5h_per_hour = %v, want 40", snap.Pool.Burn5hPerHour)
+	}
+	if snap.Pool.DryAt.IsZero() {
+		t.Error("pool dry_at missing despite positive burn and no reset relief")
+	}
+	if snap.Pool.Mood != forecast.MoodEasy {
+		t.Errorf("pool mood = %q, want %q", snap.Pool.Mood, forecast.MoodEasy)
+	}
 }
 
 // assertKeys fails unless m's key set is exactly want.

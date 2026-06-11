@@ -547,10 +547,15 @@ func ToStatuses(snaps []pool.Snapshot) []AccountStatus {
 			Resets5h:       sn.Resets5h,
 			Resets7d:       sn.Resets7d,
 			SampleAge:      sn.SampleAge.Round(time.Second).String(),
-			ExtraEnabled:   sn.ExtraEnabled,
-			ExtraUsed:      sn.ExtraUsed,
-			ExtraLimit:     sn.ExtraLimit,
-			Components:     sn.Components,
+			// The wire ships the gated display forecast, never the raw
+			// scoring burn (which stays live on stale samples).
+			Burn5hPerHour:      sn.Forecast.BurnPerHour,
+			Projected5hAtReset: sn.Forecast.AtReset,
+			Depleted5hAt:       sn.Forecast.DepletedAt,
+			ExtraEnabled:       sn.ExtraEnabled,
+			ExtraUsed:          sn.ExtraUsed,
+			ExtraLimit:         sn.ExtraLimit,
+			Components:         sn.Components,
 		})
 	}
 	return out

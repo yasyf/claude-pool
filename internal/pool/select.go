@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -104,12 +105,12 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	extraByID := make(map[int]bool, len(accts))
 	for _, a := range accts {
 		byID[a.ID] = a
-		in, sample, err := m.scoreInput(a, sessions, now)
+		in, samples, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
 		inByID[a.ID] = in
-		extraByID[a.ID] = sample.ExtraEnabled
+		extraByID[a.ID] = len(samples) > 0 && samples[0].ExtraEnabled
 		inputs = append(inputs, in)
 	}
 
@@ -178,16 +179,17 @@ func (m *Manager) sampleStale(ctx context.Context, accts []store.Account, sessio
 }
 
 // scoreInput assembles a score.Input for one account from cached state, also
-// returning the latest sample so callers can surface fields scoring ignores
-// (extra usage). The sample is the zero value when the account was never
-// sampled.
-func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, store.UsageSample, error) {
+// returning its recent samples (newest first) so callers can compute display
+// forecasts and surface fields scoring ignores (extra usage). The slice is
+// empty when the account was never sampled.
+func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now time.Time) (score.Input, []store.UsageSample, error) {
 	in := score.Input{AccountID: a.ID}
-	var sample store.UsageSample
-	if s, ok, err := m.Store.LatestUsageSample(a.ID); err != nil {
-		return in, sample, err
-	} else if ok {
-		sample = s
+	samples, err := m.Store.RecentUsageSamples(a.ID, forecast.BurnSampleLimit)
+	if err != nil {
+		return in, nil, err
+	}
+	if len(samples) > 0 {
+		s := samples[0]
 		in.HasUsage = true
 		in.SampleTS = s.TS
 		in.Util5h = s.Util5h
@@ -195,34 +197,13 @@ func (m *Manager) scoreInput(a store.Account, sessions []procscan.Session, now t
 		in.Resets5h = s.Resets5h
 		in.Resets7d = s.Resets7d
 		in.RateLimited = s.RateLimited
-		in.Burn5hPerHour = m.burnRate5h(a.ID)
+		in.Burn5hPerHour = forecast.Burn5h(samples, now)
 	}
 	in.ActiveSessions = procscan.CountByConfigDir(sessions, a.ConfigDir)
 	if r, ok, _ := m.Store.LastRefresh(a.ID); ok && !r.OK {
 		in.RefreshFailed = true
 	}
-	return in, sample, nil
-}
-
-// burnRate5h estimates the recent rate of change of util_5h in percent/hour
-// from the two most recent samples. Returns 0 if there is too little history,
-// the samples are too close together (<30s), or utilization decreased (a window
-// reset happened, which is not a burn).
-func (m *Manager) burnRate5h(accountID int) float64 {
-	samples, err := m.Store.RecentUsageSamples(accountID, 2)
-	if err != nil || len(samples) < 2 {
-		return 0
-	}
-	newer, older := samples[0], samples[1]
-	dt := newer.TS.Sub(older.TS)
-	if dt < 30*time.Second {
-		return 0
-	}
-	dUtil := newer.Util5h - older.Util5h
-	if dUtil <= 0 {
-		return 0
-	}
-	return dUtil / dt.Hours()
+	return in, samples, nil
 }
 
 // PreflightRefresh refreshes the chosen account's token if it expires within

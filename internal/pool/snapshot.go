@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
@@ -26,8 +27,15 @@ type Snapshot struct {
 	Stale          bool
 	Resets5h       time.Time
 	Resets7d       time.Time
-	Burn5hPerHour  float64
-	SampleAge      time.Duration
+	// Burn5hPerHour is the ungated scoring burn: it feeds score.Input
+	// rebuilds (the daemon's reservation re-rank) even when the sample is
+	// stale. Display consumers use Forecast instead.
+	Burn5hPerHour float64
+	// Forecast is the gated display forecast — zero when the account is
+	// idle, stale, rate-limited, or exhausted. Only it reaches the status
+	// wire's prediction fields.
+	Forecast  forecast.Estimate
+	SampleAge time.Duration
 	// Extra-usage (pay-as-you-go overage) state from the latest sample, for
 	// status display: an exhausted account with ExtraEnabled bills credits
 	// instead of rate-limiting.
@@ -53,14 +61,14 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	now := time.Now()
 
 	inputs := make([]score.Input, len(accts))
-	samples := make([]store.UsageSample, len(accts))
+	samples := make([][]store.UsageSample, len(accts))
 	for i, a := range accts {
-		in, sample, err := m.scoreInput(a, sessions, now)
+		in, recent, err := m.scoreInput(a, sessions, now)
 		if err != nil {
 			return nil, err
 		}
 		inputs[i] = in
-		samples[i] = sample
+		samples[i] = recent
 	}
 	results := make(map[int]score.Result)
 	for _, r := range score.Rank(inputs, now) {
@@ -71,6 +79,10 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 	for i, a := range accts {
 		in := inputs[i]
 		r := results[a.ID]
+		var latest store.UsageSample
+		if len(samples[i]) > 0 {
+			latest = samples[i][0]
+		}
 		s := Snapshot{
 			Account:        a,
 			Score:          r.Score,
@@ -86,9 +98,10 @@ func (m *Manager) Snapshots(ctx context.Context, live bool, fresh time.Duration)
 			Resets5h:       in.Resets5h,
 			Resets7d:       in.Resets7d,
 			Burn5hPerHour:  in.Burn5hPerHour,
-			ExtraEnabled:   samples[i].ExtraEnabled,
-			ExtraUsed:      samples[i].ExtraUsed,
-			ExtraLimit:     samples[i].ExtraLimit,
+			Forecast:       forecast.Estimate5h(samples[i], r.Exhausted, now),
+			ExtraEnabled:   latest.ExtraEnabled,
+			ExtraUsed:      latest.ExtraUsed,
+			ExtraLimit:     latest.ExtraLimit,
 			Components:     r.Components,
 		}
 		if in.HasUsage {

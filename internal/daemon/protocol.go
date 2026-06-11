@@ -7,6 +7,7 @@ package daemon
 import (
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/forecast"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/version"
 )
@@ -56,6 +57,17 @@ type AccountStatus struct {
 	Resets5h       time.Time `json:"resets_5h"`
 	Resets7d       time.Time `json:"resets_7d"`
 	SampleAge      string    `json:"sample_age"`
+	// Forecast fields, computed from recent usage history at snapshot time.
+	// All are omitted when no projection is possible (idle, stale,
+	// rate-limited, exhausted, or too little burn history); the widget
+	// decodes them as optionals.
+	Burn5hPerHour float64 `json:"burn_5h_per_hour,omitempty"` // %/hr drain
+	// Projected5hAtReset is the projected REMAINING percent at Resets5h,
+	// clamped to 0..100 (matching the remaining_5h convention).
+	Projected5hAtReset float64 `json:"projected_5h_at_reset,omitempty"`
+	// Depleted5hAt is when remaining hits 0 at the current burn; omitted
+	// when a reset refills the window first.
+	Depleted5hAt time.Time `json:"depleted_5h_at,omitzero"`
 	// Extra-usage (pay-as-you-go overage) state, for status display.
 	ExtraEnabled bool    `json:"extra_enabled,omitempty"`
 	ExtraUsed    float64 `json:"extra_used,omitempty"`  // currency cents
@@ -74,12 +86,29 @@ type StatusSnapshot struct {
 	Version     string          `json:"version"`
 	GeneratedAt time.Time       `json:"generated_at"`
 	Accounts    []AccountStatus `json:"accounts"`
+	// Pool is the pool-wide rollup behind the widget's headline and mascot;
+	// nil (key absent) when no account has ever been sampled, which the
+	// widget models as an optional.
+	Pool *PoolOutlook `json:"pool,omitempty"`
+}
+
+// PoolOutlook is the wire form of the forecast pool rollup: mean remaining
+// capacity, summed burn, projected dry-out, and the alarm mood. Mood is
+// computed here, daemon-side, so the widget mascot and any CLI rendering
+// always agree.
+type PoolOutlook struct {
+	Remaining5hPct float64       `json:"remaining_5h_pct"`
+	Remaining7dPct float64       `json:"remaining_7d_pct"`
+	Burn5hPerHour  float64       `json:"burn_5h_per_hour,omitempty"`
+	DryAt          time.Time     `json:"dry_at,omitzero"`
+	Mood           forecast.Mood `json:"mood"`
 }
 
 // NewStatusSnapshot stamps accounts with the protocol version, build version,
-// and generation time. GeneratedAt is truncated to whole seconds: Go would
-// otherwise emit RFC3339Nano, whose fractional part trips plain ISO-8601
-// decoders (the widget's Swift JSONDecoder among them).
+// and generation time, and rolls up the pool-wide outlook. GeneratedAt is
+// truncated to whole seconds: Go would otherwise emit RFC3339Nano, whose
+// fractional part trips plain ISO-8601 decoders (the widget's Swift
+// JSONDecoder among them).
 func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 	if accounts == nil {
 		// A nil slice reaches here when an empty pool round-trips the socket
@@ -88,12 +117,33 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 		// the widget's non-optional array would refuse to decode.
 		accounts = []AccountStatus{}
 	}
-	return StatusSnapshot{
+	snap := StatusSnapshot{
 		Proto:       ProtocolVersion,
 		Version:     version.String(),
 		GeneratedAt: now.Truncate(time.Second),
 		Accounts:    accounts,
 	}
+	pa := make([]forecast.PoolAccount, 0, len(accounts))
+	for _, a := range accounts {
+		pa = append(pa, forecast.PoolAccount{
+			HasUsage:    a.HasUsage,
+			RateLimited: a.RateLimited,
+			Remaining5h: a.Remaining5h,
+			Remaining7d: a.Remaining7d,
+			BurnPerHour: a.Burn5hPerHour,
+			Resets5h:    a.Resets5h,
+		})
+	}
+	if p, ok := forecast.PoolOf(pa, now); ok {
+		snap.Pool = &PoolOutlook{
+			Remaining5hPct: p.Remaining5h,
+			Remaining7dPct: p.Remaining7d,
+			Burn5hPerHour:  p.BurnPerHour,
+			DryAt:          p.DryAt,
+			Mood:           p.Mood,
+		}
+	}
+	return snap
 }
 
 // Response is one server reply (one JSON object per line).
