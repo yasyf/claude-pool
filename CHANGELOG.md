@@ -6,10 +6,183 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-10
+
+### Changed
+- The generated shell alias (and docs) wrap `ccp run` instead of the
+  `ccp select` compose form, so the wrapper owns the full launch environment
+  and never goes stale as it grows.
+
+### Fixed
+- Pooled sessions stamped account-anchored install paths into the shared
+  `~/.claude/plugins` state, which claude's marketplace validator rejected as
+  a "corrupted installLocation". cc-pool now pins the plugin root by setting
+  `CLAUDE_CODE_PLUGIN_CACHE_DIR=~/.claude/plugins` everywhere it launches or
+  instructs a launch — `ccp run`, the `ccp add` login, and the `ccp env`
+  export lines; a user-set value is respected.
+
+## [0.14.0] - 2026-06-10
+
 ### Added
-- `ccp add` detects when a login is the same subscription already in the pool
-  (by accountUuid) and, on a TTY, asks before adding it again; non-interactive
-  runs warn and proceed so automation is never blocked.
+- When every account is exhausted, `ccp select` and `ccp run` fall back to
+  the least-bad account and print a loud billing warning to stderr naming the
+  binding reset window, so extra-usage billing is never silent; `ccp env`
+  prints the same warning.
+- `ccp status` shows exhausted and overage `$X/$Y` badges, backed by the
+  extra-usage overage block now decoded and persisted from the usage API.
+- The daemon logs every selection (pick kind, score, usage, runner-up) so
+  surprising picks can be audited after the fact.
+
+### Changed
+- The usage-sample store schema changed clean-slate, with no column
+  migration — a `~/.cc-pool` database created before 0.14.0 needs to be
+  recreated. The database holds only regenerable cache and state, never
+  secrets.
+
+### Fixed
+- `ccp` could launch a session on an account whose 5-hour window was 100%
+  used — imminent-reset credit forgave total exhaustion and a sticky session
+  pin never let go — silently billing extra-usage credits. Accounts with a
+  pegged window and a pending reset are now unavailable, and the headroom
+  barrier, runway, and sticky floor score raw current remaining, so an
+  imminent reset can no longer mask zero headroom.
+- `ccp select --wait` now actually waits: its daemon arm was dead code. It
+  refuses exhausted-pool fallback picks and keeps waiting for headroom, and
+  the daemon commits no side effects for a pick the client discards.
+
+## [0.13.2] - 2026-06-08
+
+### Fixed
+- Account scoring forgave far too much weekly usage when the 7-day reset was
+  days away — an account at 73% weekly usage with a reset ~2.5 days out could
+  rank first over fresher peers. The reset-credit horizon is now capped at
+  one 5-hour session, so a distant weekly reset earns no credit and accounts
+  rank by true weekly headroom.
+- The `ccp select`/`ccp run` heading and the `ccp status` detail panel
+  labeled the reset-aware "effective" figure as `free`/`remaining` next to
+  the raw `used` bars, producing contradictions like 73% used / 74% free.
+  The heading now shows raw % used (health-tinted), and the panel labels its
+  score term `effective` so it reconciles with the usage bars.
+
+## [0.13.1] - 2026-06-08
+
+### Fixed
+- `ccp add` no longer hangs silently before the login prompt: the daemon
+  binds its socket before probing `claude --version` so readiness checks
+  return immediately, a redundant `launchctl kickstart -k` (which killed the
+  fresh daemon and cold-started a second instance) is gone, and the remaining
+  daemon/overlay waits show a spinner so they read as progress.
+
+## [0.13.0] - 2026-06-08
+
+### Changed
+- Plan-mode plans are shared across the whole pool: the overlay links each
+  account's `plans` dir to the single `~/.claude/plans` store, so plans
+  written in one pooled session are visible from every account and from
+  plain `claude` instead of being scattered per account.
+
+## [0.12.4] - 2026-06-08
+
+### Fixed
+- `ccp add` no longer mistakes plain claude's startup-adopted session secret
+  for a completed login. Over headless SSH, `claude /login` copies the global
+  session secret into the account's credential store before any login
+  happens; the add watcher treated that copy as "login done", killed claude
+  mid-menu, and registered a duplicate of the main subscription. Completion
+  is now gated on the account's own `.claude.json` identity, and finalize
+  refuses accounts without one — console/third-party API logins, which write
+  no identity, are rejected: cc-pool pools Max/Pro OAuth subscriptions only.
+
+## [0.12.3] - 2026-06-08
+
+### Fixed
+- Upgrading no longer prints a `pkill -f 'cc-pool daemon'` instruction when
+  an old daemon is slow to release the socket — `ccp` auto-evicts a wedged
+  version-skewed daemon, booting it out via launchd first and, for a true
+  orphan, killing the exact process holding `~/.cc-pool/daemon.sock`
+  (identified by socket peer credentials, never by process name, so only the
+  socket holder can ever be targeted).
+
+## [0.12.2] - 2026-06-08
+
+### Fixed
+- The shared overlay no longer links or mirrors `~/.claude/.credentials.json`
+  into pool account dirs. claude writes its OAuth credential to that
+  plaintext file when the macOS Keychain is unavailable (e.g. a headless SSH
+  session), and sharing it meant `ccp add` ran `claude /login` against plain
+  claude's live credential — adopting that login instead of prompting for a
+  new account, and mutating plain claude's credential on refresh, the one
+  thing the pool must never touch. Each account now keeps its own.
+- Credentials resolve Keychain-first with a plaintext-file fallback, so the
+  login watcher, add finalization, the daemon's idle token refresh, and
+  `ccp doctor` work whether claude stored the credential in the Keychain or
+  in `.credentials.json` — headless setups no longer break the Keychain-only
+  assumptions.
+
+## [0.12.1] - 2026-06-08
+
+### Fixed
+- The daemon no longer logs a relink error on every overlay sync poll:
+  claude rewrites `.last-update-result.json` atomically, replacing the
+  overlay's symlink with a real file that sync refused to relink. The
+  auto-update result is now a private per-account entry — it stays
+  instance-local and never lands in the shared `~/.claude` base.
+- Starting the daemon via brew (`ccp service install`) now forces it to
+  actually run with `launchctl kickstart` — `brew services start` only loads
+  the launchd job, and a stop/start race could leave it loaded but never
+  executing.
+
+## [0.12.0] - 2026-06-08
+
+### Changed
+- Rate-limit reset windows show as absolute local times — `3:58 PM`,
+  `tomorrow 3:58 PM`, `Tue 3:58 PM`, `Jun 15, 3:58 PM` — instead of relative
+  durations like `Resets 45h50m`, across the `ccp status` table, the TUI
+  5h/7d rows, and the `ccp select` waiting-until lines.
+
+### Fixed
+- The daemon converges to the installed version after an upgrade. Previously,
+  when an orphaned old-version daemon held the socket but launchd no longer
+  tracked it, the new daemon refused to bind and `ccp status` restarted the
+  daemon on every run without converging. A starting daemon now evicts a
+  version-skewed holder (refusing to bind only against a genuine same-version
+  peer), and `ccp` asks the old daemon to step down before restarting it.
+  Along the way: a late listener close can no longer delete a successor's
+  socket, fuse mounts moved off the accept path so daemon health checks
+  respond immediately on boot, and fuse teardown is bounded and forced.
+
+## [0.11.0] - 2026-06-08
+
+### Changed
+- `ccp run` and `ccp select` name the chosen account and show its effective
+  5-hour / 7-day headroom instead of a generic "Selected the emptiest
+  account" line; an account the daemon has never sampled degrades to a
+  name-only line.
+
+## [0.10.0] - 2026-06-08
+
+### Added
+- Bare `ccp` invocations that lead with a claude flag (e.g. `ccp --resume`,
+  `ccp -p "hi"`) forward to `ccp run` instead of failing with "unknown
+  flag". `ccp`'s own `-h`/`--help` and `-v`/`--version`, its subcommands,
+  bare `ccp`, and unknown-command suggestions all behave as before.
+
+## [0.9.1] - 2026-06-08
+
+### Fixed
+- `ccp status` no longer mislabels stale accounts as "no-data": the daemon
+  reports whether usage data actually exists instead of inferring it from
+  staleness, so an account whose poll is merely overdue keeps showing its
+  real utilization.
+- Accounts no longer read "stale" for most of every poll cycle: the displayed
+  staleness threshold (90s) sat below the daemon's ~3-minute poll interval
+  and is now 5 minutes; the 90s threshold remains only as the selection
+  penalty, where it applies uniformly and doesn't skew ranking.
+- `ccp status`, `ccp select`, and `ccp run` detect and reject a daemon left
+  running from a previous version instead of rendering garbage; the status
+  TUI restarts the skewed daemon automatically.
+
+## [0.9.0] - 2026-06-08
 
 ### Changed
 - Renamed the short command from `clp` to `ccp` (the symlink beside the
@@ -18,12 +191,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Homebrew formula, launchd label, FUSE volname, and the `~/.cc-pool` state
   dir — so account dirs, Keychain service names, and stored state need no
   migration.
+
+## [0.8.0] - 2026-06-08
+
+### Changed
+- `ccp run` is a transparent launcher: it replaces itself with `claude` via
+  exec instead of supervising a subprocess, so once claude starts cc-pool is
+  gone from the process tree and signals, the controlling terminal, and the
+  exit code are all claude's. Arguments pass through verbatim with no `--`
+  separator needed (e.g. `ccp run --resume`).
+- `ccp run` picks its account the same way `ccp select` does — taking the
+  daemon's reserved pick and falling back to a live selection only when the
+  daemon is unreachable — and token refresh for run sessions is handled by
+  the daemon's idle-account path.
+
+### Removed
+- The `--account` flag on `ccp run`, which cannot coexist with literal
+  argument passthrough; force a specific account with `CCP_ACCOUNT=<id>`
+  instead.
+
+## [0.7.0] - 2026-06-08
+
+### Added
+- Interactive `ccp status` TUI: a live-refreshing account list plus a detail
+  pane that explains the selected account's score factor by factor, with a
+  footer legend. Piped or non-TTY output falls back to the plain table with a
+  one-line legend; `--plain` forces the table on a terminal.
+
+### Changed
+- Status 5h/7d columns show % used (100% = exhausted), matching Anthropic's
+  framing, with usage bars; the `SESS` column is renamed `LIVE`, and flags
+  appear inline only when present.
+- `ccp select` is quieter: it names the chosen account instead of printing a
+  generic reuse line, and prints only when stdout is a terminal — silent
+  under pipes and command substitution.
+
+## [0.6.1] - 2026-06-08
+
+### Fixed
+- Two processes refreshing the same account's token at once — the daemon's
+  poll loop racing a short-lived `ccp` invocation — could double-spend the
+  single-use OAuth refresh token, leaving the loser with `invalid_grant` and
+  the account revoked until an interactive re-login. Token refresh is now
+  serialized across processes with a per-account lock held over the whole
+  read–refresh–write cycle; a waiter that acquires the lock after a peer
+  already rotated the token re-reads the fresh credential instead of spending
+  its own refresh.
+
+## [0.6.0] - 2026-06-08
+
+### Added
+- `ccp add` no longer ends silently: it prints the canonical launch command
+  and offers to wrap `claude` so plain `claude` routes through the emptiest
+  account, forwarding all arguments. The wrapper is idempotent, never
+  clobbers a user-defined `claude`, `-y` consents, and `--no-alias` opts out.
+- `ccp add` detects when a login is the same subscription already in the pool
+  (by accountUuid) and, on a TTY, asks before adding it again; non-interactive
+  runs warn and proceed so automation is never blocked.
+
+### Changed
 - Trimmed the add flow to what the user can act on: dropped the seeding,
   overlay, and cleanup chatter and the redundant "closed claude" line. "Add
-  another account?" now defaults to yes after the first account, and the closing
-  line just reports the pool total.
+  another account?" now defaults to yes after the first account, and the
+  closing line just reports the pool total.
+
+### Fixed
+- Usage headroom was inflated 100x: the `/api/oauth/usage` endpoint reports
+  each window's `utilization` as a percent (0–100), but the client treated it
+  as a 0..1 fraction, so `ccp status` showed nonsense like -2600% headroom
+  and negative scores. The value is now read verbatim, and the usage
+  model matches the current API shape (the stored-but-never-scored seven-day
+  Opus window is dropped).
 
 ## [0.5.0] - 2026-06-08
+
+### Changed
+- Reworked the CLI output: a shared styled output layer with consistent,
+  flush-left formatting and a single huh form theme. Human flows (`add`,
+  `status`, `select`, `run`) no longer leak internal ids, Keychain service
+  names, paths, or overlay kind; those stay in the inspection commands
+  (`ccp list`, `ccp doctor`). Copy across every command rewritten for clarity.
 
 ### Removed
 - Credential adoption. `ccp add` no longer copies plain claude's current login
@@ -38,12 +285,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Usage decode crashed when the API returned `resets_at` as a string. The field
   now accepts a JSON number, a numeric string, or an RFC3339 timestamp.
 
+## [0.4.1] - 2026-06-08
+
+### Added
+- Bare `ccp` routes by pool state: an empty or uninitialized pool on a
+  terminal runs the add flow, a populated pool shows status, and an empty
+  pool without a terminal errors loudly.
+- Credential adoption in `ccp add`: when plain claude's current login isn't
+  pooled yet, offer to copy its credential (read-only) into the new account's
+  own Keychain item and refresh the copy onto its own token chain — no new
+  login. Removed again in 0.5.0.
+- Watched login: `ccp add` owns the `claude /login` it spawns and closes it
+  for you once the credential lands, with full terminal restoration; the
+  manual other-terminal path polls with a spinner. Account labels prefill
+  from the logged-in email.
+
 ### Changed
-- Reworked the CLI output: a shared styled output layer with consistent,
-  flush-left formatting and a single huh form theme. Human flows (`add`,
-  `status`, `select`, `run`) no longer leak internal ids, Keychain service
-  names, paths, or overlay kind; those stay in the inspection commands
-  (`ccp list`, `ccp doctor`). Copy across every command rewritten for clarity.
+- `ccp remove --keep-credential` followed by a re-add no longer resurrects
+  the kept credential, and `ccp add -y` no longer prompts for a label.
+
+### Fixed
+- A usage-validation blip during the final add step keeps the registered
+  account with a warning instead of offering a rollback that destroyed a
+  live credential.
 
 ## [0.4.0] - 2026-06-06
 
@@ -77,5 +341,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked automatically when fuse-t is present); CI and release workflows.
 - License: PolyForm Noncommercial 1.0.0.
 
-[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/yasyf/cc-pool/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/yasyf/cc-pool/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/yasyf/cc-pool/compare/v0.13.2...v0.14.0
+[0.13.2]: https://github.com/yasyf/cc-pool/compare/v0.13.1...v0.13.2
+[0.13.1]: https://github.com/yasyf/cc-pool/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/yasyf/cc-pool/compare/v0.12.4...v0.13.0
+[0.12.4]: https://github.com/yasyf/cc-pool/compare/v0.12.3...v0.12.4
+[0.12.3]: https://github.com/yasyf/cc-pool/compare/v0.12.2...v0.12.3
+[0.12.2]: https://github.com/yasyf/cc-pool/compare/v0.12.1...v0.12.2
+[0.12.1]: https://github.com/yasyf/cc-pool/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/yasyf/cc-pool/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/yasyf/cc-pool/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/yasyf/cc-pool/compare/v0.9.1...v0.10.0
+[0.9.1]: https://github.com/yasyf/cc-pool/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/yasyf/cc-pool/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/yasyf/cc-pool/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/yasyf/cc-pool/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/yasyf/cc-pool/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/yasyf/cc-pool/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/yasyf/cc-pool/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/yasyf/cc-pool/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/yasyf/cc-pool/compare/v0.3.0...v0.4.0

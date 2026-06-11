@@ -1,23 +1,23 @@
 # cc-pool
 
 [![CI](https://img.shields.io/github/actions/workflow/status/yasyf/cc-pool/ci.yml?branch=main&label=CI)](https://github.com/yasyf/cc-pool/actions/workflows/ci.yml)
-[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/cc-pool/blob/main/LICENSE)
+[![Release](https://img.shields.io/github/v/release/yasyf/cc-pool)](https://github.com/yasyf/cc-pool/releases)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](LICENSE)
 
 **Predictive, start-of-session load-balancing across multiple Claude subscriptions — for macOS.**
 
-If you have several Claude Max/Pro subscriptions, `cc-pool` launches each
-session on the **emptiest** account, so you stop hitting 5-hour and weekly
-limits on one account while another sits idle:
+Run several Claude Max/Pro subscriptions and you hit the same wall every week:
+one account pegged at its 5-hour or weekly limit while another sits idle.
+cc-pool launches every Claude Code session on the **emptiest** account, picked
+from live 5-hour / 7-day usage *before* the session starts — predictive, not
+reactive. No proxy in the request path, no manual switching, no waiting for a
+rate-limit error to learn you picked wrong.
 
-```sh
-ccp run
-```
-
-Unlike reactive proxies or manual switchers, `ccp select` predicts the best
-account *before* the session starts, from live 5-hour / 7-day usage. Plain
-`claude` keeps working, untouched.
-
----
+After setup, `claude` is an alias for `ccp run` and the pooling disappears
+into the background. Two hard guarantees underwrite the design: plain `claude`
+on `~/.claude` keeps working untouched — the pool can never log it out — and
+secrets stay in the macOS Keychain, never in cc-pool's database. [How it
+works](#how-it-works) has the details.
 
 ## Install
 
@@ -26,41 +26,121 @@ brew tap yasyf/cc-pool https://github.com/yasyf/cc-pool
 brew install yasyf/cc-pool/cc-pool
 ```
 
-The binary installs as `cc-pool` with a `ccp` symlink.
+macOS only. The binary installs as `cc-pool` with a `ccp` symlink; the default
+build is pure Go.
 
 ## Quickstart
 
-```sh
-ccp add                                    # log in your first subscription (auto-inits the pool)
-ccp add                                    # ...and another (acct-02)
-ccp status                                 # live table: per-account 5h/7d remaining, score, sessions
+Pool two subscriptions and launch Claude on the emptiest one, in about five
+minutes.
 
-ccp run                                    # launch on the emptiest account
-claude                                     # plain claude STILL works, fully decoupled (~/.claude)
+**1. Run `ccp`.** On an empty pool it walks you through logging in each
+subscription — every account gets its own `claude /login`:
+
+```text
+$ ccp
+✓ Set up cc-pool on this machine.
+
+How do you want to log in?
+> Log in now, in this terminal
+
+# claude opens its /login flow right here; finish it and ccp closes claude for you
+
+Name for this account (optional)
+> work@example.com
+
+✓ Added work@example.com.
+
+Add another account?
+> Yes
+
+# the second login runs the same way
+✓ Added personal@example.com.
+
+Your pool now has 2 accounts.
+
+Launch Claude on the emptiest account:
+
+    ccp run
+
+Wrap `claude` to always launch on the emptiest account?
+> Yes
+
+✓ Wrapped `claude` — added an alias to ~/.zshrc.
+Restart your shell or run `source ~/.zshrc` to use it now.
+Run `command claude` for plain ~/.claude.
 ```
 
-Your main subscription joins the pool like any other account: `ccp add` gives
-it its own login in its own account dir. Plain `claude` stays fully decoupled —
-the pool can never log it out.
+**2. Check the pool.** `ccp status --plain` prints the table once; bare
+`ccp status` (or bare `ccp`, now that accounts exist) opens a live TUI with
+per-account score breakdowns:
 
-Make `claude` use the pool by default — `ccp add` offers to do this for you, appending a
-`claude` alias to your shell (`~/.zshrc`, `~/.bash_profile`, or `~/.config/fish/config.fish`)
-that forwards every argument:
-
-```sh
-alias claude='ccp run'
+```text
+$ ccp status --plain
+  ACCOUNT                     SCORE  5h used  7d used  LIVE RESETS
+▸ work@example.com             68.1      22%      46%     0 6:00 PM
+  personal@example.com         34.8      61%      70%     0 4:30 PM
+▸ = next pick · score higher = emptier · 5h/7d = % used
+updated 3:58 PM
 ```
 
-`command claude` keeps plain `claude` (on `~/.claude`) one keystroke away. Prefer a separate
-command and leave `claude` untouched? Add your own alias instead:
+**3. Launch.** Run `claude` (now wrapped). It announces its pick on stderr,
+then execs the real `claude` — cc-pool is gone from the process tree before
+Claude Code draws its first frame:
+
+```text
+$ claude
+Selected work@example.com · 5h 22% used · 7d 46% used
+```
+
+The `Selected` line names the account marked `▸` in step 2 — that match is
+your verification. From here on, every `claude` lands on whichever account
+has the most headroom.
+
+## Day-to-day use
+
+### The alias, and escaping it
+
+The quickstart wraps `claude` with `alias claude='ccp run'`. `command claude`
+bypasses it — plain claude on `~/.claude`, one keystroke away. Prefer to
+leave `claude` untouched? Decline the prompt (or pass `ccp add --no-alias`)
+and pick your own name:
 
 ```sh
 alias cl='ccp run'
 ```
 
-Prefer composing the launch yourself? `ccp select` prints the chosen config dir,
-but set the plugin root too so the session writes canonical plugin paths into
-the shared `~/.claude/plugins` state (`ccp run` and `ccp env` do this for you):
+### Passing arguments
+
+`ccp run` forwards every argument to `claude` verbatim — no `--` separator
+needed. Bare `ccp` with flags is shorthand for the same thing:
+
+```sh
+ccp run --resume
+ccp -p "summarize this repo"   # auto-converts to `ccp run -p ...`
+```
+
+### Forcing and pinning
+
+`CCP_ACCOUNT=2 ccp run` forces account 2 instead of auto-selecting. Repeated
+launches from the same directory stick to one account for prompt-cache
+continuity; those announce `Reusing work@example.com (pinned)` instead of
+`Selected`.
+
+### When every account is full
+
+Selection refuses to burn a nearly-reset window: an account with an exhausted
+plan window is never picked while any account has headroom, and
+`ccp select --wait` blocks until one does. If the whole pool is exhausted, the
+launch falls back to the least-bad account and warns loudly on stderr —
+that session bills pay-as-you-go credits if extra usage is enabled, or
+rate-limits until the window resets.
+
+### Composing the launch yourself
+
+`ccp select` prints the chosen config dir on stdout and nothing else. Set the
+plugin root too, so the session writes canonical plugin paths into the shared
+`~/.claude/plugins` (`ccp run` and `ccp env` both do this for you):
 
 ```sh
 CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp select) claude
@@ -70,91 +150,120 @@ CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp sel
 
 ### `~/.claude` is sacred
 
-`~/.claude` is **never moved** and never registered as a pool account. It stays
-the canonical config dir, so plain `claude` keeps working exactly as before, and
-serves as the **shared base** every pooled account mirrors. The pool never
-reads or writes plain claude's credential or state. Every account, including
-your main subscription, joins with its own `claude /login`, so its token chain
-is fully independent of plain claude's.
+`~/.claude` is **never moved** and never registered as a pool account. It
+stays the canonical config dir, so plain `claude` keeps working exactly as
+before, and is the **shared base** every pooled account mirrors. The
+pool never reads or writes plain claude's credential or state. Every account,
+including your main subscription, joins with its own `claude /login`, so its
+token chain is fully independent of plain claude's.
 
 ### One real config dir per account
 
 Claude Code namespaces its Keychain credential **per config dir**: the default
-`~/.claude` uses the item `Claude Code-credentials`; a custom `CLAUDE_CONFIG_DIR`
-gets a suffixed item `Claude Code-credentials-<hash>`. cc-pool gives each
-account a real, unique dir (`~/.cc-pool/accounts/acct-NN`) so each gets its own
-Keychain item, its own independent OAuth grant (its own refresh-token chain),
-and runs on its own **subscription** (never API billing). Each account dir is
-also seeded with a copy of your `~/.claude.json` with the identity stripped (the
-account's own login writes its identity), so pooled sessions inherit your
-settings, MCP servers, and per-project tool approvals instead of running
-first-run onboarding.
+`~/.claude` uses the item `Claude Code-credentials`; a custom
+`CLAUDE_CONFIG_DIR` gets a suffixed item `Claude Code-credentials-<hash>`.
+cc-pool gives each account a real, unique dir (`~/.cc-pool/accounts/acct-NN`)
+so each gets its own Keychain item, its own independent OAuth grant (its own
+refresh-token chain), and runs on its own **subscription** — never API
+billing. Each account dir is seeded with a copy of your `~/.claude.json` with
+the identity stripped (the account's own login writes its identity), so pooled
+sessions inherit your settings, MCP servers, and per-project tool approvals
+instead of running first-run onboarding.
 
 ### Shared overlay
 
-Each account dir presents **all of `~/.claude`** — your `projects/`, `skills/`,
-`settings.json`, `history.jsonl`, etc. — with writes passing straight back, so
-every session shares the same workspace. Two providers:
+Each account dir presents **all of `~/.claude`** — `projects/`, `skills/`,
+`plans/`, `settings.json`, `history.jsonl`, the lot — with writes passing
+straight back, so every session shares the same workspace and plan-mode plans
+persist across pooled sessions. Two providers:
 
 - **symlink** (default, zero-dependency): symlinks each top-level entry of
   `~/.claude` into the account dir. New top-level entries are picked up
-  automatically at launch (`ccp select`/`ccp run`), by the daemon, and by
-  `ccp doctor` — no manual step needed.
-- **fuse** (optional, live mirror): an in-process passthrough mirror mounted via
-  [fuse-t](https://github.com/macos-fuse-t/fuse-t) (kext-less, mounted as you,
-  no root). Auto-includes new entries with no re-sync. Requires a
-  `-tags fuse` build and a one-time *Network Volumes* privacy grant.
+  automatically at launch, by the daemon, and by `ccp doctor --fix`.
+- **fuse** (optional, live mirror): an in-process passthrough mirror mounted
+  via [fuse-t](https://github.com/macos-fuse-t/fuse-t) — kext-less, mounted as
+  you, no root. Requires a `-tags fuse` build (cgo) and a one-time *Network
+  Volumes* privacy grant.
 
-A small set of per-account entries are **not** shared — `daemon/` and `ide/`
-(Claude's PID-keyed supervisor and IDE lock/socket files, which would conflict
+A few entries stay per-account instead of shared: `daemon/` and `ide/`
+(Claude's PID-keyed supervisor and IDE lock/socket files, which would collide
 across concurrent sessions), `backups/` (rotating backups of each account's
-`.claude.json`), and `.claude.json` itself (per-account identity). Each account
-gets its own.
+`.claude.json`), the identity and credential files `.claude.json` and
+`.credentials.json`, and `.last-update-result.json` (instance-local
+auto-update state).
 
 ### Scoring
 
-For a healthy account the score is exactly:
+The baseline — exact when windows are far from a reset — is:
 
-```
+```text
 score = 0.70·(100−util_5h) + 0.25·(100−util_7d)
       − 2·active_sessions − 100·rate_limited − 20·stale_or_refresh_failed
 ```
 
-Near limits it gets smarter (each term reduces to the above when not engaged):
-an **imminent reset** is credited (a 90%-used window resetting in 10 min ranks
-*up*, not down); a **low-headroom barrier** stops a nearly-exhausted 7-day window
-from being masked by 5-hour headroom; and a **burn-rate** term downranks an
-account being actively drained. `select` picks argmax. Usage comes from Claude's
-own `/api/oauth/usage` endpoint.
+Three terms keep the ranking honest near the edges: an **imminent reset**
+earns credit in proportion to how soon the window resets (a 90%-used window
+resetting in 10 minutes ranks *up*, not down); a **low-headroom barrier**
+stops a nearly-exhausted 7-day window from being masked by 5-hour headroom;
+and a **burn-rate** term downranks an account being actively drained.
+`select` picks argmax. Usage comes from Claude's own `/api/oauth/usage`
+endpoint.
 
 ### The daemon
 
 `brew services start cc-pool` (Homebrew installs) or `ccp service install`
-(source builds) runs a **user LaunchAgent** (a root daemon couldn't read your
-login Keychain). It polls usage every ~3 min with exponential backoff, refreshes
-**idle** accounts' tokens before they expire (a checked-out session owns its own
-refresh; the daemon re-reads and adopts whatever token it rotated to on
+(source builds) runs a **user LaunchAgent** — a root daemon couldn't read your
+login Keychain. It polls usage every ~3 min with exponential backoff,
+refreshes **idle** accounts' tokens before they expire (a checked-out session
+owns its own refresh; the daemon adopts whatever token it rotated to on
 check-in), caches scores, and — with the fuse overlay — owns the mount
 lifecycle. `ccp add` and `ccp init` start it automatically; if it isn't
-running, `ccp select` auto-spawns it (≤2s) or samples live.
+running, `ccp select` auto-spawns it or samples live.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the
 only secret store.
 
 ## Commands
 
+These two tables cover the full user-facing surface; `ccp help <command>`
+prints the same per command.
+
 | Command | What it does |
 |---|---|
-| `ccp add` | Pool a subscription (interactive `claude /login`; auto-inits the pool and starts the daemon) |
-| `ccp init` | Prepare the pool state dir and start the daemon (optional — `ccp add` does this automatically) |
-| `ccp select` | Print the emptiest account's config dir (stdout only) — the hot path |
-| `ccp run -- <args>` | Select an account and exec `claude`, owning the session lifecycle |
-| `ccp status [-w]` | Live table of usage / score / sessions |
-| `ccp list` | Static account list |
-| `ccp env [--account N]` | Print `export` lines to launch a specific account |
-| `ccp doctor [--fix]` | Re-validate Keychain items and overlays; repair drift |
+| `ccp` | On a terminal — empty pool: guided onboarding; populated pool: status. With flags: shorthand for `ccp run` |
+| `ccp add` | Pool a subscription via its own `claude /login` (auto-inits the pool, starts the daemon) |
+| `ccp run [claude args…]` | Select the emptiest account and exec `claude`, forwarding every arg |
+| `ccp status` | Per-account usage, score, and sessions — TUI on a terminal, plain table when piped |
+| `ccp select` | Print the chosen account's config dir on stdout — the composable hot path |
+| `ccp env` | Print shell `export` lines to launch an account by hand |
+| `ccp list` | Static account list: ids, paths, Keychain items |
+| `ccp doctor` | Check accounts' Keychain items and overlays; repair drift |
 | `ccp remove <id>` | Remove an account from the pool |
+| `ccp init` | Set up the pool and start the daemon (optional — `ccp add` does this) |
 | `ccp service install\|uninstall\|status` | Manage the daemon (delegates to `brew services` on Homebrew installs) |
+
+Flags, by command:
+
+| Command | Flag | Effect |
+|---|---|---|
+| `add` | `--label <name>` | Name for the first account |
+| `add` | `--count <n>` | Add exactly N accounts, no continue prompt |
+| `add` | `--yes`, `-y` | Add one account and log in right away |
+| `add` | `--run-login` | Log in immediately instead of asking how |
+| `add` | `--no-alias` | Don't add a `claude` shell alias |
+| `run` | `CCP_ACCOUNT=<id>` (env) | Force a specific account instead of auto-selecting |
+| `select` | `--wait` | Wait for an account with headroom instead of failing or using an exhausted one |
+| `select` | `--account <id>` | Force a specific account id |
+| `select` | `--no-daemon` | Don't use the daemon; sample usage live |
+| `select` | `--fresh <dur>` | Reuse cached usage newer than this (live mode) |
+| `status` | `--plain` | Print the plain table instead of the interactive TUI |
+| `status` | `--watch`, `-w` | Refresh continuously (plain mode) |
+| `status` | `--live` | Force live sampling even if the daemon is running |
+| `env` | `--account <id>` | Account id (defaults to the best account) |
+| `doctor` | `--fix` | Attempt to repair detected drift |
+| `remove` | `--keep-credential` | Keep the account's Keychain item |
+| `init` | `--no-service` | Don't start the daemon now; `ccp add` starts it |
+| `service uninstall` | `--purge` | Also remove all pool accounts and state; never touches `~/.claude` |
 
 ## Uninstall
 
@@ -166,11 +275,15 @@ brew uninstall cc-pool
 
 `~/.claude` and its credential are never touched.
 
-## Platform
+## Development
 
-macOS only (developed against macOS 26.5, Claude Code 2.1.16x). The default
-build is pure Go; the optional fuse overlay needs cgo + fuse-t.
+Build with `CGO_ENABLED=0 go build ./cmd/cc-pool`; `go test ./...` passes with
+no network, Keychain, or daemon. The manual end-to-end test matrix lives in
+[docs/VERIFICATION.md](docs/VERIFICATION.md), release history in
+[CHANGELOG.md](CHANGELOG.md), and conventions in [AGENTS.md](AGENTS.md).
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) © Yasyf Mohamedali — free for noncommercial use; see [LICENSE](https://github.com/yasyf/cc-pool/blob/main/LICENSE).
+PolyForm-Noncommercial-1.0.0 © Yasyf Mohamedali — free for noncommercial use.
+See [LICENSE](LICENSE) or the [license text
+online](https://polyformproject.org/licenses/noncommercial/1.0.0).
