@@ -19,6 +19,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/oauth"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
@@ -294,6 +295,11 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		for _, sn := range snaps {
 			if sn.Account.ID == *req.Account {
 				s.reserve(sn.Account.ID)
+				if !req.NoMark && req.PID > 0 {
+					if _, err := s.m.Store.OpenSession(sn.Account.ID, req.PID, sn.Account.ConfigDir, req.Cwd, time.Now()); err != nil {
+						s.log.Printf("open session for acct-%02d pid %d: %v", sn.Account.ID, req.PID, err)
+					}
+				}
 				s.recordSticky(req.Cwd, sn.Account.ID)
 				id := sn.Account.ID
 				return Response{OK: true, Dir: sn.Account.ConfigDir, SelectedID: &id,
@@ -303,10 +309,20 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 		return Response{OK: false, Error: fmt.Sprintf("account %d not found", *req.Account)}
 	}
 
+	// Reconcile session rows against reality before consulting the pin: a
+	// claude that just exited must read as warm (bind), not live (hold), and
+	// pollOnce's ~3.5-minute cadence is too coarse for a quick resume.
+	if sessions, err := procscan.Scan(); err == nil {
+		if _, cerr := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), time.Now()); cerr != nil {
+			s.log.Printf("close dead sessions: %v", cerr)
+		}
+	}
+
 	ranked, bySnap := s.rankWithReservations(snaps)
-	r, sticky := s.m.StickyPick(req.Cwd, ranked, time.Now())
+	pin, outcome := s.m.StickyPick(req.Cwd, ranked, time.Now())
+	r := pin
 	fallback := false
-	if !sticky {
+	if outcome != pool.StickyBind {
 		var ok bool
 		r, ok = score.Pick(ranked)
 		if !ok && !req.NoFallback {
@@ -331,16 +347,19 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	if !req.NoMark {
 		s.reserve(best.Account.ID)
 		if req.PID > 0 {
-			if _, err := s.m.Store.OpenSession(best.Account.ID, req.PID, best.Account.ConfigDir); err != nil {
+			if _, err := s.m.Store.OpenSession(best.Account.ID, req.PID, best.Account.ConfigDir, req.Cwd, time.Now()); err != nil {
 				s.log.Printf("open session for acct-%02d pid %d: %v", best.Account.ID, req.PID, err)
 			}
 		}
 	}
-	// Record regardless of NoMark: cache continuity is established by
-	// `ccp run`'s no-mark select too.
-	s.recordSticky(req.Cwd, best.Account.ID)
+	// Record regardless of NoMark (cache continuity is established by no-mark
+	// selects too) — but never over a held pin, unless the free ranking landed
+	// on the pinned account anyway, which is genuine pin activity.
+	if !outcome.Held() || best.Account.ID == pin.AccountID {
+		s.recordSticky(req.Cwd, best.Account.ID)
+	}
 	s.log.Printf("select%s: %s -> acct-%02d (score %.1f · 5h %.0f%% used · 7d %.0f%% used%s)",
-		selectKind(sticky, fallback), req.Cwd, best.Account.ID,
+		selectKind(outcome, fallback), req.Cwd, best.Account.ID,
 		r.Score, best.Util5h, best.Util7d, runnerUp(ranked, r.AccountID, fallback))
 	id := best.Account.ID
 	// Preflight refresh the winner if idle and expiring soon (best-effort).
@@ -355,9 +374,14 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 			s.log.Printf("acct-%02d preflight refresh: %v", best.Account.ID, err)
 		}
 	}()
-	resp := Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id, Sticky: sticky,
+	resp := Response{OK: true, Dir: best.Account.ConfigDir, SelectedID: &id,
+		Sticky:      outcome == pool.StickyBind,
 		Remaining5h: best.Remaining5h, Remaining7d: best.Remaining7d, HasUsage: best.HasUsage,
 		ExhaustedFallback: fallback, ExtraEnabled: best.ExtraEnabled}
+	if outcome == pool.StickyHoldManual {
+		held := pin.AccountID
+		resp.PinHeldAccount = &held
+	}
 	if fallback && !r.ExhaustedUntil.IsZero() {
 		// Tell the client when the fallback pick actually recovers — the latest
 		// reset among its pegged windows, not necessarily the 5h one.
@@ -366,14 +390,18 @@ func (s *Server) handleSelect(ctx context.Context, req Request) Response {
 	return resp
 }
 
-// selectKind renders the select log qualifier: sticky and fallback picks are
-// mutually exclusive (a sticky pin is abandoned before the fallback engages).
-func selectKind(sticky, fallback bool) string {
+// selectKind renders the select log qualifier. A bind and a fallback are
+// mutually exclusive (an unusable pin never binds); a held pin coexists with
+// fallback only when the free ranking itself collapsed to the least-bad pick,
+// and the fallback warning is the more urgent of the two.
+func selectKind(outcome pool.StickyOutcome, fallback bool) string {
 	switch {
-	case sticky:
+	case outcome == pool.StickyBind:
 		return " (sticky)"
 	case fallback:
 		return " (exhausted-fallback)"
+	case outcome.Held():
+		return " (pin-held)"
 	default:
 		return ""
 	}
@@ -414,7 +442,7 @@ func (s *Server) handleCheckin(ctx context.Context, req Request) Response {
 		if se.PID != req.PID {
 			continue
 		}
-		if err := s.m.Store.CloseSession(se.ID); err != nil {
+		if err := s.m.Store.CloseSession(se.ID, time.Now()); err != nil {
 			s.log.Printf("checkin close session %d: %v", se.ID, err)
 		}
 		if a, err := s.m.Store.GetAccount(se.AccountID); err == nil {

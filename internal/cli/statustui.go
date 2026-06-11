@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"time"
 
@@ -39,10 +40,23 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	if !live {
 		ensureDaemon(cmd)
 	}
+	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin controls
 	model := statusTUI{
 		ctx: ctx,
-		gather: func(c context.Context) ([]pool.Snapshot, error) {
-			return gatherStatus(c, m, live)
+		cwd: cwd,
+		gather: func(c context.Context) (statusData, error) {
+			snaps, err := gatherStatus(c, m, live)
+			if err != nil {
+				return statusData{}, err
+			}
+			pin, err := readDirPin(m, cwd)
+			if err != nil {
+				return statusData{}, fmt.Errorf("read pin: %w", err)
+			}
+			return statusData{snaps: snaps, pin: pin}, nil
+		},
+		toggle: func(accountID int) (bool, error) {
+			return m.TogglePin(cwd, accountID, time.Now())
 		},
 	}
 	p := tea.NewProgram(model,
@@ -56,17 +70,31 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 	return nil
 }
 
+// statusData is one gather's worth of TUI state: the account snapshots plus
+// the launch directory's pin.
+type statusData struct {
+	snaps []pool.Snapshot
+	pin   dirPin
+}
+
 // statusTUI is the Bubble Tea model for `ccp status`. It owns a sorted snapshot
 // list, a cursor tracked by account id (so a re-sort on refresh never moves the
-// selection), and a gather closure that re-fetches state off the UI goroutine.
+// selection), a gather closure that re-fetches state off the UI goroutine, and
+// a toggle closure that pins/unpins the launch directory to the cursor's
+// account.
 type statusTUI struct {
 	ctx        context.Context
-	gather     func(context.Context) ([]pool.Snapshot, error)
+	cwd        string // launch directory; "" hides pin controls
+	gather     func(context.Context) (statusData, error)
+	toggle     func(accountID int) (bool, error)
 	snaps      []pool.Snapshot
+	pin        dirPin
 	cursorID   int
 	width      int
 	height     int
 	err        error
+	pinErr     error
+	pinBusy    bool // a toggle is in flight; drop repeat presses
 	lastUpdate time.Time
 	quitting   bool
 }
@@ -74,11 +102,12 @@ type statusTUI struct {
 // Bubble Tea messages.
 type (
 	snapsMsg struct {
-		snaps []pool.Snapshot
-		at    time.Time
+		data statusData
+		at   time.Time
 	}
-	errMsg  struct{ err error }
-	tickMsg time.Time
+	errMsg     struct{ err error }
+	pinDoneMsg struct{ err error }
+	tickMsg    time.Time
 )
 
 func (t statusTUI) Init() tea.Cmd {
@@ -89,11 +118,22 @@ func (t statusTUI) Init() tea.Cmd {
 // blocks key input.
 func (t statusTUI) refreshCmd() tea.Cmd {
 	return func() tea.Msg {
-		snaps, err := t.gather(t.ctx)
+		data, err := t.gather(t.ctx)
 		if err != nil {
 			return errMsg{err}
 		}
-		return snapsMsg{snaps: snaps, at: time.Now()}
+		return snapsMsg{data: data, at: time.Now()}
+	}
+}
+
+// togglePinCmd flips the launch directory's pin against the given account off
+// the UI goroutine. The decision intentionally uses the displayed (≤5s stale)
+// pin state: the action always matches what the user saw, and the post-toggle
+// refresh reconciles the view.
+func (t statusTUI) togglePinCmd(accountID int) tea.Cmd {
+	return func() tea.Msg {
+		_, err := t.toggle(accountID)
+		return pinDoneMsg{err: err}
 	}
 }
 
@@ -119,11 +159,19 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return t, nil
 		case "r":
 			return t, t.refreshCmd()
+		case "p":
+			if t.cwd == "" || len(t.snaps) == 0 || t.pinBusy || t.toggle == nil {
+				return t, nil
+			}
+			t.pinBusy = true
+			t.pinErr = nil
+			return t, t.togglePinCmd(t.current().Account.ID)
 		}
 		return t, nil
 	case snapsMsg:
-		t.snaps = msg.snaps
+		t.snaps = msg.data.snaps
 		sortSnapshots(t.snaps)
+		t.pin = msg.data.pin
 		t.lastUpdate = msg.at
 		t.err = nil
 		t.ensureCursor()
@@ -131,6 +179,13 @@ func (t statusTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		t.err = msg.err
 		return t, nil
+	case pinDoneMsg:
+		t.pinBusy = false
+		t.pinErr = msg.err
+		if msg.err != nil {
+			return t, nil
+		}
+		return t, t.refreshCmd()
 	case tickMsg:
 		return t, tea.Batch(t.refreshCmd(), tickCmd())
 	}
@@ -204,11 +259,29 @@ func (t statusTUI) View() string {
 	}
 	listBox := panelStyle.Width(contentW).Render(t.renderList())
 	detailBox := panelStyle.Width(contentW).Render(t.renderDetail())
-	footer := dimStyle.Render("↑/↓ navigate · r refresh · q quit")
+	help := "↑/↓ navigate · r refresh · q quit"
+	if t.cwd != "" {
+		// The pin binding is only advertised where the key actually works,
+		// and names the effect the press will have on the cursor's account.
+		pinKey := "p pin"
+		if t.pin.ok && t.current().Account.ID == t.pin.view.AccountID {
+			pinKey = "p unpin"
+		}
+		help = "↑/↓ navigate · " + pinKey + " · r refresh · q quit"
+	}
+	footer := dimStyle.Render(help)
+	if t.pinErr != nil {
+		footer = badStyle.Render(fmt.Sprintf("pin failed: %v", t.pinErr)) + "  " + footer
+	}
 	if t.err != nil {
 		footer = warnStyle.Render(fmt.Sprintf("refresh failed: %v", t.err)) + "  " + footer
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, listBox, detailBox, footer) + "\n"
+	parts := []string{listBox, detailBox}
+	if line := renderPinLine(t.pin, t.snaps); line != "" {
+		parts = append(parts, line)
+	}
+	parts = append(parts, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...) + "\n"
 }
 
 // renderList draws the account table. A 3-cell gutter carries two independent
@@ -236,6 +309,9 @@ func (t statusTUI) renderList() string {
 		row := bestMark + curMark + " " + cells
 		if fl := snapshotFlags(s); fl != "" {
 			row += " " + fl
+		}
+		if t.pin.ok && s.Account.ID == t.pin.view.AccountID {
+			row += " " + pinToken(t.pin.view.Manual)
 		}
 		lines = append(lines, row)
 	}
@@ -303,6 +379,13 @@ func (t statusTUI) renderDetail() string {
 		overlay = "symlink"
 	}
 	meta := "overlay " + overlay
+	if t.pin.ok && s.Account.ID == t.pin.view.AccountID {
+		if t.pin.view.Manual {
+			meta += " · pinned to this directory (manual)"
+		} else {
+			meta += " · pinned to this directory (auto)"
+		}
+	}
 	if !t.lastUpdate.IsZero() {
 		meta += " · updated " + t.lastUpdate.Format("15:04:05")
 	}

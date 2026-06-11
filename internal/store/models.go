@@ -36,16 +36,36 @@ type Session struct {
 	AccountID int
 	PID       int
 	ConfigDir string
+	Cwd       string // launch working directory; "" when unattributed (legacy rows, pid-0 selects)
 	StartedAt time.Time
-	EndedAt   *time.Time
+	// LastSeenAt is when a reconcile scan last observed the pid alive; nil
+	// when never observed. Dead rows are closed at this time, not at reap
+	// time, so an observer gap cannot fabricate a recent session end.
+	LastSeenAt *time.Time
+	EndedAt    *time.Time
 }
 
-// Sticky is the last account selected for a working directory, used to keep
-// resumed sessions on the same account for prompt-cache continuity.
+// Sticky is the account pinned to a working directory, used to keep resumed
+// sessions on the same account for prompt-cache continuity.
 type Sticky struct {
-	Cwd        string
-	AccountID  int
+	Cwd       string
+	AccountID int
+	// SelectedAt is the last pin activity: set at creation (manual pin or
+	// first select) and refreshed by every select that records the pin.
 	SelectedAt time.Time
+	// Manual marks a pin created explicitly by the user (status TUI) rather
+	// than by select-path affinity. Manual pins bind without a warm cache and
+	// are never repointed by the select path.
+	Manual bool
+}
+
+// CwdActivity summarizes tracked session activity for one working directory,
+// feeding the sticky binding and expiry rules. It counts only sessions the
+// pool marked (sessions table) — pid-0 selects and externally launched claude
+// processes are invisible here even when procscan can see them.
+type CwdActivity struct {
+	Live      int       // sessions still running in this cwd
+	LastEnded time.Time // most recent ended_at; zero when none ended
 }
 
 // RefreshEntry is one credential-refresh attempt.

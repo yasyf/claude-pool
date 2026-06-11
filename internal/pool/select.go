@@ -30,6 +30,10 @@ type SelectOptions struct {
 	// Cwd is the caller's working directory, keying select stickiness.
 	// Empty disables stickiness.
 	Cwd string
+	// PID marks the launching process as a session checkout when > 0
+	// (`ccp run` execs claude in-place, so its pid IS the claude pid),
+	// feeding the sticky activity rules.
+	PID int
 	// NoFallback returns ErrNoneAvailable instead of a least-bad exhausted
 	// pick. Set by --wait callers, which would discard the pick (and its
 	// sticky rewrite) to keep waiting.
@@ -38,6 +42,11 @@ type SelectOptions struct {
 
 // DefaultFreshFor is the default cache window for live selection.
 const DefaultFreshFor = 60 * time.Second
+
+// scanSessions is the live-session scan used by Select. Var so tests can
+// substitute a canned scan — procscan runs the real `ps`, which would make
+// session-reconciliation tests depend on the machine's process table.
+var scanSessions = procscan.Scan
 
 // SelectResult is a ranked selection outcome.
 type SelectResult struct {
@@ -55,7 +64,12 @@ type SelectResult struct {
 	// ExtraEnabled reports whether the pick has pay-as-you-go overage billing
 	// enabled, for the fallback warning.
 	ExtraEnabled bool
-	byID         map[int]store.Account
+	// PinHeldAccount is the id of a manual pin whose account could not serve
+	// this select (rate-limited, exhausted, or below the sticky headroom
+	// floor); nil otherwise. The pin is kept — callers must surface that an
+	// explicit pin was bypassed when Best differs from it.
+	PinHeldAccount *int
+	byID           map[int]store.Account
 }
 
 // Select scores all accounts and returns the best available one.
@@ -68,13 +82,22 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 		return nil, ErrNoAccounts
 	}
 
-	sessions, _ := procscan.Scan() // best-effort; nil on error
+	sessions, scanErr := scanSessions() // best-effort; nil sessions on error
 
 	if opts.Live {
 		m.sampleStale(ctx, accts, sessions, opts.FreshFor)
 	}
 
 	now := time.Now()
+	if scanErr == nil {
+		// Self-heal session bookkeeping when no daemon is around to reconcile:
+		// rows held by dead pids would otherwise keep their cwd's pin alive
+		// forever. Gated on the scan error, NOT on a nil slice — a successful
+		// scan with zero claude processes is exactly the state where every
+		// tracked row is dead and must be reaped. Best-effort, like every
+		// other piece of select bookkeeping.
+		_, _ = m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), now)
+	}
 	inputs := make([]score.Input, 0, len(accts))
 	byID := make(map[int]store.Account, len(accts))
 	inByID := make(map[int]score.Input, len(accts))
@@ -91,28 +114,41 @@ func (m *Manager) Select(ctx context.Context, opts SelectOptions) (*SelectResult
 	}
 
 	ranked := score.Rank(inputs, now)
-	if r, ok := m.StickyPick(opts.Cwd, ranked, now); ok {
-		// Best-effort: stickiness must never fail a select.
-		_ = m.RecordSticky(opts.Cwd, r.AccountID, now)
-		ri := inByID[r.AccountID]
-		return &SelectResult{Best: byID[r.AccountID], Result: r, Ranked: ranked, Sticky: true, HasUsage: ri.HasUsage, Util5h: ri.Util5h, Util7d: ri.Util7d, byID: byID}, nil
-	}
-	best, ok := score.Pick(ranked)
+	pin, outcome := m.StickyPick(opts.Cwd, ranked, now)
+	best := pin
 	fallback := false
-	if !ok && !opts.NoFallback {
-		// Every account is exhausted (or worse). Launch on the least-bad
-		// exhausted one rather than refusing — the caller warns loudly.
-		best, ok = score.PickFallback(ranked)
-		fallback = true
+	if outcome != StickyBind {
+		var ok bool
+		best, ok = score.Pick(ranked)
+		if !ok && !opts.NoFallback {
+			// Every account is exhausted (or worse). Launch on the least-bad
+			// exhausted one rather than refusing — the caller warns loudly.
+			best, ok = score.PickFallback(ranked)
+			fallback = true
+		}
+		if !ok {
+			return &SelectResult{Ranked: ranked, byID: byID}, ErrNoneAvailable
+		}
 	}
-	if !ok {
-		return &SelectResult{Ranked: ranked, byID: byID}, ErrNoneAvailable
+	// A held pin stays untouched — unless the free ranking landed on the
+	// pinned account anyway, in which case the select is genuine pin activity.
+	// Best-effort: stickiness must never fail a select.
+	if !outcome.Held() || best.AccountID == pin.AccountID {
+		_ = m.RecordSticky(opts.Cwd, best.AccountID, now)
 	}
-	_ = m.RecordSticky(opts.Cwd, best.AccountID, now) // best-effort, as above
+	if opts.PID > 0 {
+		// Best-effort, as above: a session row feeds the activity rules.
+		_, _ = m.Store.OpenSession(best.AccountID, opts.PID, byID[best.AccountID].ConfigDir, opts.Cwd, now)
+	}
 	bi := inByID[best.AccountID]
-	return &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked,
-		HasUsage: bi.HasUsage, Util5h: bi.Util5h, Util7d: bi.Util7d,
-		ExhaustedFallback: fallback, ExtraEnabled: extraByID[best.AccountID], byID: byID}, nil
+	res := &SelectResult{Best: byID[best.AccountID], Result: best, Ranked: ranked,
+		Sticky: outcome == StickyBind, HasUsage: bi.HasUsage, Util5h: bi.Util5h, Util7d: bi.Util7d,
+		ExhaustedFallback: fallback, ExtraEnabled: extraByID[best.AccountID], byID: byID}
+	if outcome == StickyHoldManual {
+		held := pin.AccountID
+		res.PinHeldAccount = &held
+	}
+	return res, nil
 }
 
 // sampleStale concurrently refreshes usage for accounts whose latest sample is

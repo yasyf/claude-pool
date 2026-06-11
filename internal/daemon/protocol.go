@@ -79,6 +79,11 @@ type Response struct {
 	ExhaustedFallback bool `json:"exhausted_fallback,omitempty"`
 	// ExtraEnabled: the pick has overage billing enabled (fallback warning).
 	ExtraEnabled bool `json:"extra_enabled,omitempty"`
+	// PinHeldAccount: the cwd has a manual pin to this account, but it could
+	// not serve (rate-limited, exhausted, or below the sticky headroom floor).
+	// The pin was kept; the client must surface the bypass when the pick
+	// differs from it.
+	PinHeldAccount *int `json:"pin_held_account,omitempty"`
 	// NoneAvailable: select found no servable account (all rate-limited or the
 	// pool is empty) — a structured signal so clients don't match error strings.
 	NoneAvailable bool            `json:"none_available,omitempty"`

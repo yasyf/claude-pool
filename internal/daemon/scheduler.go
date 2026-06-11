@@ -62,7 +62,7 @@ func (s *Server) pollOnce(ctx context.Context) {
 	if err != nil {
 		s.log.Printf("procscan: %v", err)
 	} else {
-		switch n, err := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions)); {
+		switch n, err := s.m.Store.CloseDeadSessions(procscan.AlivePIDs(sessions), time.Now()); {
 		case err != nil:
 			s.log.Printf("close dead sessions: %v", err)
 		case n > 0:
@@ -70,8 +70,10 @@ func (s *Server) pollOnce(ctx context.Context) {
 		}
 	}
 
-	// Row hygiene only: StickyPick checks freshness on read, which also covers
-	// the daemonless path where no pruner runs.
+	// Row hygiene only: StickyPick checks the activity rule on read, which also
+	// covers the daemonless path where no pruner runs. The prune itself is
+	// activity-based — a pin with a live tracked session survives, and an idle
+	// one dies a TTL after its last select or session end (see PruneSticky).
 	if _, err := s.m.Store.PruneSticky(time.Now().Add(-pool.StickyTTL)); err != nil {
 		s.log.Printf("prune sticky: %v", err)
 	}

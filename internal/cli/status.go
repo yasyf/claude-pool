@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/version"
 )
 
@@ -45,12 +47,18 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	if isTTY() && !plain {
 		return runStatusTUI(cmd, m, live)
 	}
+	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin state
 	render := func() error {
 		snaps, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
 			return err
 		}
-		out := renderTable(snaps)
+		// Unlike the TUI's keep-last-view loop, the one-shot path fails fast.
+		pin, err := readDirPin(m, cwd)
+		if err != nil {
+			return err
+		}
+		out := renderTable(snaps, pin)
 		if watch {
 			fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
 		}
@@ -81,6 +89,83 @@ func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.
 		}
 	}
 	return m.Snapshots(ctx, true, pool.DefaultFreshFor)
+}
+
+// dirPin is the launch directory's pin as render input (ok=false: no pin).
+type dirPin struct {
+	cwd  string
+	view pool.PinView
+	ok   bool
+}
+
+// readDirPin reads cwd's pin straight from the store — a single-row local read
+// that needs neither the daemon's status cache nor a wire change.
+func readDirPin(m *pool.Manager, cwd string) (dirPin, error) {
+	if cwd == "" {
+		return dirPin{}, nil
+	}
+	view, ok, err := m.PinView(cwd, time.Now())
+	if err != nil {
+		return dirPin{}, err
+	}
+	return dirPin{cwd: cwd, view: view, ok: ok}, nil
+}
+
+// pinToken is the row badge on the pinned account's line.
+func pinToken(manual bool) string {
+	if manual {
+		return pinStyle.Render("pinned")
+	}
+	return pinStyle.Render("pinned (auto)")
+}
+
+// renderPinLine renders the launch directory's pin summary ("" when none):
+// who it is pinned to, manual vs auto, and what the pin is doing — counting
+// down to expiry, held open by live sessions, or waiting for one to end.
+// Shared by the TUI and the plain table.
+func renderPinLine(pin dirPin, snaps []pool.Snapshot) string {
+	if !pin.ok {
+		return ""
+	}
+	name := fmt.Sprintf("acct-%02d", pin.view.AccountID)
+	unusable := false
+	for _, s := range snaps {
+		if s.Account.ID != pin.view.AccountID {
+			continue
+		}
+		name = accountName(s.Account.Label)
+		// Mirrors score.UsableForSticky off the snapshot's own breakdown.
+		unusable = s.RateLimited || s.Exhausted ||
+			(s.HasUsage && s.Components.RawRemaining5h < score.StickyMinRemaining5h)
+		break
+	}
+	kind := "auto"
+	if pin.view.Manual {
+		kind = "manual"
+	}
+	var state string
+	switch {
+	case unusable:
+		// Never promise a bind the selector would hold or abandon.
+		state = "account can't serve — selects rank freely"
+	case pin.view.Live && pin.view.Binding:
+		state = "while sessions live"
+	case pin.view.Live:
+		state = "waiting for session end"
+	default:
+		state = "until " + humanizeReset(pin.view.ExpiresAt)
+	}
+	return pinStyle.Render("pinned "+name) +
+		dimStyle.Render(" · "+kind+" · "+state+" · "+abbreviateHome(pin.cwd))
+}
+
+// abbreviateHome renders path with the user's home directory shortened to ~.
+func abbreviateHome(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || !strings.HasPrefix(path, home) {
+		return path
+	}
+	return "~" + strings.TrimPrefix(path, home)
 }
 
 // daemonStatusUsable reports whether a status response can be rendered directly.
@@ -148,8 +233,9 @@ func sortSnapshots(snaps []pool.Snapshot) {
 	})
 }
 
-// renderTable produces a styled fixed-width table, best account highlighted.
-func renderTable(snaps []pool.Snapshot) string {
+// renderTable produces a styled fixed-width table, best account highlighted,
+// with the launch directory's pin badged on its account and summarized below.
+func renderTable(snaps []pool.Snapshot, pin dirPin) string {
 	if len(snaps) == 0 {
 		return "No accounts yet. Run `ccp add` to add one.\n"
 	}
@@ -172,6 +258,9 @@ func renderTable(snaps []pool.Snapshot) string {
 		if flags := snapshotFlags(s); flags != "" {
 			row += " " + flags
 		}
+		if pin.ok && s.Account.ID == pin.view.AccountID {
+			row += " " + pinToken(pin.view.Manual)
+		}
 		if i == 0 {
 			row = bestStyle.Render("▸ ") + row
 		} else {
@@ -182,6 +271,10 @@ func renderTable(snaps []pool.Snapshot) string {
 	}
 	b.WriteString(dimStyle.Render("▸ = next pick · score higher = emptier · 5h/7d = % used"))
 	b.WriteByte('\n')
+	if line := renderPinLine(pin, snaps); line != "" {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
 	b.WriteString(dimStyle.Render(fmt.Sprintf("updated %s", time.Now().Format(clockLayout))))
 	return b.String()
 }

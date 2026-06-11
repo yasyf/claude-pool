@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,6 +15,59 @@ func openTest(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// TestMigrationAddsColumns opens a database created with the pre-cwd/manual
+// schema and asserts Open migrates it: both columns exist, legacy rows read
+// with the zero-value semantics the activity rules rely on, and a second Open
+// is a no-op.
+func TestMigrationAddsColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Second)
+	for _, stmt := range []string{
+		`CREATE TABLE sessions (
+		   id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL,
+		   pid INTEGER, config_dir TEXT, started_at INTEGER NOT NULL, ended_at INTEGER)`,
+		`CREATE TABLE sticky (
+		   cwd TEXT PRIMARY KEY, account_id INTEGER NOT NULL, selected_at INTEGER NOT NULL)`,
+	} {
+		if _, err := old.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := old.Exec(`INSERT INTO sessions(account_id,pid,config_dir,started_at) VALUES(1,42,'b',?)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`INSERT INTO sticky(cwd,account_id,selected_at) VALUES('/proj',1,?)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ { // second pass proves idempotence
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		st, ok, err := s.GetSticky("/proj")
+		if err != nil || !ok || st.AccountID != 1 || st.Manual {
+			t.Fatalf("open %d: legacy sticky = %+v ok=%v err=%v", i, st, ok, err)
+		}
+		live, err := s.ListActiveSessions()
+		if err != nil || len(live) != 1 || live[0].Cwd != "" {
+			t.Fatalf("open %d: legacy sessions = %+v err=%v", i, live, err)
+		}
+		// A legacy (cwd='') session row neither matches nor protects any pin.
+		if act, err := s.GetCwdActivity("/proj", 1); err != nil || act.Live != 0 {
+			t.Fatalf("open %d: legacy row leaked into activity: %+v err=%v", i, act, err)
+		}
+		s.Close()
+	}
 }
 
 func TestAccountCRUD(t *testing.T) {
@@ -124,22 +178,141 @@ func TestUsageSampleExtraUsageRoundTrip(t *testing.T) {
 
 func TestSessionsReconcile(t *testing.T) {
 	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	started := now.Add(-2 * SessionReapGrace) // old enough to reap
 	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
-	id1, _ := s.OpenSession(1, 111, "b")
-	s.OpenSession(1, 222, "b")
-	if n, _ := s.ActiveSessionCount(1); n != 2 {
-		t.Fatalf("active = %d, want 2", n)
+	id1, _ := s.OpenSession(1, 111, "b", "/proj", started)
+	s.OpenSession(1, 222, "b", "/proj", started)
+	s.OpenSession(1, 333, "b", "/proj", now) // fresh: inside the reap grace
+	if n, _ := s.ActiveSessionCount(1); n != 3 {
+		t.Fatalf("active = %d, want 3", n)
 	}
-	// Only 222 is alive -> 111 closed.
-	closed, err := s.CloseDeadSessions(map[int]bool{222: true})
+	live, err := s.ListActiveSessions()
+	if err != nil || len(live) != 3 || live[0].Cwd != "/proj" {
+		t.Fatalf("active sessions = %+v err=%v", live, err)
+	}
+	// Only 222 is alive -> 111 closed; 333 is dead but too young to reap.
+	closed, err := s.CloseDeadSessions(map[int]bool{222: true}, now)
 	if err != nil || closed != 1 {
 		t.Fatalf("closed = %d err=%v", closed, err)
 	}
-	if n, _ := s.ActiveSessionCount(1); n != 1 {
-		t.Fatalf("active after reconcile = %d, want 1", n)
+	if n, _ := s.ActiveSessionCount(1); n != 2 {
+		t.Fatalf("active after reconcile = %d, want 2", n)
 	}
-	if err := s.CloseSession(id1); err != nil {
+	// The alive row was stamped last-seen; the never-observed dead row was
+	// closed at its start (no liveness was ever witnessed), not at reap time.
+	for _, se := range mustActive(t, s) {
+		if se.PID == 222 && (se.LastSeenAt == nil || !se.LastSeenAt.Equal(now)) {
+			t.Fatalf("alive row not stamped last-seen: %+v", se)
+		}
+	}
+	if act, _ := s.GetCwdActivity("/proj", 1); !act.LastEnded.Equal(started) {
+		t.Fatalf("reaped row must end at its start, got %v want %v", act.LastEnded, started)
+	}
+	if err := s.CloseSession(id1, now); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func mustActive(t *testing.T, s *Store) []Session {
+	t.Helper()
+	live, err := s.ListActiveSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return live
+}
+
+// TestCloseDeadSessionsEndsAtLastSeen pins the honest-end rule: a row whose
+// pid was observed alive by an earlier reconcile is closed at that
+// observation, never at reap time — a long observer gap must not fabricate a
+// warm cache.
+func TestCloseDeadSessionsEndsAtLastSeen(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+	s.OpenSession(1, 555, "b", "/proj", now.Add(-5*time.Hour))
+
+	// A reconcile 4h ago saw the pid alive; the process then died unobserved.
+	if _, err := s.CloseDeadSessions(map[int]bool{555: true}, now.Add(-4*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := s.CloseDeadSessions(map[int]bool{}, now)
+	if err != nil || closed != 1 {
+		t.Fatalf("closed = %d err=%v", closed, err)
+	}
+	act, err := s.GetCwdActivity("/proj", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !act.LastEnded.Equal(now.Add(-4 * time.Hour)) {
+		t.Fatalf("end = %v, want the last-seen time %v (not reap time %v)",
+			act.LastEnded, now.Add(-4*time.Hour), now)
+	}
+}
+
+func TestGetCwdActivity(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+
+	act, err := s.GetCwdActivity("/proj", 1)
+	if err != nil || act.Live != 0 || !act.LastEnded.IsZero() {
+		t.Fatalf("empty table: %+v err=%v", act, err)
+	}
+
+	// One live, two ended (the later end must win), one unattributed legacy
+	// row, and one row on a DIFFERENT account in the same directory.
+	s.OpenSession(1, 100, "b", "/proj", now.Add(-3*time.Hour))
+	early, _ := s.OpenSession(1, 200, "b", "/proj", now.Add(-2*time.Hour))
+	late, _ := s.OpenSession(1, 300, "b", "/proj", now.Add(-90*time.Minute))
+	s.CloseSession(early, now.Add(-time.Hour))
+	s.CloseSession(late, now.Add(-10*time.Minute))
+	s.OpenSession(1, 400, "b", "", now)
+	other, _ := s.OpenSession(2, 500, "c", "/proj", now.Add(-time.Hour))
+	s.CloseSession(other, now.Add(-time.Minute))
+
+	act, err = s.GetCwdActivity("/proj", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if act.Live != 1 {
+		t.Fatalf("live = %d, want 1", act.Live)
+	}
+	// Account 2's fresher end (1m ago) must not leak into account 1's view.
+	if !act.LastEnded.Equal(now.Add(-10 * time.Minute)) {
+		t.Fatalf("lastEnded = %v, want %v", act.LastEnded, now.Add(-10*time.Minute))
+	}
+
+	// The empty-cwd legacy row is invisible to any real directory, and a
+	// different directory sees nothing.
+	if act, _ := s.GetCwdActivity("/other", 1); act.Live != 0 || !act.LastEnded.IsZero() {
+		t.Fatalf("unrelated cwd sees activity: %+v", act)
+	}
+}
+
+// TestDeleteStickyVersion: the version-guarded delete removes only the exact
+// row version it was given — a refreshed or repinned row survives.
+func TestDeleteStickyVersion(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+
+	s.UpsertSticky("/proj", 1, now.Add(-2*time.Hour))
+	// Concurrent writer repins before the stale delete lands.
+	s.PinManual("/proj", 2, now)
+	if err := s.DeleteStickyVersion("/proj", now.Add(-2*time.Hour), false); err != nil {
+		t.Fatal(err)
+	}
+	if st, ok, _ := s.GetSticky("/proj"); !ok || st.AccountID != 2 || !st.Manual {
+		t.Fatalf("newer manual pin must survive a stale-versioned delete: %+v ok=%v", st, ok)
+	}
+
+	// The matching version is deleted.
+	if err := s.DeleteStickyVersion("/proj", now, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetSticky("/proj"); ok {
+		t.Fatal("matching version must be deleted")
 	}
 }
 
@@ -170,25 +343,114 @@ func TestSticky(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _, _ = s.GetSticky("/proj")
-	if got.AccountID != 2 || !got.SelectedAt.Equal(t1) {
+	if got.AccountID != 2 || !got.SelectedAt.Equal(t1) || got.Manual {
 		t.Fatalf("upsert did not overwrite: %+v", got)
+	}
+}
+
+func TestUpsertStickyNeverRepointsManualPin(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	if err := s.PinManual("/proj", 1, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// A select that landed elsewhere must not touch the manual pin.
+	if err := s.UpsertSticky("/proj", 2, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, _ := s.GetSticky("/proj")
+	if !ok || got.AccountID != 1 || !got.Manual || !got.SelectedAt.Equal(now) {
+		t.Fatalf("manual pin repointed: %+v", got)
+	}
+
+	// A select that landed on the pinned account refreshes it, keeping manual.
+	t2 := now.Add(2 * time.Minute)
+	if err := s.UpsertSticky("/proj", 1, t2); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ = s.GetSticky("/proj")
+	if got.AccountID != 1 || !got.Manual || !got.SelectedAt.Equal(t2) {
+		t.Fatalf("manual pin not refreshed: %+v", got)
+	}
+}
+
+func TestPinManualAndDeleteSticky(t *testing.T) {
+	s := openTest(t)
+	now := time.Now().Truncate(time.Second)
+
+	// PinManual overrides an existing auto pin.
+	s.UpsertSticky("/proj", 1, now.Add(-time.Minute))
+	if err := s.PinManual("/proj", 2, now); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, _ := s.GetSticky("/proj")
+	if !ok || got.AccountID != 2 || !got.Manual || !got.SelectedAt.Equal(now) {
+		t.Fatalf("manual pin: %+v", got)
+	}
+
+	// PinManual also overrides another manual pin (re-pin to a new account).
+	if err := s.PinManual("/proj", 1, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := s.GetSticky("/proj"); got.AccountID != 1 || !got.Manual {
+		t.Fatalf("re-pin: %+v", got)
+	}
+
+	if err := s.DeleteSticky("/proj"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetSticky("/proj"); ok {
+		t.Fatal("pin should be deleted")
+	}
+	// Idempotent on a missing row.
+	if err := s.DeleteSticky("/proj"); err != nil {
+		t.Fatalf("second delete: %v", err)
 	}
 }
 
 func TestPruneSticky(t *testing.T) {
 	s := openTest(t)
 	now := time.Now().Truncate(time.Second)
+	cutoff := now.Add(-time.Hour)
+	s.UpsertAccount(Account{ID: 1, ConfigDir: "b", KeychainService: "s", KeychainAccount: "u"})
+
+	// /old: selected long ago, no sessions -> pruned (today's rule preserved).
 	s.UpsertSticky("/old", 1, now.Add(-2*time.Hour))
+	// /fresh: recent select -> survives.
 	s.UpsertSticky("/fresh", 1, now)
-	n, err := s.PruneSticky(now.Add(-time.Hour))
-	if err != nil || n != 1 {
-		t.Fatalf("prune: n=%d err=%v", n, err)
+	// /live: stale select but a live tracked session holds it.
+	s.UpsertSticky("/live", 1, now.Add(-3*time.Hour))
+	s.OpenSession(1, 100, "b", "/live", now.Add(-3*time.Hour))
+	// /warm: stale select, last session ended within the TTL.
+	s.UpsertSticky("/warm", 1, now.Add(-3*time.Hour))
+	warm, _ := s.OpenSession(1, 200, "b", "/warm", now.Add(-3*time.Hour))
+	s.CloseSession(warm, now.Add(-30*time.Minute))
+	// /cold: stale select, last session ended before the cutoff.
+	s.UpsertSticky("/cold", 1, now.Add(-3*time.Hour))
+	cold, _ := s.OpenSession(1, 300, "b", "/cold", now.Add(-3*time.Hour))
+	s.CloseSession(cold, now.Add(-2*time.Hour))
+	// /manual-new: never-used manual pin inside its 1h minimum.
+	s.PinManual("/manual-new", 1, now.Add(-30*time.Minute))
+	// /manual-old: never-used manual pin past its 1h minimum.
+	s.PinManual("/manual-old", 1, now.Add(-2*time.Hour))
+
+	n, err := s.PruneSticky(cutoff)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok, _ := s.GetSticky("/old"); ok {
-		t.Fatal("old row should be pruned")
+	if n != 3 {
+		t.Fatalf("pruned %d rows, want 3 (/old, /cold, /manual-old)", n)
 	}
-	if _, ok, _ := s.GetSticky("/fresh"); !ok {
-		t.Fatal("fresh row should survive")
+	for _, cwd := range []string{"/fresh", "/live", "/warm", "/manual-new"} {
+		if _, ok, _ := s.GetSticky(cwd); !ok {
+			t.Errorf("%s should survive", cwd)
+		}
+	}
+	for _, cwd := range []string{"/old", "/cold", "/manual-old"} {
+		if _, ok, _ := s.GetSticky(cwd); ok {
+			t.Errorf("%s should be pruned", cwd)
+		}
 	}
 }
 

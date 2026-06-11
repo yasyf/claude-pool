@@ -70,6 +70,11 @@ type selectReq struct {
 	fresh    time.Duration // live-mode cache window (--fresh)
 	noDaemon bool          // skip the daemon, sample live (--no-daemon)
 	cwd      string        // keys select stickiness; empty disables it
+	// pid marks the pick with a session checkout. `ccp run` passes its own
+	// pid — exec replaces it with claude in place, so the row tracks the real
+	// session and feeds the sticky activity rules. `ccp select` leaves it 0:
+	// the process printing the dir exits before claude starts.
+	pid int
 }
 
 // resolveSelection runs the full account-selection pipeline shared by `ccp run`
@@ -89,6 +94,11 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 			return "", "", err
 		}
 		_ = m.RecordSticky(req.cwd, a.ID, time.Now()) // anchor future selects here
+		if req.pid > 0 {
+			// Best-effort bookkeeping, like RecordSticky: the session row feeds
+			// the sticky activity rules.
+			_, _ = m.Store.OpenSession(a.ID, req.pid, a.ConfigDir, req.cwd, time.Now())
+		}
 		dir, err := prepareAccount(cmd, m, a)
 		// Forced pick: no scoring, so no usage to report (hasUsage=false → bare name).
 		return dir, selectionLine(accountName(a.Label), false, false, 0, 0), err
@@ -101,16 +111,19 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 	if !req.noDaemon {
 		cl := daemon.NewClient()
 		if cl.EnsureRunning(2*time.Second) && daemonAt(version.String()) {
-			// pid 0, no session row: ccp exits before claude starts, so procscan
-			// attributes the live process. We still reserve (anti-thundering-herd).
-			// --wait refuses exhausted fallback picks (it would discard them, and
-			// the daemon must not commit their sticky/reservation side effects).
-			if resp, ok := cl.Select(nil, 0, false, req.cwd, req.wait); ok {
+			// req.pid is `ccp run`'s own pid (the future claude pid, see
+			// selectReq) or 0 for `ccp select`, whose pid-0 picks lean on
+			// procscan to attribute the live process. We still reserve
+			// (anti-thundering-herd). --wait refuses exhausted fallback picks
+			// (it would discard them, and the daemon must not commit their
+			// sticky/reservation side effects).
+			if resp, ok := cl.Select(nil, req.pid, false, req.cwd, req.wait); ok {
 				switch daemonSelectOutcome(resp, req.wait) {
 				case outcomePicked:
 					if resp.ExhaustedFallback {
 						warnExhaustedFallback(cmd, daemonAccountName(m, resp.SelectedID), resp.ExtraEnabled, derefTime(resp.SoonestReset))
 					}
+					warnPinHeld(cmd, m, resp.PinHeldAccount, resp.SelectedID)
 					return resp.Dir, daemonSelectionLine(m, resp), nil
 				case outcomeError:
 					return "", "", errors.New(resp.Error)
@@ -127,8 +140,8 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 	}
 
 	// Live path (no daemon, or waiting): sample + score synchronously. Select
-	// records stickiness itself.
-	opts := pool.SelectOptions{Live: true, FreshFor: req.fresh, Cwd: req.cwd, NoFallback: req.wait}
+	// records stickiness (and the session row) itself.
+	opts := pool.SelectOptions{Live: true, FreshFor: req.fresh, Cwd: req.cwd, PID: req.pid, NoFallback: req.wait}
 	for {
 		sr, err := m.Select(cmd.Context(), opts)
 		if errors.Is(err, pool.ErrNoneAvailable) {
@@ -157,9 +170,22 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 		if sr.ExhaustedFallback {
 			warnExhaustedFallback(cmd, accountName(sr.Best.Label), sr.ExtraEnabled, sr.Result.ExhaustedUntil)
 		}
+		warnPinHeld(cmd, m, sr.PinHeldAccount, &sr.Best.ID)
 		dir, err := prepareAccount(cmd, m, sr.Best)
 		return dir, liveSelectionLine(sr), err
 	}
+}
+
+// warnPinHeld prints the bypass notice for a held manual pin: the user
+// explicitly pinned this directory, so silently launching elsewhere would
+// violate their expectation. No notice when the free ranking landed on the
+// pinned account anyway — the pin was honored in effect.
+func warnPinHeld(cmd *cobra.Command, m *pool.Manager, held, selected *int) {
+	if held == nil || (selected != nil && *selected == *held) {
+		return
+	}
+	warn(cmd.ErrOrStderr(), "manual pin to %s is rate-limited or out of headroom — using %s; pin kept",
+		daemonAccountName(m, held), daemonAccountName(m, selected))
 }
 
 // selectOutcome classifies a daemon select reply for resolveSelection.

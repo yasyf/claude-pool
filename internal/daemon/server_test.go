@@ -142,6 +142,184 @@ func TestHandleSelectSkipsExhaustedStickyPin(t *testing.T) {
 	}
 }
 
+// TestHandleSelectMarksSessionWithCwd: a select carrying a pid opens a session
+// row attributed to the caller's cwd, feeding the sticky activity rules.
+func TestHandleSelectMarksSessionWithCwd(t *testing.T) {
+	s, _ := newTestServer(t)
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, Cwd: "/proj"})
+	if !resp.OK || resp.SelectedID == nil {
+		t.Fatalf("select failed: %+v", resp)
+	}
+	live, err := s.m.Store.ListActiveSessions()
+	if err != nil || len(live) != 1 {
+		t.Fatalf("sessions = %+v err=%v", live, err)
+	}
+	if live[0].PID != 4242 || live[0].Cwd != "/proj" || live[0].AccountID != *resp.SelectedID {
+		t.Fatalf("session row = %+v, want pid 4242 cwd /proj acct %d", live[0], *resp.SelectedID)
+	}
+
+	// Negative: NoMark must not open a row.
+	s2, _ := newTestServer(t)
+	if resp := s2.handleSelect(t.Context(), Request{Op: OpSelect, PID: 4242, NoMark: true, Cwd: "/proj"}); !resp.OK {
+		t.Fatalf("select failed: %+v", resp)
+	}
+	if live, _ := s2.m.Store.ListActiveSessions(); len(live) != 0 {
+		t.Fatalf("NoMark must not mark: %+v", live)
+	}
+}
+
+// TestHandleSelectBindsWarmEndedSession is the headline activity-rule fix: a
+// session that outlived the old selected_at TTL ended minutes ago, so the pin
+// must still bind — the warm cache is exactly what stickiness protects.
+func TestHandleSelectBindsWarmEndedSession(t *testing.T) {
+	s, dirs := newTestServer(t)
+	now := time.Now()
+	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.m.Store.OpenSession(2, 0, dirs[2], "/proj", now.Add(-3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.Store.CloseSession(id, now.Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
+		t.Fatalf("expected sticky acct-2 (%s) via warm ended session, got %+v", dirs[2], resp)
+	}
+}
+
+// TestHandleSelectHoldsLiveOnlyPin: when the pinned dir's only session is
+// still live, a new session cannot resume it — rank freely, but never repoint
+// the pin (it binds for a TTL once the session ends).
+func TestHandleSelectHoldsLiveOnlyPin(t *testing.T) {
+	s, dirs := newTestServer(t)
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+	now := time.Now()
+	if err := s.m.Store.UpsertSticky("/proj", 2, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.Store.OpenSession(2, 0, dirs[2], "/proj", now.Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
+		t.Fatalf("expected free non-sticky acct-1 (%s), got %+v", dirs[1], resp)
+	}
+	if resp.PinHeldAccount != nil {
+		t.Fatalf("an auto hold must not flag a held manual pin: %+v", resp.PinHeldAccount)
+	}
+	st, ok, _ := s.m.Store.GetSticky("/proj")
+	if !ok || st.AccountID != 2 {
+		t.Fatalf("held pin was repointed: %+v ok=%v", st, ok)
+	}
+	// Drain the preflight goroutine before reading the shared log buffer.
+	s.wg.Wait()
+	if !strings.Contains(buf.String(), "select (pin-held): /proj -> acct-01") {
+		t.Fatalf("held pin not logged: %q", buf.String())
+	}
+}
+
+// TestHandleSelectQuickResumeBindsAfterReap: a session whose claude just died
+// must not hold the pin until the next ~3.5-minute poll — handleSelect
+// reconciles before deciding, so the dead row reads as a warm end and the pin
+// binds.
+func TestHandleSelectQuickResumeBindsAfterReap(t *testing.T) {
+	s, dirs := newTestServer(t)
+	now := time.Now()
+	if err := s.m.Store.UpsertSticky("/proj", 2, now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// pid 4000000 can never belong to a live claude (macOS pids are 5-digit),
+	// so handleSelect's procscan-backed sweep reaps the row. A reconcile saw
+	// it alive 10 minutes ago, so the reap stamps a warm end.
+	if _, err := s.m.Store.OpenSession(2, 4000000, dirs[2], "/proj", now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.Store.CloseDeadSessions(map[int]bool{4000000: true}, now.Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	if !resp.OK || resp.Dir != dirs[2] || !resp.Sticky {
+		t.Fatalf("quick resume must bind the pin via the reaped warm end, got %+v", resp)
+	}
+}
+
+// TestHandleSelectForcedMarksSession: a forced select carrying a pid marks the
+// checkout like a ranked one, so forced sessions feed the activity rules.
+func TestHandleSelectForcedMarksSession(t *testing.T) {
+	s, _ := newTestServer(t)
+	forced := 2
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, Cwd: "/proj"})
+	if !resp.OK {
+		t.Fatalf("forced select failed: %+v", resp)
+	}
+	live, err := s.m.Store.ListActiveSessions()
+	if err != nil || len(live) != 1 {
+		t.Fatalf("sessions = %+v err=%v", live, err)
+	}
+	if live[0].PID != 4242 || live[0].Cwd != "/proj" || live[0].AccountID != 2 {
+		t.Fatalf("session row = %+v, want pid 4242 cwd /proj acct 2", live[0])
+	}
+
+	// Negative: NoMark suppresses the row on the forced path too.
+	s2, _ := newTestServer(t)
+	if resp := s2.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, PID: 4242, NoMark: true, Cwd: "/proj"}); !resp.OK {
+		t.Fatalf("forced select failed: %+v", resp)
+	}
+	if live, _ := s2.m.Store.ListActiveSessions(); len(live) != 0 {
+		t.Fatalf("forced NoMark must not mark: %+v", live)
+	}
+}
+
+// TestHandleSelectHoldsUnusableManualPin: a manual pin to an account that
+// cannot serve is bypassed loudly (PinHeldAccount) but never repointed.
+func TestHandleSelectHoldsUnusableManualPin(t *testing.T) {
+	s, dirs := newTestServer(t)
+	now := time.Now().Add(time.Minute) // newer than the harness samples
+	if err := s.m.Store.PinManual("/proj", 2, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.Store.InsertUsageSample(store.UsageSample{
+		AccountID: 2, TS: now, Util5h: 100, Util7d: 21,
+		Resets5h: now.Add(21 * time.Minute), Resets7d: now.Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"})
+	if !resp.OK || resp.Dir != dirs[1] || resp.Sticky {
+		t.Fatalf("expected free acct-1 (%s) over the exhausted manual pin, got %+v", dirs[1], resp)
+	}
+	if resp.PinHeldAccount == nil || *resp.PinHeldAccount != 2 {
+		t.Fatalf("held manual pin must be surfaced, got %+v", resp.PinHeldAccount)
+	}
+	st, ok, _ := s.m.Store.GetSticky("/proj")
+	if !ok || st.AccountID != 2 || !st.Manual {
+		t.Fatalf("manual pin lost on hold: %+v ok=%v", st, ok)
+	}
+}
+
+// TestHandleSelectForcedKeepsManualPin: a one-shot forced select must not
+// silently destroy an explicit manual pin to a different account.
+func TestHandleSelectForcedKeepsManualPin(t *testing.T) {
+	s, dirs := newTestServer(t)
+	now := time.Now()
+	if err := s.m.Store.PinManual("/proj", 1, now); err != nil {
+		t.Fatal(err)
+	}
+	forced := 2
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, Account: &forced, NoMark: true, Cwd: "/proj"})
+	if !resp.OK || resp.Dir != dirs[2] {
+		t.Fatalf("forced select failed: %+v", resp)
+	}
+	st, ok, _ := s.m.Store.GetSticky("/proj")
+	if !ok || st.AccountID != 1 || !st.Manual {
+		t.Fatalf("forced select repointed the manual pin: %+v ok=%v", st, ok)
+	}
+}
+
 // TestHandleSelectExhaustedFallback: with every account exhausted, select must
 // return the least-bad one flagged ExhaustedFallback (never an error), carrying
 // the pick's extra-usage flag and recovery time for the client warning, and the
@@ -170,6 +348,8 @@ func TestHandleSelectExhaustedFallback(t *testing.T) {
 	if resp.SoonestReset == nil || !resp.SoonestReset.Equal(reset.Truncate(time.Second)) {
 		t.Fatalf("fallback must carry the pick's recovery time %v for the warning, got %v", reset, resp.SoonestReset)
 	}
+	// Drain the preflight goroutine before reading the shared log buffer.
+	s.wg.Wait()
 	logged := buf.String()
 	if !strings.Contains(logged, "select (exhausted-fallback): /proj -> acct-02") {
 		t.Fatalf("fallback pick not logged as such: %q", logged)
@@ -273,6 +453,8 @@ func TestHandleSelectLogsPick(t *testing.T) {
 	if resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true, Cwd: "/proj"}); !resp.OK {
 		t.Fatalf("select failed: %+v", resp)
 	}
+	// Drain the preflight goroutine before reading the shared log buffer.
+	s.wg.Wait()
 	logged := buf.String()
 	if !strings.Contains(logged, "select: /proj -> acct-01") {
 		t.Fatalf("fresh pick not logged: %q", logged)

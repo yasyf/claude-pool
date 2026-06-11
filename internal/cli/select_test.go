@@ -181,6 +181,95 @@ func TestResolveSelectionWarnsOnExhaustedFallback(t *testing.T) {
 	}
 }
 
+// TestWarnPinHeld pins the bypass notice's gating: silent without a held pin
+// and when the pick IS the held account (the pin was honored in effect), loud
+// — with the pin-kept reassurance — when an explicit pin was bypassed.
+func TestWarnPinHeld(t *testing.T) {
+	m := exhaustedPoolManager(t) // any manager with account rows for names
+	held, selected := 2, 1
+	cases := map[string]struct {
+		held, selected *int
+		want           string // "" = stderr must stay clean
+	}{
+		"no held pin":          {nil, &selected, ""},
+		"pick is the held pin": {&held, &held, ""},
+		"bypassed":             {&held, &selected, "manual pin to"},
+		"bypassed, nil pick":   {&held, nil, "manual pin to"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetErr(&stderr)
+			warnPinHeld(cmd, m, tc.held, tc.selected)
+			out := stripANSI(stderr.String())
+			if tc.want == "" {
+				if out != "" {
+					t.Fatalf("expected silence, got %q", out)
+				}
+				return
+			}
+			if !strings.Contains(out, tc.want) || !strings.Contains(out, "pin kept") {
+				t.Fatalf("notice malformed: %q", out)
+			}
+		})
+	}
+}
+
+// TestResolveSelectionWarnsOnHeldManualPin pins the notice at the integration
+// point: a live selection over a dir manually pinned to an exhausted account
+// must pick the healthy one AND say the pin was bypassed. Deleting the
+// warnPinHeld call site fails this test.
+func TestResolveSelectionWarnsOnHeldManualPin(t *testing.T) {
+	m := exhaustedPoolManager(t)
+	now := time.Now()
+	// Heal acct-1 so the pool is no longer all-exhausted; pin to acct-2, which
+	// stays pegged (unusable for stickiness).
+	if err := m.Store.InsertUsageSample(store.UsageSample{
+		AccountID: 1, TS: now.Add(time.Second), Util5h: 10, Util7d: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.PinManual("/proj", 2, now); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&stderr)
+	cmd.SetContext(context.Background())
+	dir, _, err := resolveSelection(cmd, m, selectReq{noDaemon: true, cwd: "/proj"})
+	if err != nil || dir == "" {
+		t.Fatalf("selection must succeed: dir=%q err=%v", dir, err)
+	}
+	out := stripANSI(stderr.String())
+	if !strings.Contains(out, "manual pin to") || !strings.Contains(out, "pin kept") {
+		t.Fatalf("bypass notice missing from stderr: %q", out)
+	}
+	// The pin must survive the bypass untouched.
+	st, ok, _ := m.Store.GetSticky("/proj")
+	if !ok || st.AccountID != 2 || !st.Manual {
+		t.Fatalf("manual pin lost on bypass: %+v ok=%v", st, ok)
+	}
+
+	// Negative: when the fallback pick IS the held account (all exhausted,
+	// pin on the least-bad), the pin was honored in effect — no notice.
+	m2 := exhaustedPoolManager(t)
+	if err := m2.Store.PinManual("/proj", 2, now); err != nil {
+		t.Fatal(err)
+	}
+	var stderr2 bytes.Buffer
+	cmd2 := &cobra.Command{}
+	cmd2.SetErr(&stderr2)
+	cmd2.SetContext(context.Background())
+	if _, _, err := resolveSelection(cmd2, m2, selectReq{noDaemon: true, cwd: "/proj"}); err != nil {
+		t.Fatal(err)
+	}
+	if out := stripANSI(stderr2.String()); strings.Contains(out, "manual pin to") {
+		t.Fatalf("honored-in-effect pin must not warn: %q", out)
+	}
+}
+
 // TestResolveSelectionWaitRefusesExhaustedFallback pins --wait's contract:
 // over an all-exhausted pool it must wait (here: until the context cancels),
 // never hand back the exhausted pick that a non-wait call accepts.

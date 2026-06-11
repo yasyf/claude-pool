@@ -10,6 +10,7 @@ import (
 
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/score"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 )
@@ -41,7 +42,12 @@ func TestRenderTablePlain(t *testing.T) {
 			Resets5h: time.Now().Add(2*time.Hour + 3*time.Minute),
 		},
 	}
-	out := stripANSI(renderTable(snaps))
+	out := stripANSI(renderTable(snaps, dirPin{}))
+
+	// No pin context → no pin artifacts.
+	if strings.Contains(out, "pinned") {
+		t.Errorf("output must not show pin tokens without a pin\n%s", out)
+	}
 
 	for _, want := range []string{"5h used", "7d used", "LIVE", "RESETS"} {
 		if !strings.Contains(out, want) {
@@ -87,6 +93,24 @@ func TestRenderTablePlain(t *testing.T) {
 	}
 }
 
+// TestAbbreviateHome pins the ~-abbreviation used by the pin summary line.
+func TestAbbreviateHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cases := map[string]struct{ in, want string }{
+		"inside home":  {home + "/Code/proj", "~/Code/proj"},
+		"home itself":  {home, "~"},
+		"outside home": {"/tmp/elsewhere", "/tmp/elsewhere"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := abbreviateHome(tc.in); got != tc.want {
+				t.Errorf("abbreviateHome(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestHumanizeResetAt pins the absolute-reset formatter against a fixed now
 // (Monday 2026-06-08 10:00 local). Inputs are built in time.Local so the
 // formatter's .Local() is a no-op and the expected strings hold in any zone.
@@ -120,8 +144,104 @@ func TestHumanizeResetAt(t *testing.T) {
 
 // TestRenderTableEmpty keeps the friendly empty-pool message.
 func TestRenderTableEmpty(t *testing.T) {
-	if got := renderTable(nil); !strings.Contains(got, "ccp add") {
+	if got := renderTable(nil, dirPin{}); !strings.Contains(got, "ccp add") {
 		t.Errorf("empty pool should suggest `ccp add`, got %q", got)
+	}
+}
+
+// TestRenderTablePin: with the launch dir pinned, the pinned account's row is
+// badged and the pin summary line names the account, kind, and deadline.
+func TestRenderTablePin(t *testing.T) {
+	snaps := []pool.Snapshot{
+		{Account: store.Account{ID: 1, Label: "best@example.com"}, Score: 90, HasUsage: true},
+		{Account: store.Account{ID: 2, Label: "pinned@example.com"}, Score: 50, HasUsage: true,
+			Util5h: 10, Util7d: 10, Remaining5h: 90, Components: score.Components{RawRemaining5h: 90}},
+	}
+	pin := dirPin{cwd: "/proj", ok: true, view: pool.PinView{
+		AccountID: 2, Manual: true, Binding: true,
+		ExpiresAt: time.Date(2026, 6, 11, 15, 58, 0, 0, time.Local),
+	}}
+	out := stripANSI(renderTable(snaps, pin))
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if !strings.Contains(lines[2], "pinned@example.com") || !strings.HasSuffix(strings.TrimRight(lines[2], " "), "pinned") {
+		t.Errorf("pinned row must carry the badge\n%s", out)
+	}
+	if strings.Contains(lines[1], "pinned") {
+		t.Errorf("unpinned row must not carry the badge\n%s", out)
+	}
+	for _, want := range []string{"pinned pinned@example.com", "manual", "until", "/proj"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("pin line missing %q\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderPinLine pins each pin-state phrasing, including the fallback name
+// for an account missing from snaps and the no-promise wording when the pinned
+// account cannot serve — each arm of the UsableForSticky mirror independently.
+func TestRenderPinLine(t *testing.T) {
+	healthySnap := func(raw5 float64) []pool.Snapshot {
+		return []pool.Snapshot{{Account: store.Account{ID: 2, Label: "p@example.com"},
+			HasUsage: true, Components: score.Components{RawRemaining5h: raw5}}}
+	}
+	snaps := healthySnap(50)
+	view := func(manual, live, binding bool) pool.PinView {
+		pv := pool.PinView{AccountID: 2, Manual: manual, Live: live, Binding: binding}
+		if !live {
+			pv.ExpiresAt = time.Now().Add(30 * time.Minute)
+		}
+		return pv
+	}
+	rateLimited := healthySnap(50)
+	rateLimited[0].RateLimited = true
+	cases := map[string]struct {
+		pin   dirPin
+		snaps []pool.Snapshot
+		want  []string
+		none  bool
+	}{
+		"no pin":           {pin: dirPin{cwd: "/proj"}, snaps: snaps, none: true},
+		"manual countdown": {pin: dirPin{cwd: "/proj", ok: true, view: view(true, false, true)}, snaps: snaps, want: []string{"manual", "until"}},
+		"manual live":      {pin: dirPin{cwd: "/proj", ok: true, view: view(true, true, true)}, snaps: snaps, want: []string{"manual", "while sessions live"}},
+		"auto waiting":     {pin: dirPin{cwd: "/proj", ok: true, view: view(false, true, false)}, snaps: snaps, want: []string{"auto", "waiting for session end"}},
+		"auto countdown":   {pin: dirPin{cwd: "/proj", ok: true, view: view(false, false, true)}, snaps: snaps, want: []string{"auto", "until"}},
+		"unknown account":  {pin: dirPin{cwd: "/proj", ok: true, view: view(true, false, true)}, snaps: nil, want: []string{"acct-02"}},
+		"exhausted account": {
+			pin:   dirPin{cwd: "/proj", ok: true, view: view(true, false, true)},
+			snaps: []pool.Snapshot{{Account: store.Account{ID: 2, Label: "p@example.com"}, HasUsage: true, Exhausted: true}},
+			want:  []string{"can't serve"},
+		},
+		"rate-limited account": {
+			pin:   dirPin{cwd: "/proj", ok: true, view: view(true, false, true)},
+			snaps: rateLimited,
+			want:  []string{"can't serve"},
+		},
+		"below the sticky floor": {
+			pin:   dirPin{cwd: "/proj", ok: true, view: view(true, false, true)},
+			snaps: healthySnap(score.StickyMinRemaining5h - 1),
+			want:  []string{"can't serve"},
+		},
+		"exactly at the floor stays usable": {
+			pin:   dirPin{cwd: "/proj", ok: true, view: view(true, false, true)},
+			snaps: healthySnap(score.StickyMinRemaining5h),
+			want:  []string{"until"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := stripANSI(renderPinLine(tc.pin, tc.snaps))
+			if tc.none {
+				if got != "" {
+					t.Fatalf("want no line, got %q", got)
+				}
+				return
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("line %q missing %q", got, want)
+				}
+			}
+		})
 	}
 }
 
@@ -193,7 +313,7 @@ func TestRenderTableUnusableSinks(t *testing.T) {
 			Util7d:   12,
 		},
 	}
-	out := stripANSI(renderTable(snaps))
+	out := stripANSI(renderTable(snaps, dirPin{}))
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	if !strings.Contains(lines[1], "healthy@example.com") || !strings.HasPrefix(lines[1], "▸") {
 		t.Errorf("usable account must be row 1 with the next-pick marker\n%s", out)
@@ -212,7 +332,7 @@ func TestStatusTUISortsTiered(t *testing.T) {
 	healthy := pool.Snapshot{Score: 13.3}
 	healthy.Account.ID = 2
 
-	model, _ := statusTUI{}.Update(snapsMsg{snaps: []pool.Snapshot{exhausted, healthy}, at: time.Now()})
+	model, _ := statusTUI{}.Update(snapsMsg{data: statusData{snaps: []pool.Snapshot{exhausted, healthy}}, at: time.Now()})
 	tui, ok := model.(statusTUI)
 	if !ok {
 		t.Fatalf("Update returned %T, want statusTUI", model)

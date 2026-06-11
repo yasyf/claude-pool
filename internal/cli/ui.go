@@ -18,6 +18,9 @@ var (
 	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	badStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	okStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	// pinStyle marks pin state: magenta (13), because green/yellow/red carry
+	// health semantics in every other token.
+	pinStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
 )
 
 // usageStyle tints a 0..100 percent-used figure by health: green below 70%,

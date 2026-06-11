@@ -50,7 +50,9 @@ the shared plugin state; ` + "`ccp run`" + ` sets it for you.)`,
 				cwd, _ := os.Getwd() // best-effort: an unreadable cwd just disables stickiness
 				// `ccp run` is the imperative form of `ccp select | claude`: it shares
 				// the exact selection pipeline, then execs instead of printing the dir.
-				dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd})
+				// Our pid IS the future claude pid (exec replaces in place), so the
+				// pick is marked as a real session checkout.
+				dir, line, err := resolveSelection(cmd, m, selectReq{account: account, cwd: cwd, pid: os.Getpid()})
 				if err != nil {
 					return err
 				}

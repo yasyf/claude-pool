@@ -46,12 +46,14 @@ CREATE TABLE IF NOT EXISTS usage_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_acct_ts ON usage_samples(account_id, ts DESC);
 CREATE TABLE IF NOT EXISTS sessions (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_id INTEGER NOT NULL,
-  pid        INTEGER,
-  config_dir TEXT,
-  started_at INTEGER NOT NULL,
-  ended_at   INTEGER
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id   INTEGER NOT NULL,
+  pid          INTEGER,
+  config_dir   TEXT,
+  cwd          TEXT NOT NULL DEFAULT '',
+  started_at   INTEGER NOT NULL,
+  last_seen_at INTEGER,
+  ended_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(account_id) WHERE ended_at IS NULL;
 CREATE TABLE IF NOT EXISTS refresh_log (
@@ -64,7 +66,8 @@ CREATE TABLE IF NOT EXISTS refresh_log (
 CREATE TABLE IF NOT EXISTS sticky (
   cwd         TEXT PRIMARY KEY,
   account_id  INTEGER NOT NULL,
-  selected_at INTEGER NOT NULL
+  selected_at INTEGER NOT NULL,
+  manual      INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -86,6 +89,50 @@ func Open(path string) (*Store, error) {
 func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
+	}
+	// Columns added after a table first shipped: CREATE TABLE IF NOT EXISTS
+	// never alters an existing table, so pre-existing databases need these.
+	if err := s.ensureColumn("sessions", "cwd", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sessions", "last_seen_at", "INTEGER"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("sticky", "manual", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// After the ALTERs: on an old database sessions.cwd does not exist when the
+	// schema const runs, so this index cannot live there.
+	if _, err := s.db.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd, ended_at)`); err != nil {
+		return fmt.Errorf("apply schema: index sessions.cwd: %w", err)
+	}
+	return nil
+}
+
+// ensureColumn adds column (with declaration decl) to table when it is absent.
+// Errors fail Open — running against a half-migrated schema is never
+// acceptable.
+func (s *Store) ensureColumn(table, column, decl string) error {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return fmt.Errorf("inspect %s.%s: %w", table, column, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	// table/column/decl are compile-time constants; nothing user-controlled.
+	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl)); err != nil {
+		// Two processes can race the check-then-ALTER on the first open after
+		// an upgrade (sqlite has no ADD COLUMN IF NOT EXISTS). The
+		// postcondition is "column exists" — re-check before failing.
+		var again int
+		if err2 := s.db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&again); err2 == nil && again > 0 {
+			return nil
+		}
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -312,21 +359,23 @@ func (s *Store) RecentUsageSamples(accountID, limit int) ([]UsageSample, error) 
 	return out, rows.Err()
 }
 
-// OpenSession records a new checkout and returns its id.
-func (s *Store) OpenSession(accountID, pid int, configDir string) (int64, error) {
+// OpenSession records a new checkout at time at and returns its id. cwd is the
+// session's launch directory ("" when unknown), feeding the sticky activity
+// rules.
+func (s *Store) OpenSession(accountID, pid int, configDir, cwd string, at time.Time) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO sessions(account_id,pid,config_dir,started_at) VALUES(?,?,?,?)`,
-		accountID, pid, configDir, time.Now().Unix())
+		`INSERT INTO sessions(account_id,pid,config_dir,cwd,started_at) VALUES(?,?,?,?,?)`,
+		accountID, pid, configDir, cwd, at.Unix())
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
 }
 
-// CloseSession marks a session ended by id.
-func (s *Store) CloseSession(id int64) error {
+// CloseSession marks a session ended by id at time at.
+func (s *Store) CloseSession(id int64, at time.Time) error {
 	_, err := s.db.Exec(`UPDATE sessions SET ended_at=? WHERE id=? AND ended_at IS NULL`,
-		time.Now().Unix(), id)
+		at.Unix(), id)
 	return err
 }
 
@@ -341,7 +390,7 @@ func (s *Store) ActiveSessionCount(accountID int) (int, error) {
 // ListActiveSessions returns all live sessions across accounts.
 func (s *Store) ListActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id,account_id,pid,config_dir,started_at FROM sessions WHERE ended_at IS NULL`)
+		`SELECT id,account_id,pid,config_dir,cwd,started_at,last_seen_at FROM sessions WHERE ended_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -350,44 +399,110 @@ func (s *Store) ListActiveSessions() ([]Session, error) {
 	for rows.Next() {
 		var se Session
 		var started int64
-		var pid sql.NullInt64
+		var pid, seen sql.NullInt64
 		var cd sql.NullString
-		if err := rows.Scan(&se.ID, &se.AccountID, &pid, &cd, &started); err != nil {
+		if err := rows.Scan(&se.ID, &se.AccountID, &pid, &cd, &se.Cwd, &started, &seen); err != nil {
 			return nil, err
 		}
 		se.PID = int(pid.Int64)
 		se.ConfigDir = cd.String
 		se.StartedAt = time.Unix(started, 0)
+		if seen.Valid {
+			t := time.Unix(seen.Int64, 0)
+			se.LastSeenAt = &t
+		}
 		out = append(out, se)
 	}
 	return out, rows.Err()
 }
 
-// CloseDeadSessions ends every active session whose pid is not in alive.
-func (s *Store) CloseDeadSessions(alive map[int]bool) (int, error) {
+// SessionReapGrace is how long a freshly opened session is immune to
+// CloseDeadSessions. `ccp run` marks its checkout before exec'ing into
+// claude, so for a moment the row's pid belongs to a ccp process that no
+// claude-only scan can see; reaping it would instantly fabricate a "session
+// ended" signal for the sticky rules.
+const SessionReapGrace = time.Minute
+
+// touchSession stamps a live session's last observed liveness.
+func (s *Store) touchSession(id int64, at time.Time) error {
+	_, err := s.db.Exec(`UPDATE sessions SET last_seen_at=? WHERE id=? AND ended_at IS NULL`,
+		at.Unix(), id)
+	return err
+}
+
+// CloseDeadSessions reconciles active sessions against the live claude pids
+// in alive, observed at time at: live rows are stamped last-seen, and dead
+// rows older than SessionReapGrace are closed. A dead row's end is stamped at
+// its last observed liveness (falling back to its start) — never at
+// observation time, because a reap after a long observer gap (no daemon
+// polling, no selects) would otherwise fabricate a warm cache for the sticky
+// rules out of a session that died hours ago.
+func (s *Store) CloseDeadSessions(alive map[int]bool, at time.Time) (int, error) {
 	sessions, err := s.ListActiveSessions()
 	if err != nil {
 		return 0, err
 	}
 	closed := 0
 	for _, se := range sessions {
-		if se.PID > 0 && !alive[se.PID] {
-			if err := s.CloseSession(se.ID); err != nil {
+		if se.PID <= 0 {
+			continue
+		}
+		if alive[se.PID] {
+			if err := s.touchSession(se.ID, at); err != nil {
 				return closed, err
 			}
-			closed++
+			continue
 		}
+		if at.Sub(se.StartedAt) < SessionReapGrace {
+			continue
+		}
+		end := se.StartedAt
+		if se.LastSeenAt != nil && se.LastSeenAt.After(end) {
+			end = *se.LastSeenAt
+		}
+		if err := s.CloseSession(se.ID, end); err != nil {
+			return closed, err
+		}
+		closed++
 	}
 	return closed, nil
 }
 
-// UpsertSticky records (or refreshes) the account last selected for cwd.
+// GetCwdActivity aggregates tracked session activity for cwd on one account —
+// the prompt cache a pin protects belongs to a single account, so sessions on
+// other accounts in the same directory neither warm nor hold it. It never
+// returns ErrNoRows: a cwd with no tracked sessions reads as the zero
+// CwdActivity. Only marked sessions count — see the CwdActivity godoc.
+func (s *Store) GetCwdActivity(cwd string, accountID int) (CwdActivity, error) {
+	var act CwdActivity
+	var lastEnded int64
+	err := s.db.QueryRow(
+		`SELECT COALESCE(SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END), 0),
+		        COALESCE(MAX(ended_at), 0)
+		 FROM sessions WHERE cwd = ? AND account_id = ?`, cwd, accountID).Scan(&act.Live, &lastEnded)
+	if err != nil {
+		return CwdActivity{}, fmt.Errorf("cwd activity for %s: %w", cwd, err)
+	}
+	if lastEnded > 0 {
+		act.LastEnded = time.Unix(lastEnded, 0)
+	}
+	return act, nil
+}
+
+// UpsertSticky records (or refreshes) the account the select path picked for
+// cwd. It is the select-path write and can never downgrade or repoint a manual
+// pin: a conflict repoints/refreshes an auto pin, refreshes a manual pin when
+// the select landed on the pinned account (manual is absent from the SET
+// list), and is a deliberate no-op when a manual pin points elsewhere. One
+// atomic statement — the daemon and a live-path CLI are separate processes, so
+// read-modify-write would race.
 func (s *Store) UpsertSticky(cwd string, accountID int, at time.Time) error {
 	_, err := s.db.Exec(
-		`INSERT INTO sticky(cwd,account_id,selected_at) VALUES(?,?,?)
+		`INSERT INTO sticky(cwd,account_id,selected_at,manual) VALUES(?,?,?,0)
 		 ON CONFLICT(cwd) DO UPDATE SET
 		   account_id=excluded.account_id,
-		   selected_at=excluded.selected_at`,
+		   selected_at=excluded.selected_at
+		 WHERE manual = 0 OR account_id = excluded.account_id`,
 		cwd, accountID, at.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert sticky for %s: %w", cwd, err)
@@ -395,12 +510,51 @@ func (s *Store) UpsertSticky(cwd string, accountID int, at time.Time) error {
 	return nil
 }
 
+// PinManual pins cwd to accountID at time at, overriding any existing pin
+// (manual or auto) for that directory.
+func (s *Store) PinManual(cwd string, accountID int, at time.Time) error {
+	_, err := s.db.Exec(
+		`INSERT INTO sticky(cwd,account_id,selected_at,manual) VALUES(?,?,?,1)
+		 ON CONFLICT(cwd) DO UPDATE SET
+		   account_id=excluded.account_id,
+		   selected_at=excluded.selected_at,
+		   manual=1`,
+		cwd, accountID, at.Unix())
+	if err != nil {
+		return fmt.Errorf("pin %s: %w", cwd, err)
+	}
+	return nil
+}
+
+// DeleteSticky removes cwd's pin (manual or auto). Idempotent: deleting an
+// absent row is not an error (a toggle's read-then-delete may race a prune).
+func (s *Store) DeleteSticky(cwd string) error {
+	if _, err := s.db.Exec(`DELETE FROM sticky WHERE cwd=?`, cwd); err != nil {
+		return fmt.Errorf("delete sticky for %s: %w", cwd, err)
+	}
+	return nil
+}
+
+// DeleteStickyVersion removes cwd's pin only if it still matches the version
+// the caller read (selected_at + manual). StickyPick's expired-row hygiene
+// uses this so a concurrent writer (a manual pin from the TUI, a select in
+// another process) can never have its newer row erased on the basis of a
+// stale read.
+func (s *Store) DeleteStickyVersion(cwd string, selectedAt time.Time, manual bool) error {
+	if _, err := s.db.Exec(
+		`DELETE FROM sticky WHERE cwd=? AND selected_at=? AND manual=?`,
+		cwd, selectedAt.Unix(), manual); err != nil {
+		return fmt.Errorf("delete sticky for %s: %w", cwd, err)
+	}
+	return nil
+}
+
 // GetSticky returns the sticky record for cwd, ok=false if none exists.
 func (s *Store) GetSticky(cwd string) (Sticky, bool, error) {
-	row := s.db.QueryRow(`SELECT cwd,account_id,selected_at FROM sticky WHERE cwd=?`, cwd)
+	row := s.db.QueryRow(`SELECT cwd,account_id,selected_at,manual FROM sticky WHERE cwd=?`, cwd)
 	var st Sticky
 	var at int64
-	if err := row.Scan(&st.Cwd, &st.AccountID, &at); err != nil {
+	if err := row.Scan(&st.Cwd, &st.AccountID, &at, &st.Manual); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return st, false, nil
 		}
@@ -410,10 +564,22 @@ func (s *Store) GetSticky(cwd string) (Sticky, bool, error) {
 	return st, true, nil
 }
 
-// PruneSticky deletes sticky rows last refreshed before cutoff, returning the
-// number deleted.
+// PruneSticky deletes sticky rows whose last activity predates cutoff,
+// returning the number deleted. Activity is max(selected_at, latest tracked
+// session end in the row's cwd), and a row with a live tracked session
+// survives regardless — the pin expires one TTL after the cache last saw
+// traffic, not after the last select.
 func (s *Store) PruneSticky(cutoff time.Time) (int, error) {
-	res, err := s.db.Exec(`DELETE FROM sticky WHERE selected_at < ?`, cutoff.Unix())
+	res, err := s.db.Exec(
+		`DELETE FROM sticky WHERE
+		   NOT EXISTS (SELECT 1 FROM sessions se
+		               WHERE se.cwd = sticky.cwd AND se.account_id = sticky.account_id
+		                 AND se.ended_at IS NULL)
+		   AND MAX(selected_at,
+		           COALESCE((SELECT MAX(se.ended_at) FROM sessions se
+		                     WHERE se.cwd = sticky.cwd AND se.account_id = sticky.account_id
+		                       AND se.ended_at IS NOT NULL), 0)) < ?`,
+		cutoff.Unix())
 	if err != nil {
 		return 0, err
 	}
