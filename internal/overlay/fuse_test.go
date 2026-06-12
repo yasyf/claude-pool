@@ -336,6 +336,48 @@ func TestMirrorClaudeJSONRenameWriteThrough(t *testing.T) {
 	}
 }
 
+// TestMirrorClaudeJSONRenameWriteThroughSharedProjectKeys: a claude-style
+// commit whose project entries mix an approval key with session history writes
+// ONLY the approval key through to base — base's matching entry keeps its own
+// history, a base-unknown project is minted with the approval key alone (no
+// history at all), and the private file still holds the full committed payload
+// verbatim (migrate depends on it).
+func TestMirrorClaudeJSONRenameWriteThroughSharedProjectKeys(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	committed := `{"theme":"dark","oauthAccount":{"accountUuid":"acct-own"},"projects":{"/base":{"history":["acct-h1","acct-h2"],"hasClaudeMdExternalIncludesApproved":true},"/fresh":{"history":["acct-h3"],"hasClaudeMdExternalIncludesApproved":true}}}`
+	commitClaudeJSON(t, fs, home, committed)
+
+	priv := mustReadFile(t, filepath.Join(home, "acct.private", ".claude.json"))
+	if string(priv) != committed {
+		t.Fatalf("private file = %q, want the full committed payload %q (migrate depends on it)", priv, committed)
+	}
+	base := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
+	proj := raw(t, base["projects"])
+	entry := raw(t, proj["/base"])
+	if string(entry["hasClaudeMdExternalIncludesApproved"]) != `true` {
+		t.Errorf("base /base approval key = %s, want true written through", entry["hasClaudeMdExternalIncludesApproved"])
+	}
+	if string(entry["history"]) != `["theirs"]` {
+		t.Errorf("base /base history = %s, want its own [\"theirs\"] — account history must never cross", entry["history"])
+	}
+	if len(entry) != 2 {
+		t.Errorf("base /base entry = %s, want exactly its own history + the approval key", proj["/base"])
+	}
+	fresh := raw(t, proj["/fresh"])
+	if string(fresh["hasClaudeMdExternalIncludesApproved"]) != `true` {
+		t.Errorf("minted /fresh approval key = %s, want true", fresh["hasClaudeMdExternalIncludesApproved"])
+	}
+	if h, ok := fresh["history"]; ok {
+		t.Errorf("minted /fresh entry carries history %s — private session state leaked into base", h)
+	}
+	if len(fresh) != 1 {
+		t.Errorf("minted /fresh entry = %s, want the approval key alone", proj["/fresh"])
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
 // TestMirrorClaudeJSONWriteThroughSkipsMissingBase: with no base ~/.claude.json
 // a commit must not mint one — cc-pool must not pre-empt vanilla claude's own
 // onboarding.
@@ -389,20 +431,36 @@ func TestMirrorClaudeJSONWriteThroughErrStickyAndClears(t *testing.T) {
 // keys already match base must not rewrite the base file — rewriting identical
 // bytes bumps base's mtime, which invalidates every mount's merge cache and
 // widens the vanilla-claude last-writer window for nothing. Pinned via mtime:
-// base is backdated after the first commit, so any rewrite by the identical
-// second commit would move ModTime forward.
+// base is backdated after the first commit, so any rewrite by the second
+// commit — which differs only in private state (history grows, numStartups
+// bumps: exactly what every claude session commits) — would move ModTime
+// forward. Base's project entry is reordered to non-json.Marshal key order
+// between the commits, so a gratuitous projects re-encode (which would sort
+// it) cannot hide behind byte-identical output: it would defeat the
+// bytes.Equal short-circuit and move the mtime.
 func TestMirrorClaudeJSONNoopWriteThroughSkipsRewrite(t *testing.T) {
 	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
 	basePath := filepath.Join(home, ".claude.json")
-	committed := `{"theme":"solarized","oauthAccount":{"accountUuid":"acct-own"},"numStartups":7}`
-	commitClaudeJSON(t, fs, home, committed)
-	want := mustReadFile(t, basePath)
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized","oauthAccount":{"accountUuid":"acct-own"},"numStartups":7,"projects":{"/base":{"history":["mine"],"hasTrustDialogAccepted":true}}}`)
+
+	const (
+		sorted    = `"/base":{"hasTrustDialogAccepted":true,"history":["theirs"]}`
+		reordered = `"/base":{"history":["theirs"],"hasTrustDialogAccepted":true}`
+	)
+	canon := mustReadFile(t, basePath)
+	if !bytes.Contains(canon, []byte(sorted)) {
+		t.Fatalf("first commit did not write the trust key into base's project entry:\n%s", canon)
+	}
+	want := bytes.Replace(canon, []byte(sorted), []byte(reordered), 1)
+	if err := os.WriteFile(basePath, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	old := time.Now().Add(-time.Hour).Truncate(time.Second)
 	if err := os.Chtimes(basePath, old, old); err != nil {
 		t.Fatal(err)
 	}
-	commitClaudeJSON(t, fs, home, committed)
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized","oauthAccount":{"accountUuid":"acct-own"},"numStartups":8,"projects":{"/base":{"history":["mine","more"],"hasTrustDialogAccepted":true}}}`)
 	fi, err := os.Stat(basePath)
 	if err != nil {
 		t.Fatal(err)

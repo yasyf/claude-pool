@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/winfsp/cgofuse/fuse"
+	"golang.org/x/sys/unix"
 )
 
 // mirrorFS is a passthrough filesystem: most operations are applied directly to
@@ -46,10 +47,23 @@ func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
 // a private top-level component, else under root.
 func (fs *mirrorFS) real(path string) string {
 	rel := filepath.FromSlash(path)
-	if PrivateEntry(topComponent(path)) {
+	if privateName(topComponent(path)) {
 		return filepath.Join(fs.privateRoot, rel)
 	}
 	return filepath.Join(fs.root, rel)
+}
+
+// privateName reports whether a top-level name backs onto privateRoot:
+// PrivateEntry names plus their AppleDouble "._<name>" sidecars. A sidecar
+// must colocate with its parent — xnu writes "._<name>" beside "<name>" when
+// setxattr fails ENOTSUP (pre-namedattr mounts, or any fuse-t named-attribute
+// regression), and routing a private file's sidecar into the shared base
+// litters it with orphans once claude's tmp→rename commit moves on. TrimPrefix
+// on a non-sidecar name is a no-op, so normal names route exactly as before.
+// The ONE predicate is shared by real and Readdir's private-merge filter so
+// the two can never disagree about where a name lives.
+func privateName(name string) bool {
+	return PrivateEntry(strings.TrimPrefix(name, "._"))
 }
 
 // topComponent returns the first path component of a fuse path ("/daemon/x" -> "daemon").
@@ -238,7 +252,7 @@ func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 			return 0 // listing base succeeded; a missing private root is not an error
 		}
 		for _, e := range priv {
-			if seen[e.Name()] || !PrivateEntry(e.Name()) {
+			if seen[e.Name()] || !privateName(e.Name()) {
 				continue
 			}
 			if !fill(e.Name(), nil, 0) {
@@ -312,6 +326,93 @@ func (fs *mirrorFS) Utimens(path string, tmsp []fuse.Timespec) int {
 		{Sec: tmsp[1].Sec, Usec: int32(tmsp[1].Nsec / 1000)},
 	}
 	return errno(syscall.Utimes(fs.real(path), tv))
+}
+
+// The xattr ops pass through to fs.real(path) via x/sys/unix's L-variants —
+// never following symlinks, matching the mirror's Lstat/Readlink posture. They
+// exist because the mount runs with namedattr: implementing them (rather than
+// inheriting FileSystemBase's -ENOSYS) is what keeps xnu's AppleDouble
+// fallback from littering ._ sidecars, and fuse-t requires Listxattr or
+// Getxattr fails outright (fuse-t issue #62). /.claude.json gets no merged-view
+// carve-out: the merge covers file CONTENT only, so its xattrs live on the
+// private backing file like any other private path.
+
+// Setxattr passes through, translating ENOTSUP to EPERM: ENOTSUP from setxattr
+// is the one status that trips xnu's AppleDouble ._ fallback — the exact bug
+// this layer exists to prevent — while EPERM refuses cleanly. Every other
+// error (notably EPERM for the SIP-protected com.apple.provenance) passes
+// through unchanged.
+func (fs *mirrorFS) Setxattr(path string, name string, value []byte, flags int) int {
+	return setxattrErrno(unix.Lsetxattr(fs.real(path), name, value, flags))
+}
+
+// setxattrErrno maps a setxattr passthrough error to the fuse status,
+// translating ENOTSUP to EPERM (see Setxattr). Split from Setxattr so the
+// translation is testable without a filesystem that rejects xattrs.
+func setxattrErrno(err error) int {
+	if errors.Is(err, unix.ENOTSUP) {
+		return -int(syscall.EPERM)
+	}
+	return errno(err)
+}
+
+func (fs *mirrorFS) Getxattr(path string, name string) (int, []byte) {
+	backing := fs.real(path)
+	for {
+		sz, err := unix.Lgetxattr(backing, name, nil)
+		if err != nil {
+			return errno(err), nil
+		}
+		if sz == 0 {
+			return 0, []byte{}
+		}
+		buf := make([]byte, sz)
+		n, err := unix.Lgetxattr(backing, name, buf)
+		if errors.Is(err, unix.ERANGE) {
+			continue // grew between the size probe and the fetch; re-probe
+		}
+		if err != nil {
+			return errno(err), nil
+		}
+		return 0, buf[:n]
+	}
+}
+
+func (fs *mirrorFS) Listxattr(path string, fill func(name string) bool) int {
+	backing := fs.real(path)
+	var buf []byte
+	for {
+		sz, err := unix.Llistxattr(backing, nil)
+		if err != nil {
+			return errno(err)
+		}
+		if sz == 0 {
+			return 0
+		}
+		buf = make([]byte, sz)
+		n, err := unix.Llistxattr(backing, buf)
+		if errors.Is(err, unix.ERANGE) {
+			continue // grew between the size probe and the fetch; re-probe
+		}
+		if err != nil {
+			return errno(err)
+		}
+		buf = buf[:n]
+		break
+	}
+	for _, name := range strings.Split(string(buf), "\x00") {
+		if name == "" {
+			continue // trailing NUL terminator
+		}
+		if !fill(name) {
+			return 0
+		}
+	}
+	return 0
+}
+
+func (fs *mirrorFS) Removexattr(path string, name string) int {
+	return errno(unix.Lremovexattr(fs.real(path), name))
 }
 
 // copyStat converts a Go syscall.Stat_t (darwin) into a fuse.Stat_t.

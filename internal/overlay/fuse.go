@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,6 +90,8 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	}
 	mountMu.Unlock()
 
+	sweepAppleDoubleLitter(base)
+
 	// Private backing for excluded (instance-local) entries.
 	priv := FusePrivateRoot(accountDir)
 	for name := range ExcludedEntries {
@@ -109,10 +112,17 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 	// directly by plain `claude` while a pooled session reads through this
 	// mirror, so disable attribute caching to avoid stale reads. nobrowse
 	// keeps the mount out of Finder sidebars.
+	// namedattr: macOS's NFS client defaults to nonamedattr, under which every
+	// xattr op on the mount fails ENOTSUP — and ENOTSUP from setxattr is
+	// exactly what trips xnu's AppleDouble fallback (bsd/vfs/vfs_xattr.c),
+	// littering ._<name> sidecar files into the backing dir. namedattr routes
+	// xattrs to the mirror's xattr ops instead (fuse-t supports NFSv4 named
+	// attributes but ships with them disabled by default since v1.0.46).
 	opts := []string{
 		"-o", "volname=cc-pool-" + filepath.Base(accountDir),
 		"-o", "noattrcache",
 		"-o", "nobrowse",
+		"-o", "namedattr",
 	}
 	go func() {
 		defer close(done)
@@ -210,6 +220,29 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, accountDir)
 	}
 	return nil
+}
+
+// sweepAppleDoubleLitter unlinks top-level AppleDouble sidecars of private
+// entries from base. Pre-namedattr mounts misrouted them there: xnu's ENOTSUP
+// fallback wrote "._<name>" beside where it believed "<name>" lived, and the
+// mirror routed the sidecar of a private file into the shared base, where
+// claude's tmp→rename commit orphaned it. The litter is provably mount-origin:
+// plain claude's state file lives at base's SIBLING ~/.claude.json, so any
+// ._.claude.json* (or other private-entry sidecar) inside base can only have
+// come from the mirror's old misrouting. Janitorial and best-effort by design
+// — a sweep failure must never block a mount. No other base mutations.
+func sweepAppleDoubleLitter(base string) {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "._") || !PrivateEntry(strings.TrimPrefix(name, "._")) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(base, name))
+	}
 }
 
 // HostProbe attempts a throwaway in-process probe mount; it must run in the
