@@ -49,9 +49,44 @@ func init() {
 }
 
 // mountRegistry tracks live mounts so Teardown can unmount the right host.
+// everMountedLive is the sticky per-process "Network Volumes" TCC deduction:
+// once any mount registers live the grant is proven for this process, and
+// later mount-up timeouts are transient (ErrMountTimeout), not TCC
+// (ErrMountNotLive). It is set beside the mounts map insert in Setup, which
+// covers OpProbe's throwaway probe mount automatically: probeFuse drives
+// FuseProvider.Setup, the only path that registers a mount. Guarded by
+// mountMu like the map it shadows.
 var (
-	mountMu sync.Mutex
-	mounts  = map[string]*mountHandle{}
+	mountMu         sync.Mutex
+	mounts          = map[string]*mountHandle{}
+	everMountedLive bool
+)
+
+// mountProven reports whether this process has ever hosted a live mount —
+// the proof that the "Network Volumes" TCC grant is held.
+func mountProven() bool {
+	mountMu.Lock()
+	defer mountMu.Unlock()
+	return everMountedLive
+}
+
+// Mount-up wait bounds, selected by mountProven. The first mount in a process
+// gets longer: a genuine TCC denial fails fast regardless, while a slow but
+// granted fuse-t deserves the extra patience before we surface the scary TCC
+// walkthrough. 14s, not 15: the holder-side OpMount budget is liveWithin
+// probe (<=2s) + wait + 3s done-drain, and 2+14+3 = 19 must stay under the
+// 20s mount op deadline in internal/mountd. OpProbe shares that 20s deadline
+// and its throwaway mount (HostProbe) is the process's first, so it waits the
+// full 14s: the failure path fits (14s wait + 3s drain = 17), but a mount
+// coming live near the 14s bound whose Teardown then wedges (3s unmountGrace
+// + 2s forceGrace + <=2s bounded MountedWithin) totals ~21s — an accepted
+// tail. That conjunction (a near-deadline first mount AND a wedged teardown
+// of the just-live probe mount) is vanishingly narrow, and the blown deadline
+// fails loud as one transient "mount holder probe failed" fuse-unavailable
+// verdict (pool.DetectOverlayKind), re-proven on the next probe.
+var (
+	mountWait      = 8 * time.Second
+	firstMountWait = 14 * time.Second
 )
 
 type mountHandle struct {
@@ -130,18 +165,26 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 		_ = host.Mount(accountDir, opts)
 	}()
 
-	if !waitMounted(base, accountDir, 8*time.Second) {
+	wait := mountWait
+	if !mountProven() {
+		wait = firstMountWait
+	}
+	if !waitMounted(base, accountDir, wait) {
 		host.Unmount()
 		// Bounded wait: a mount stuck on the one-time "Network Volumes" TCC
-		// grant must not hang the daemon. Fall back to symlink instead.
+		// grant must not hang the daemon; the holder retries it.
 		select {
 		case <-done:
 		case <-time.After(3 * time.Second):
 		}
-		return fmt.Errorf("%w: %s (grant Network Volumes access once in System Settings ▸ Privacy, then retry; symlink is used until then)", ErrMountNotLive, accountDir)
+		// Re-read mountProven at failure time: a sibling mount coming live
+		// mid-wait proves the grant and turns this from TCC into a transient
+		// timeout — exactly the kill-9 revive-storm incident shape.
+		return mountWaitErr(accountDir, wait, mountProven())
 	}
 	mountMu.Lock()
 	mounts[accountDir] = &mountHandle{host: host, fs: fs, done: done}
+	everMountedLive = true
 	mountMu.Unlock()
 	return nil
 }

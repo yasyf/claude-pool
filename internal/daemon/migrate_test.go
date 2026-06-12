@@ -1023,11 +1023,26 @@ func TestHealFuseTaxonomy(t *testing.T) {
 			setupErr:    fmt.Errorf("mount: %w", overlay.ErrUnmountWedged),
 			wantOutcome: healRetry, wantKind: "fuse",
 		},
+		// The exact chain overlayClass produces for a mount-up timeout under a
+		// proven "Network Volumes" grant: transient fuse-t slowness, never the
+		// TCC condition. wantTCC false is the load-bearing negative — pre-fix,
+		// every timeout recorded TCC guidance and waited on the grant copy.
+		"mount timeout (proven grant) retries without recording TCC": {
+			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout)),
+			wantOutcome: healRetry, wantKind: "fuse", wantTCC: false,
+		},
 		// Forward skew: a newer holder's error class this daemon predates is
 		// unclassifiable — the protocol's sanctioned extension path must read
 		// as retry, never as the mount failure that converts.
 		"unknown holder error class retries next poll": {
 			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (quota-exceeded): per-account quota exhausted", mountd.ErrUnknownClass)),
+			wantOutcome: healRetry, wantKind: "fuse",
+		},
+		// The skew matrix's degrade path: a pre-fix daemon receiving the new
+		// "mount-timeout" class reads it as ErrUnknownClass — which the
+		// additive policy routes to retry, never to the conversion arm.
+		"mount-timeout class on a pre-fix daemon degrades to retry": {
+			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (mount-timeout): fuse mount did not come up in time", mountd.ErrUnknownClass)),
 			wantOutcome: healRetry, wantKind: "fuse",
 		},
 		"genuine failure on an idle account converts": {

@@ -53,6 +53,8 @@ func overlayClass(err error) error {
 	switch {
 	case errors.Is(err, ErrTCCDenied):
 		return fmt.Errorf("%w: %w", overlay.ErrMountNotLive, err)
+	case errors.Is(err, ErrMountTimeout):
+		return fmt.Errorf("%w: %w", overlay.ErrMountTimeout, err)
 	case errors.Is(err, ErrUnmountWedged):
 		return fmt.Errorf("%w: %w", overlay.ErrUnmountWedged, err)
 	default:
@@ -64,15 +66,23 @@ func overlayClass(err error) error {
 // mounted and live is adopted with zero RPC — the holder kept serving it
 // across a daemon restart; the adoption stat is bounded (probeMount), so a
 // wedged mirror reads not-adoptable and routes to the holder instead of
-// hanging the caller. Otherwise the holder is spawned if needed and asked
-// to mount (ensure-mounted holder-side: a mirror the holder still holds but
-// that died is remounted). A dead HOLDER's carcass — accountDir still a
-// mountpoint but absent from the fresh holder's registry — fails with
-// ErrForeignMount by design (the holder never stacks mounts): callers must
-// Teardown(base, accountDir) to clear it, then retry Setup.
+// hanging the caller. Adoption additionally requires the local deep probe
+// (overlay.DeepProbeWithin, bounded) to pass or report ErrProbeMissing — an
+// old holder's mirror predating the probe file carries no verdict and is
+// adopted as before, but a deep-wedged mirror (shallow-alive, bulk reads
+// hang) must never be adopted: it falls through to the Mount RPC so the
+// deep-aware holder remounts it via forced teardown. Otherwise the holder is
+// spawned if needed and asked to mount (ensure-mounted holder-side: a mirror
+// the holder still holds but that died is remounted). A dead HOLDER's carcass
+// — accountDir still a mountpoint but absent from the fresh holder's registry
+// — fails with ErrForeignMount by design (the holder never stacks mounts):
+// callers must Teardown(base, accountDir) to clear it, then retry Setup.
 func (p *RemoteProvider) Setup(base, accountDir string) error {
 	if st, ok := probeMount(base, accountDir); ok && st.mounted && st.alive {
-		return nil
+		if err := deepRead(accountDir); err == nil || errors.Is(err, overlay.ErrProbeMissing) {
+			return nil
+		}
+		// Deep-wedged: fall through to the Mount RPC for the remount.
 	}
 	if err := EnsureRunning(p.Socket, p.LogPath, p.spawnTimeout()); err != nil {
 		return fmt.Errorf("mount %s: %w", accountDir, err)

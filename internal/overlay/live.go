@@ -105,14 +105,48 @@ func MountAlive(base, accountDir string) bool {
 	return err == nil
 }
 
+// mountAliveFn seams MountAlive so waitMounted and MountAliveWithin are
+// unit-testable without the fuse build tag. Tests swap it and restore via
+// t.Cleanup.
+var mountAliveFn = MountAlive
+
+// aliveProbes joins the package's own bounded mount-liveness probes. Its own
+// instance, keyed like ownProbes by the account dir but never shared with it:
+// a MountAlive verdict must never join (or be answered by) a plain Mounted
+// probe of the same dir.
+var aliveProbes StatProbes[bool]
+
+// MountAliveWithin reports MountAlive(base, accountDir) bounded by the
+// package's stat-probe timeout. A probe that does not answer within the bound
+// reads NOT alive — unlike MountedWithin there is no ok return, because every
+// liveness caller fails the same direction: a mirror that cannot answer a 2s
+// stat is exactly the dead-or-wedged mount the check exists to flag, and
+// reading it as alive would let a wedged mirror pass for healthy.
+func MountAliveWithin(base, accountDir string) bool {
+	alive, ok := aliveProbes.Do(accountDir, statProbeTimeout, func() bool {
+		return mountAliveFn(base, accountDir)
+	})
+	return ok && alive
+}
+
+// mountPollInterval is waitMounted's probe cadence. A var, not a const, so
+// tests can shrink it.
+var mountPollInterval = 100 * time.Millisecond
+
 // waitMounted polls until base's contents are visible through accountDir.
+// Probe-first, then deadline, then sleep: the ordering guarantees one final
+// probe at/after the deadline, so a mount that lands while the last sleep
+// straddles the deadline is kept rather than reported dead (and a timeout of
+// zero probes exactly once).
 func waitMounted(base, accountDir string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if MountAlive(base, accountDir) {
+	for {
+		if mountAliveFn(base, accountDir) {
 			return true
 		}
-		time.Sleep(100 * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(mountPollInterval)
 	}
-	return false
 }

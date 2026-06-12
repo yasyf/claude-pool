@@ -50,11 +50,26 @@ type Request struct {
 // truth, not registry membership: dir is currently a mountpoint (the
 // device-id check, overlay.Mounted) AND base's contents are visible through
 // it (overlay.MountAlive). Either half alone can lie — a dead mirror exposes
-// the underlying dir, whose leftover entries can shadow base's.
+// the underlying dir, whose leftover entries can shadow base's. Live also
+// folds in the holder's cached deep-probe verdict (a deep-wedged mirror reads
+// Live=false), so old daemons need nothing to be protected from a partial
+// wedge — they already key selection off Live.
 type MountInfo struct {
 	Dir  string `json:"dir"`
 	Base string `json:"base"`
 	Live bool   `json:"live"`
+	// Wedged reports the partial-wedge signature: the mirror answers the
+	// shallow liveness stats (mountpoint present, base visible) but fails the
+	// deep bulk-read probe — serving metadata while hanging large reads.
+	// Always false when Live is true.
+	Wedged bool `json:"wedged,omitempty"`
+	// Epoch increments each time this holder (re)mounts Dir, starting at 1
+	// for the holder's first mount of it. Zero means the holder predates the
+	// field.
+	Epoch uint64 `json:"epoch,omitempty"`
+	// MountedAt is the unix-seconds timestamp of the current mount of Dir.
+	// Zero means the holder predates the field.
+	MountedAt int64 `json:"mounted_at,omitempty"`
 }
 
 // Error classes, sent alongside Error so drivers classify failures without
@@ -67,6 +82,13 @@ const (
 	// one-time macOS "Network Volumes" TCC grant. The Error text carries the
 	// user-facing walkthrough.
 	ClassTCC = "tcc"
+	// ClassMountTimeout: the mount was issued but did not come live within
+	// the holder's bounded wait, in a process whose "Network Volumes" grant
+	// is already proven by an earlier live mount or probe — NOT the TCC
+	// condition. Transient; drivers retry and never surface TCC guidance.
+	// Drivers that predate this class degrade to ErrUnknownClass, which the
+	// additive policy routes to retry as well.
+	ClassMountTimeout = "mount-timeout"
 	// ClassMountFailed: the mount failed outright.
 	ClassMountFailed = "mount-failed"
 	// ClassWedged: the unmount did not take; the dir is still a mountpoint

@@ -79,6 +79,11 @@ type HolderStatus struct {
 	Version string `json:"version"`
 	// Mounts counts the live mirrors in the holder's last List.
 	Mounts int `json:"mounts"`
+	// WedgedMounts counts the partial-wedge mirrors in the holder's last
+	// List: mounts that answer shallow metadata stats but hang bulk reads
+	// (MountInfo.Wedged). Supervision remounts them automatically; status and
+	// doctor surface them so already-wedged sessions get relaunched. Additive.
+	WedgedMounts int `json:"wedged_mounts,omitempty"`
 	// Skewed means a reachable holder runs a different build than the daemon.
 	Skewed bool `json:"skewed"`
 	// TCCError carries the latest mount-blocked-pending-TCC guidance (the

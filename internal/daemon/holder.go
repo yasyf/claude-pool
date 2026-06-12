@@ -25,6 +25,14 @@ const (
 	spawnBackoffBase = 10 * time.Second
 	spawnBackoffCap  = 10 * time.Minute
 
+	// remountBackoffBase/remountBackoffCap bound the per-row remount backoff
+	// for fuse rows the holder cannot vouch for (see retryUnvouchedFuseRows):
+	// consecutive failed heals double the wait 10s → 20s → … capped at 2
+	// minutes. The cap sits deliberately under the 180s scheduler period —
+	// supervision must never be the slower recovery path.
+	remountBackoffBase = 10 * time.Second
+	remountBackoffCap  = 2 * time.Minute
+
 	// defaultHolderGoneWait bounds waiting for a retiring holder to release
 	// its socket after acking Shutdown — the holder's own sweep runs under a
 	// 60s op deadline and the client's Shutdown timeout is 65s, so this sits
@@ -32,17 +40,24 @@ const (
 	defaultHolderGoneWait = 70 * time.Second
 )
 
+// backoffAfter returns the wait after `failures` consecutive failures: base
+// doubling per failure, capped at limit. Zero or negative failure counts
+// never shrink below base.
+func backoffAfter(failures int, base, limit time.Duration) time.Duration {
+	d := base
+	for i := 1; i < failures && d < limit; i++ {
+		d *= 2
+	}
+	if d > limit {
+		d = limit
+	}
+	return d
+}
+
 // spawnBackoff returns the wait after `failures` consecutive holder-spawn
 // failures: spawnBackoffBase doubling per failure, capped at spawnBackoffCap.
 func spawnBackoff(failures int) time.Duration {
-	d := spawnBackoffBase
-	for i := 1; i < failures && d < spawnBackoffCap; i++ {
-		d *= 2
-	}
-	if d > spawnBackoffCap {
-		d = spawnBackoffCap
-	}
-	return d
+	return backoffAfter(failures, spawnBackoffBase, spawnBackoffCap)
 }
 
 // supervisor is superviseHolder's tick-local state: respawn backoff
@@ -58,6 +73,18 @@ type supervisor struct {
 	// produced when it differs from ours (see noteSpawnedVersion): the
 	// reverse-skew steady state superviseTick must never re-replace.
 	spawnedSkew string
+	// rowRetry is the per-account remount backoff ledger for fuse rows the
+	// holder cannot vouch for (see retryUnvouchedFuseRows). Lazily
+	// initialized; like the rest of supervisor, only the supervise goroutine
+	// touches it — no lock.
+	rowRetry map[int]rowRetryState
+}
+
+// rowRetryState is one fuse row's remount-backoff bookkeeping in
+// supervisor.rowRetry.
+type rowRetryState struct {
+	failures int       // consecutive failed heal attempts
+	retryAt  time.Time // backoff: earliest next heal attempt
 }
 
 // superviseHolder watches the detached mount holder until ctx is cancelled:
@@ -106,10 +133,12 @@ func (s *Server) superviseTick(ctx context.Context) {
 		// Steady state: healthy at our version, or at the version our own
 		// spawns produce (a newer on-disk binary under an older daemon — see
 		// noteSpawnedVersion; replacing would mint the same version again,
-		// sweeping every mirror each tick forever). Reset the backoff and
-		// clear any stale spawn-error/deferral surface.
+		// sweeping every mirror each tick forever). Reset the backoff, clear
+		// any stale spawn-error/deferral surface, and retry whatever fuse
+		// rows this healthy holder still cannot vouch for.
 		s.resetSpawnBackoff()
 		s.sup.lastDefer = ""
+		s.retryUnvouchedFuseRows(ctx)
 		return
 	}
 	s.replaceSkewedHolder(ctx)
@@ -441,6 +470,108 @@ func (s *Server) remountFuseRows(ctx context.Context, accts []store.Account) {
 		}
 		s.endPoll(a.ID)
 	}
+}
+
+// retryUnvouchedFuseRows is the steady-state heal loop: on every supervision
+// tick with a healthy settled holder, each fuse row the holder cache cannot
+// vouch for — a remount that failed during a revive, a TCC-blocked row
+// waiting on its grant, or a mirror the holder reports present-but-dead,
+// deep-wedged or plain dead — is retried under per-account exponential backoff
+// (remountBackoffBase doubling to remountBackoffCap, deliberately under the
+// 180s scheduler period). Each attempt runs under the scheduler's poll-claim
+// discipline: a claimed account is skipped WITHOUT advancing its backoff —
+// skipping is not failing — and its row is re-read under the claim so a row
+// converted in the gap is left alone. A successful heal (by this loop or
+// anyone else — ready() covers mounts established by any path) deletes the
+// row's ledger entry; rows that left the fuse set are pruned after the pass.
+// reviveHolder's one-shot remountFuseRows stays separate: a revived holder's
+// rows get one immediate sweep there, and the first steady tick afterwards
+// lands here ~10s later for anything it could not finish.
+func (s *Server) retryUnvouchedFuseRows(ctx context.Context) {
+	fuse, err := s.fuseAccounts()
+	if err != nil {
+		s.log.Printf("holder supervision: list accounts: %v", err)
+		return
+	}
+	// One session scan per pass, taken lazily on the first held-dead row —
+	// the count only flavors the held-dead log line.
+	var sessions []procscan.Session
+	scanned := false
+	now := time.Now()
+	inPass := make(map[int]bool, len(fuse))
+	for _, a := range fuse {
+		inPass[a.ID] = true
+		if ctx.Err() != nil {
+			return
+		}
+		if s.holder.ready(a.ConfigDir) {
+			delete(s.sup.rowRetry, a.ID)
+			continue
+		}
+		if now.Before(s.sup.rowRetry[a.ID].retryAt) {
+			continue
+		}
+		if !s.beginPoll(a.ID) {
+			continue // skip-don't-race; the owner leaves it consistent
+		}
+		fresh, err := s.m.Store.GetAccount(a.ID)
+		switch {
+		case err != nil:
+			s.log.Printf("acct-%02d re-read row before remount: %v", a.ID, err)
+			s.advanceRowBackoff(a.ID)
+		case fresh.OverlayKind != string(overlay.KindFuse):
+			// Converted while this pass's listing aged: its owner left it
+			// consistent, and a non-fuse row needs no remount ledger.
+			delete(s.sup.rowRetry, a.ID)
+		default:
+			if dead, wedged := s.holder.heldDead(a.ConfigDir); dead {
+				if !scanned {
+					scanned = true
+					ses, serr := s.scan()
+					if serr != nil {
+						s.log.Printf("holder supervision: session scan: %v", serr)
+					}
+					sessions = ses
+				}
+				// The holder's deep-probe verdict picks the copy: a deep wedge
+				// serves metadata but hangs reads, while a plain-dead registered
+				// mirror (an out-of-band `umount -f`, a dead fuse-t worker, or
+				// an old holder that cannot deep-probe) fails reads outright.
+				// The relaunch guidance holds in both shapes — sessions on the
+				// old mirror are orphaned by the remount either way.
+				desc := "dead mirror (fails reads outright; unmounted out of band or its fuse worker died?)"
+				if wedged {
+					desc = "wedged mirror (serves metadata but hangs reads)"
+				}
+				s.log.Printf("acct-%02d %s; remounting under %d live session(s) — relaunch them",
+					a.ID, desc, procscan.CountByConfigDir(sessions, a.ConfigDir))
+			}
+			if s.healFuse(fresh) == healMounted {
+				delete(s.sup.rowRetry, a.ID)
+			} else {
+				s.advanceRowBackoff(a.ID)
+			}
+		}
+		s.endPoll(a.ID)
+	}
+	for id := range s.sup.rowRetry {
+		if !inPass[id] {
+			delete(s.sup.rowRetry, id)
+		}
+	}
+}
+
+// advanceRowBackoff books one failed heal attempt against account id's
+// remount ledger: the failure count grows and the next attempt waits out the
+// doubled window.
+func (s *Server) advanceRowBackoff(id int) {
+	if s.sup.rowRetry == nil {
+		s.sup.rowRetry = make(map[int]rowRetryState)
+	}
+	st := s.sup.rowRetry[id]
+	st.failures++
+	st.retryAt = time.Now().Add(backoffAfter(st.failures, remountBackoffBase, remountBackoffCap))
+	s.sup.rowRetry[id] = st
 }
 
 // remountReplacedRows heals every fuse row after a holder replacement, under

@@ -147,11 +147,16 @@ func holderFooter(h *daemon.HolderStatus) string {
 	if h == nil {
 		return ""
 	}
+	// Priority: TCC and a failing respawn block the holder entirely and need
+	// the user; a wedge is narrower (N mirrors, supervision remounts them)
+	// and only asks for a doctor run; skew is cosmetic.
 	switch {
 	case h.TCCError != "":
 		return warnStyle.Render("mount holder: TCC blocked — " + h.TCCError)
 	case h.SpawnError != "":
 		return warnStyle.Render("mount holder: respawn failing — " + h.SpawnError)
+	case h.WedgedMounts > 0:
+		return warnStyle.Render(fmt.Sprintf("mount holder: %s — run `ccp doctor`", plural(h.WedgedMounts, "wedged mirror")))
 	case h.Skewed:
 		return warnStyle.Render(fmt.Sprintf("mount holder %s skewed; will be replaced when idle", h.Version))
 	default:

@@ -24,10 +24,19 @@ const holderRefreshFloor = 5 * time.Second
 // for a fuse dir (see refreshIfStale). Respawn/backoff policy lives in
 // superviseHolder; this is only the cache it keys on.
 type holderState struct {
-	mu          sync.Mutex
-	healthy     bool
-	version     string
-	mounts      map[string]bool // dir -> Live, per the holder's last List
+	mu      sync.Mutex
+	healthy bool
+	version string
+	mounts  map[string]bool // dir -> Live, per the holder's last List
+	// wedged, epochs, and mountedAt mirror the holder's per-dir deep-probe
+	// verdict, mount epoch, and mount time from the last List, keyed like
+	// mounts (one entry per registered mount). A zero Epoch/MountedAt on the
+	// wire means the holder predates the fields and stores as 0/zero-time
+	// here. Like mounts they describe a reachable holder's registry, so they
+	// are replaced wholesale by refresh and cleared by markUnhealthy.
+	wedged      map[string]bool
+	epochs      map[string]uint64
+	mountedAt   map[string]time.Time
 	refreshedAt time.Time
 	// bases mirrors the holder's dir -> base registry from the last
 	// successful List. Unlike mounts it SURVIVES markUnhealthy: it exists so
@@ -83,9 +92,17 @@ func (h *holderState) refresh(c *mountd.Client) {
 	}
 	m := make(map[string]bool, len(mounts))
 	b := make(map[string]string, len(mounts))
+	w := make(map[string]bool, len(mounts))
+	e := make(map[string]uint64, len(mounts))
+	at := make(map[string]time.Time, len(mounts))
 	for _, mi := range mounts {
 		m[mi.Dir] = mi.Live
 		b[mi.Dir] = mi.Base
+		w[mi.Dir] = mi.Wedged
+		e[mi.Dir] = mi.Epoch
+		if mi.MountedAt != 0 {
+			at[mi.Dir] = time.Unix(mi.MountedAt, 0)
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -96,6 +113,7 @@ func (h *holderState) refresh(c *mountd.Client) {
 		return
 	}
 	h.healthy, h.version, h.mounts, h.bases, h.refreshedAt = true, ver, m, b, time.Now()
+	h.wedged, h.epochs, h.mountedAt = w, e, at
 	if len(m) > 0 {
 		h.everMounted = true
 	}
@@ -175,6 +193,7 @@ func (h *holderState) markUnhealthy() {
 	h.mu.Lock()
 	h.gen++
 	h.healthy, h.version, h.mounts, h.refreshedAt = false, "", nil, time.Now()
+	h.wedged, h.epochs, h.mountedAt = nil, nil, nil
 	h.mu.Unlock()
 }
 
@@ -183,6 +202,27 @@ func (h *holderState) ready(dir string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.healthy && h.mounts[dir]
+}
+
+// heldDead reports the held-dead signature for dir: a healthy holder's
+// last List NAMES the dir (the holder's registry owns a mount there) yet
+// reports it not Live — serving registry metadata while the mirror fails its
+// liveness probes. Present-but-dead is the precise discriminator: refresh
+// stores exactly one mounts entry per List row, and the holder registers a
+// mount only after a successful Setup (setupAndRegister never records a
+// failed one), so a TCC-blocked or never-mounted dir is ABSENT from the map
+// and reads false here — heldDead can never hot-loop a TCC-blocked row.
+// wedged is the holder's deep-probe verdict for a dead dir — it splits the
+// two dead shapes: a deep wedge serves metadata but hangs reads, while a
+// plain-dead registered mirror (an out-of-band `umount -f`, a dead fuse-t
+// worker, or an old holder that cannot deep-probe and never sets Wedged)
+// fails reads outright.
+func (h *holderState) heldDead(dir string) (dead, wedged bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	live, present := h.mounts[dir]
+	dead = h.healthy && present && !live
+	return dead, dead && h.wedged[dir]
 }
 
 // noteMounted records a mirror the daemon just established or adopted without
@@ -199,6 +239,10 @@ func (h *holderState) noteMounted(dir string) {
 		h.mounts = map[string]bool{}
 	}
 	h.mounts[dir] = true
+	// A fresh live mount supersedes the last List's wedge verdict for the dir
+	// (Wedged is always false when Live is true). Epoch and mount time are
+	// NOT fabricated — the next refresh installs the holder's polled truth.
+	delete(h.wedged, dir)
 	h.everMounted = true
 	h.tccErr = ""
 }
@@ -212,6 +256,9 @@ func (h *holderState) noteUnmounted(dir string) {
 	h.gen++
 	delete(h.mounts, dir)
 	delete(h.bases, dir)
+	delete(h.wedged, dir)
+	delete(h.epochs, dir)
+	delete(h.mountedAt, dir)
 	h.mu.Unlock()
 }
 
@@ -235,11 +282,18 @@ func (h *holderState) wireStatus() *HolderStatus {
 			live++
 		}
 	}
+	wedged := 0
+	for _, w := range h.wedged {
+		if w {
+			wedged++
+		}
+	}
 	return &HolderStatus{
-		Version:    h.version,
-		Mounts:     live,
-		Skewed:     h.healthy && h.version != "" && h.version != version.String(),
-		TCCError:   h.tccErr,
-		SpawnError: h.spawnErr,
+		Version:      h.version,
+		Mounts:       live,
+		WedgedMounts: wedged,
+		Skewed:       h.healthy && h.version != "" && h.version != version.String(),
+		TCCError:     h.tccErr,
+		SpawnError:   h.spawnErr,
 	}
 }

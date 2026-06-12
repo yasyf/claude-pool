@@ -251,6 +251,81 @@ func TestHolderStateRefreshDiscardsSnapshotRacedByInPlaceUpdate(t *testing.T) {
 	})
 }
 
+// TestHolderStateHeldDead pins the held-dead discriminator on the cache:
+// held-dead is PRESENT in the holder's last List but not Live, and the wedged
+// return relays the holder's deep-probe verdict for dead dirs only. Driven
+// through refresh so the matrix verifies how List rows are actually stored —
+// one mounts entry per registered mount, so a TCC-blocked or never-mounted
+// dir (which the holder never registers) is absent and can never read
+// held-dead.
+func TestHolderStateHeldDead(t *testing.T) {
+	cases := map[string]struct {
+		mounts     []mountd.MountInfo
+		unhealthy  bool
+		wantDead   bool
+		wantWedged bool
+	}{
+		"present, dead, and deep-wedged is the wedge signature": {
+			mounts:     []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: false, Wedged: true}},
+			wantDead:   true,
+			wantWedged: true,
+		},
+		"present and dead without a wedge verdict is plain dead": {
+			// An out-of-band `umount -f`, a dead fuse-t worker, or an old
+			// holder that predates the deep probe and never sets Wedged.
+			mounts:   []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: false}},
+			wantDead: true,
+		},
+		"present and live is healthy": {
+			mounts: []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: true}},
+		},
+		"absent dir (TCC-blocked or never mounted) is not held-dead": {
+			mounts: []mountd.MountInfo{{Dir: "/pool/other", Base: "/b", Live: false}},
+		},
+		"unreachable holder never reads held-dead": {
+			mounts:    []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: false, Wedged: true}},
+			unhealthy: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var h holderState
+			h.refresh(mountd.NewClient(startCannedHolder(t, tc.mounts)))
+			if tc.unhealthy {
+				h.markUnhealthy()
+			}
+			dead, wedged := h.heldDead("/pool/acct-01")
+			if dead != tc.wantDead || wedged != tc.wantWedged {
+				t.Fatalf("heldDead = (%v, %v), want (%v, %v)", dead, wedged, tc.wantDead, tc.wantWedged)
+			}
+		})
+	}
+}
+
+// TestWireStatusCountsWedged pins the WedgedMounts surface: refresh installs
+// the holder's per-dir wedge verdicts and wireStatus counts them; a fresh
+// mount supersedes its dir's verdict in place, and an unreachable holder
+// counts zero.
+func TestWireStatusCountsWedged(t *testing.T) {
+	var h holderState
+	h.refresh(mountd.NewClient(startCannedHolder(t, []mountd.MountInfo{
+		{Dir: "/pool/a", Base: "/b", Live: false, Wedged: true},
+		{Dir: "/pool/b", Base: "/b", Live: false, Wedged: true},
+		{Dir: "/pool/c", Base: "/b", Live: true},
+	})))
+	if got := h.wireStatus().WedgedMounts; got != 2 {
+		t.Fatalf("WedgedMounts = %d, want 2 of 3", got)
+	}
+	h.noteMounted("/pool/a")
+	if got := h.wireStatus().WedgedMounts; got != 1 {
+		t.Fatalf("WedgedMounts after a remount of one = %d, want 1", got)
+	}
+	h.markUnhealthy()
+	if got := h.wireStatus().WedgedMounts; got != 0 {
+		t.Fatalf("WedgedMounts after markUnhealthy = %d, want 0", got)
+	}
+}
+
 // TestHolderStateNoteMounted pins the fresh-mount fast path: a successful
 // mount is trusted before any refresh, and it clears recorded TCC guidance
 // (the grant is per holder process, so one live mount proves it landed).

@@ -1,16 +1,20 @@
 package procscan
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
 
-const sample = `  501 /Users/me/.local/bin/claude --session-id abc FOO=bar CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-01 PATH=/usr/bin
-  777 claude --dangerously-skip-permissions PATH=/usr/bin LANG=en_US.UTF-8
-  888 fish -c claude CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-02
-  999 /usr/bin/node /some/script.js CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-03
- 1010 /Users/me/.local/bin/claude CLAUDE_CONFIG_DIR=/Users/me/.claude
+const sample = `  501 01:02:03 /Users/me/.local/bin/claude --session-id abc FOO=bar CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-01 PATH=/usr/bin
+  777    05:09 claude --dangerously-skip-permissions PATH=/usr/bin LANG=en_US.UTF-8
+  888 02:03:04 fish -c claude CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-02
+  999 00:01 /usr/bin/node /some/script.js CLAUDE_CONFIG_DIR=/Users/me/.cc-pool/accounts/acct-03
+ 1010 banana /Users/me/.local/bin/claude CLAUDE_CONFIG_DIR=/Users/me/.claude
 `
 
 func TestParse(t *testing.T) {
-	got := parse(sample)
+	got := parse(sample, time.Now())
 	// Expect: pid 501 (acct-01), pid 777 (default, no env), pid 1010 (~/.claude).
 	// pid 888 is `fish` (argv0 != claude). pid 999 is node. Both excluded.
 	if len(got) != 3 {
@@ -38,7 +42,7 @@ func TestParse(t *testing.T) {
 }
 
 func TestCountByConfigDir(t *testing.T) {
-	sessions := parse(sample)
+	sessions := parse(sample, time.Now())
 	cases := map[string]struct {
 		configDir string
 		want      int
@@ -52,5 +56,107 @@ func TestCountByConfigDir(t *testing.T) {
 		if n := CountByConfigDir(sessions, tc.configDir); n != tc.want {
 			t.Errorf("%s: CountByConfigDir(%q) = %d, want %d", name, tc.configDir, n, tc.want)
 		}
+	}
+}
+
+// TestParseStartedAt pins StartedAt = now - etime, and the deliberate
+// soft-fail: a malformed etime yields the zero StartedAt but the session is
+// still returned — session detection is load-bearing, staleness is advisory.
+func TestParseStartedAt(t *testing.T) {
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	got := parse(sample, now)
+	byPID := map[int]Session{}
+	for _, s := range got {
+		byPID[s.PID] = s
+	}
+	if want := now.Add(-(1*time.Hour + 2*time.Minute + 3*time.Second)); !byPID[501].StartedAt.Equal(want) {
+		t.Errorf("pid 501 StartedAt = %v, want %v", byPID[501].StartedAt, want)
+	}
+	if want := now.Add(-(5*time.Minute + 9*time.Second)); !byPID[777].StartedAt.Equal(want) {
+		t.Errorf("pid 777 StartedAt = %v, want %v", byPID[777].StartedAt, want)
+	}
+	stale, ok := byPID[1010]
+	if !ok {
+		t.Fatal("pid 1010 (malformed etime) must still be returned")
+	}
+	if !stale.StartedAt.IsZero() {
+		t.Errorf("pid 1010 StartedAt = %v, want zero for malformed etime", stale.StartedAt)
+	}
+}
+
+func TestParseEtime(t *testing.T) {
+	cases := map[string]struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		"mm:ss":                        {in: "01:23", want: 1*time.Minute + 23*time.Second},
+		"zero":                         {in: "00:00", want: 0},
+		"hh:mm:ss":                     {in: "13:01:23", want: 13*time.Hour + 1*time.Minute + 23*time.Second},
+		"dd-hh:mm:ss":                  {in: "2-03:04:05", want: 51*time.Hour + 4*time.Minute + 5*time.Second},
+		"bare seconds":                 {in: "45", wantErr: true},
+		"empty":                        {in: "", wantErr: true},
+		"garbage":                      {in: "banana", wantErr: true},
+		"negative minutes":             {in: "-1:23", wantErr: true},
+		"negative seconds":             {in: "1:-23", wantErr: true},
+		"days without hours":           {in: "1-2:3", wantErr: true},
+		"seconds out of range":         {in: "01:60", wantErr: true},
+		"minutes out of range":         {in: "60:00", wantErr: true},
+		"hours out of range with days": {in: "1-24:00:00", wantErr: true},
+		"four fields":                  {in: "1:2:3:4", wantErr: true},
+		"internal spaces":              {in: "01: 23", wantErr: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := parseEtime(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseEtime(%q) = %v, want error", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseEtime(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseEtime(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScanPopulatesStartedAt drives Scan through the psOutput seam: parsed
+// etimes anchor StartedAt near scan time, a malformed etime keeps its session
+// with a zero StartedAt, and a ps failure is Scan's error, not a silent nil.
+func TestScanPopulatesStartedAt(t *testing.T) {
+	orig := psOutput
+	t.Cleanup(func() { psOutput = orig })
+
+	psOutput = func() ([]byte, error) { return []byte(sample), nil }
+	before := time.Now()
+	got, err := Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	if len(got) != 3 {
+		t.Fatalf("got %d sessions, want 3: %+v", len(got), got)
+	}
+	byPID := map[int]Session{}
+	for _, s := range got {
+		byPID[s.PID] = s
+	}
+	elapsed := 1*time.Hour + 2*time.Minute + 3*time.Second
+	lo, hi := before.Add(-elapsed), after.Add(-elapsed)
+	if sa := byPID[501].StartedAt; sa.Before(lo) || sa.After(hi) {
+		t.Errorf("pid 501 StartedAt = %v, want within [%v, %v]", sa, lo, hi)
+	}
+	if sa := byPID[1010].StartedAt; !sa.IsZero() {
+		t.Errorf("pid 1010 StartedAt = %v, want zero for malformed etime", sa)
+	}
+
+	psOutput = func() ([]byte, error) { return nil, errors.New("ps exploded") }
+	if _, err := Scan(); err == nil {
+		t.Fatal("Scan must propagate a ps failure")
 	}
 }

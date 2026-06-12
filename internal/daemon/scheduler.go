@@ -27,14 +27,7 @@ const (
 
 // rlBackoff returns the backoff duration for a given consecutive-429 streak.
 func rlBackoff(streak int) time.Duration {
-	d := rateLimitBackoffBase
-	for i := 1; i < streak && d < rateLimitBackoffCap; i++ {
-		d *= 2
-	}
-	if d > rateLimitBackoffCap {
-		d = rateLimitBackoffCap
-	}
-	return d
+	return backoffAfter(streak, rateLimitBackoffBase, rateLimitBackoffCap)
 }
 
 // scheduler runs the periodic usage poll + idle-only refresh + session

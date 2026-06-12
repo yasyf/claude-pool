@@ -293,6 +293,28 @@ func TestSpawnBackoffDoublesAndCaps(t *testing.T) {
 	}
 }
 
+// TestRemountBackoffDoublesAndCaps pins backoffAfter under the per-row
+// remount constants: base-doubling per failure, capped at 2 minutes —
+// deliberately under the 180s scheduler period, so supervision is never the
+// slower recovery path.
+func TestRemountBackoffDoublesAndCaps(t *testing.T) {
+	cases := map[int]time.Duration{
+		1:  remountBackoffBase, // first failure -> base
+		2:  20 * time.Second,   // doubled
+		3:  40 * time.Second,   // doubled again
+		4:  80 * time.Second,   // still under the cap
+		5:  remountBackoffCap,  // 160s capped to 2min
+		12: remountBackoffCap,  // stays capped
+		0:  remountBackoffBase, // degenerate input never shrinks below base
+		-1: remountBackoffBase, // negative input never shrinks below base
+	}
+	for failures, want := range cases {
+		if got := backoffAfter(failures, remountBackoffBase, remountBackoffCap); got != want {
+			t.Errorf("backoffAfter(%d, base, cap) = %v, want %v", failures, got, want)
+		}
+	}
+}
+
 // TestSuperviseRespawnConditions pins when a dead holder is respawned at all:
 // only when fuse rows (or mounts a holder previously served) need one, and
 // never while a holder is healthy at our version.
@@ -524,6 +546,227 @@ func TestRemountFuseRowsReReadsRow(t *testing.T) {
 		t.Fatal("remount leaked its poll claim")
 	}
 	s.endPoll(1)
+}
+
+// mountTimeoutChain is the exact error chain RemoteProvider.Setup produces
+// for a mount-up timeout under a proven "Network Volumes" grant: the
+// provider's wrap around overlayClass's dual-wrap of the wire sentinel.
+func mountTimeoutChain() error {
+	return fmt.Errorf("mount: %w", fmt.Errorf("%w: %w", overlay.ErrMountTimeout, mountd.ErrMountTimeout))
+}
+
+// TestSuperviseTickRetriesUnvouchedRowWithBackoff pins the steady-state heal
+// loop: a fuse row a healthy holder cannot vouch for is retried each tick
+// under per-row backoff — attempts advance the failure count, the window
+// gates the next tick, and a successful heal vouches and drops the ledger
+// entry.
+func TestSuperviseTickRetriesUnvouchedRowWithBackoff(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil) // healthy at our version, vouching for nothing
+	fake.setupErr = mountTimeoutChain()
+
+	// First steady tick: one attempt, booked as one failure with a window.
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 1 {
+		t.Fatalf("setups after the first tick = %d, want 1", fake.setupCount())
+	}
+	if st := s.sup.rowRetry[1]; st.failures != 1 || !st.retryAt.After(time.Now()) {
+		t.Fatalf("rowRetry[1] = %+v, want one failure with a future retryAt", st)
+	}
+
+	// Immediately ticking again sits inside the window: no attempt.
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 1 {
+		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
+	}
+
+	// Window rewound: the retry runs and the failure count advances.
+	st := s.sup.rowRetry[1]
+	st.retryAt = time.Now().Add(-time.Second)
+	s.sup.rowRetry[1] = st
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 2 || s.sup.rowRetry[1].failures != 2 {
+		t.Fatalf("after the rewound window: setups=%d failures=%d, want 2/2",
+			fake.setupCount(), s.sup.rowRetry[1].failures)
+	}
+
+	// Failure cleared: the next windowed attempt mounts, vouches, and drops
+	// the ledger entry.
+	fake.setupErr = nil
+	st = s.sup.rowRetry[1]
+	st.retryAt = time.Now().Add(-time.Second)
+	s.sup.rowRetry[1] = st
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 3 {
+		t.Fatalf("setups after clearing the failure = %d, want 3", fake.setupCount())
+	}
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("healed row not vouched for in the holder cache")
+	}
+	if _, ok := s.sup.rowRetry[1]; ok {
+		t.Fatal("successful heal left a rowRetry entry")
+	}
+}
+
+// TestSuperviseTickRetrySkipsClaimedAccount pins the skip-don't-race
+// discipline on the steady-state loop: an eligible row someone else owns is
+// neither attempted nor penalized — a skip is not a failure — and the next
+// tick after release retries it.
+func TestSuperviseTickRetrySkipsClaimedAccount(t *testing.T) {
+	s, _, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = mountTimeoutChain()
+	// An eligible ledger entry whose window has passed…
+	s.sup.rowRetry = map[int]rowRetryState{1: {failures: 2, retryAt: time.Now().Add(-time.Second)}}
+	// …on an account someone else owns.
+	if !s.beginPoll(1) {
+		t.Fatal("beginPoll failed on a free account")
+	}
+
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 0 {
+		t.Fatal("supervisor raced the claim owner")
+	}
+	if got := s.sup.rowRetry[1].failures; got != 2 {
+		t.Fatalf("failures after a skip = %d, want 2 unchanged", got)
+	}
+
+	// Released: the still-open window admits the next tick's attempt.
+	s.endPoll(1)
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 1 {
+		t.Fatalf("setups after release = %d, want 1", fake.setupCount())
+	}
+	if got := s.sup.rowRetry[1].failures; got != 3 {
+		t.Fatalf("failures after a real attempt = %d, want 3", got)
+	}
+}
+
+// TestSuperviseTickRetryLeavesConvertedRowAndPrunes pins the ledger hygiene:
+// a row that earned a retry entry while fuse and then converted to symlink is
+// never healed as fuse, and its entry is pruned from the ledger.
+func TestSuperviseTickRetryLeavesConvertedRowAndPrunes(t *testing.T) {
+	s, _, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	// The row earned a ledger entry while fuse…
+	s.sup.rowRetry = map[int]rowRetryState{1: {failures: 1, retryAt: time.Now().Add(-time.Second)}}
+	// …then converted away.
+	flipToSymlink(t, s, 1)
+
+	s.superviseTick(t.Context())
+
+	if fake.setupCount() != 0 {
+		t.Fatal("a converted row was healed as fuse")
+	}
+	if len(s.sup.rowRetry) != 0 {
+		t.Fatalf("rowRetry = %v, want the converted row's entry pruned", s.sup.rowRetry)
+	}
+}
+
+// TestSuperviseTickRetriesTCCBlockedRowUnderBackoff pins the improved
+// post-grant story: a TCC-blocked row rides the same backoff — attempted,
+// bounded, never hot — with the guidance surfaced on the wire, and the first
+// successful mount after the grant clears it via noteMounted.
+func TestSuperviseTickRetriesTCCBlockedRowUnderBackoff(t *testing.T) {
+	s, dirs, fake, _ := newSuperviseServer(t)
+	flipToFuse(t, s, 1)
+	s.holderSocket = startCannedHolder(t, nil)
+	fake.setupErr = fmt.Errorf("mount: %w", overlay.ErrMountNotLive)
+
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 1 || s.sup.rowRetry[1].failures != 1 {
+		t.Fatalf("after the first tick: setups=%d failures=%d, want 1/1",
+			fake.setupCount(), s.sup.rowRetry[1].failures)
+	}
+	if got := s.holder.wireStatus().TCCError; got == "" {
+		t.Fatal("TCC guidance not surfaced for the blocked row")
+	}
+	// Inside the window: bounded, not hot.
+	s.superviseTick(t.Context())
+	if fake.setupCount() != 1 {
+		t.Fatalf("setups inside the backoff window = %d, want still 1", fake.setupCount())
+	}
+
+	// Grant landed: the next windowed attempt mounts, vouches, and clears the
+	// guidance through noteMounted.
+	fake.setupErr = nil
+	st := s.sup.rowRetry[1]
+	st.retryAt = time.Now().Add(-time.Second)
+	s.sup.rowRetry[1] = st
+	s.superviseTick(t.Context())
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("granted row not mounted and vouched for")
+	}
+	if got := s.holder.wireStatus().TCCError; got != "" {
+		t.Fatalf("TCCError after the successful mount = %q, want cleared via noteMounted", got)
+	}
+	if _, ok := s.sup.rowRetry[1]; ok {
+		t.Fatal("successful heal left a rowRetry entry")
+	}
+}
+
+// TestSuperviseTickRemountsHeldDeadRow pins the held-dead heal: a dir the
+// holder NAMES in List (registered, shallow-mounted) but reports dead is
+// logged loudly — the holder's deep-probe verdict picks the copy (a wedge
+// hangs reads; a plain-dead mirror fails them outright), the live-session
+// count and relaunch guidance appear in both shapes — and remounted through
+// the ordinary healFuse path.
+func TestSuperviseTickRemountsHeldDeadRow(t *testing.T) {
+	const (
+		wedgeCopy = "wedged mirror (serves metadata but hangs reads)"
+		deadCopy  = "dead mirror (fails reads outright; unmounted out of band or its fuse worker died?)"
+	)
+	cases := map[string]struct {
+		wedged   bool
+		wantCopy string
+		notCopy  string
+	}{
+		"deep-wedged mirror logs the wedge copy": {
+			wedged:   true,
+			wantCopy: wedgeCopy,
+			notCopy:  deadCopy,
+		},
+		"plain-dead mirror logs the dead copy, never the wedge copy": {
+			wantCopy: deadCopy,
+			notCopy:  wedgeCopy,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, dirs, fake, _ := newSuperviseServer(t)
+			flipToFuse(t, s, 1)
+			s.holderSocket = startCannedHolder(t, []mountd.MountInfo{
+				{Dir: dirs[1], Base: "/base", Live: false, Wedged: tc.wedged},
+			})
+			var buf bytes.Buffer
+			s.log = log.New(&buf, "", 0)
+
+			s.superviseTick(t.Context())
+
+			if fake.setupCount() != 1 {
+				t.Fatalf("setups = %d, want the held-dead mirror remounted", fake.setupCount())
+			}
+			if !s.holder.ready(dirs[1]) {
+				t.Fatal("remounted mirror not vouched for")
+			}
+			out := buf.String()
+			if !strings.Contains(out, tc.wantCopy) {
+				t.Fatalf("held-dead log line missing %q:\n%s", tc.wantCopy, out)
+			}
+			if strings.Contains(out, tc.notCopy) {
+				t.Fatalf("held-dead log line carries the wrong copy %q:\n%s", tc.notCopy, out)
+			}
+			if !strings.Contains(out, "live session") || !strings.Contains(out, "relaunch") {
+				t.Fatalf("held-dead log line missing the session count or relaunch guidance:\n%s", out)
+			}
+			if _, ok := s.sup.rowRetry[1]; ok {
+				t.Fatal("successful remount left a rowRetry entry")
+			}
+		})
+	}
 }
 
 // TestSuperviseSkewGateLegs pins the idle gate one leg at a time: each leg
@@ -1222,9 +1465,11 @@ func TestEvictionNeverDialsMountsSocket(t *testing.T) {
 
 // bindVersionedHolder binds a canned holder at an exact socket path replying
 // ver on every op — including ver "" (a healthy holder whose version is
-// unknown on the wire). Shutdowns are counted and release the socket, like a
-// real holder exiting. Returns the shutdown counter.
-func bindVersionedHolder(t *testing.T, socket, ver string) *atomic.Int32 {
+// unknown on the wire). A non-nil list answers each List with its result
+// (called per RPC, so a fixture can vouch for mounts as they land); nil
+// lists nothing. Shutdowns are counted and release the socket, like a real
+// holder exiting. Returns the shutdown counter.
+func bindVersionedHolder(t *testing.T, socket, ver string, list func() []mountd.MountInfo) *atomic.Int32 {
 	t.Helper()
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -1240,7 +1485,17 @@ func bindVersionedHolder(t *testing.T, socket, ver string) *atomic.Int32 {
 			}
 			var req mountd.Request
 			resp := mountd.Response{OK: true, Version: ver}
-			isShutdown := json.NewDecoder(conn).Decode(&req) == nil && req.Op == mountd.OpShutdown
+			isShutdown := false
+			if json.NewDecoder(conn).Decode(&req) == nil {
+				switch req.Op {
+				case mountd.OpShutdown:
+					isShutdown = true
+				case mountd.OpList:
+					if list != nil {
+						resp.Mounts = list()
+					}
+				}
+			}
 			_ = json.NewEncoder(conn).Encode(resp)
 			conn.Close()
 			if isShutdown {
@@ -1263,7 +1518,7 @@ func bindVersionedHolder(t *testing.T, socket, ver string) *atomic.Int32 {
 // serving, with the converge guidance logged once and Skewed still surfaced.
 func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 	t.Run("revive spawns a newer holder and settles", func(t *testing.T) {
-		s, _, fake, _ := newSuperviseServer(t)
+		s, dirs, fake, _ := newSuperviseServer(t)
 		flipToFuse(t, s, 1)
 		var buf bytes.Buffer
 		s.log = log.New(&buf, "", 0)
@@ -1271,7 +1526,14 @@ func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 		var successor *atomic.Int32
 		s.spawnHolder = func(socket, _ string, _ time.Duration) error {
 			spawns.Add(1)
-			successor = bindVersionedHolder(t, socket, "9.9.9-next")
+			// Like a real holder, the successor vouches for the row once the
+			// revive's remount lands — so the steady ticks must stay quiet.
+			successor = bindVersionedHolder(t, socket, "9.9.9-next", func() []mountd.MountInfo {
+				if fake.setupCount() == 0 {
+					return nil
+				}
+				return []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}}
+			})
 			return nil
 		}
 
@@ -1285,12 +1547,12 @@ func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 		if got := successor.Load(); got != 0 {
 			t.Fatalf("the newer spawned holder was shut down %d time(s); reverse skew must never re-replace", got)
 		}
-		// Exactly one remount: later ticks see a healthy (if skewed) holder
-		// and must not churn. ready() is not asserted here — the canned
-		// successor's empty List truthfully clears the in-place vouch on the
-		// next refresh; cache plumbing is pinned by the holderstate tests.
+		// Exactly one remount, from the revive: the successor's List vouches
+		// for it, so every steady tick's retryUnvouchedFuseRows pass finds the
+		// row ready and touches nothing — per-tick mount quiescence is part of
+		// the settling this test pins.
 		if fake.setupCount() != 1 {
-			t.Fatalf("revive incomplete or churned: setups=%d, want 1", fake.setupCount())
+			t.Fatalf("setups=%d, want exactly 1 (revive remount only; steady ticks must stay quiet)", fake.setupCount())
 		}
 		if got := strings.Count(buf.String(), "restart the daemon to converge"); got != 1 {
 			t.Fatalf("converge guidance logged %d time(s), want once: %q", got, buf.String())
@@ -1309,7 +1571,14 @@ func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 		var successor *atomic.Int32
 		s.spawnHolder = func(socket, _ string, _ time.Duration) error {
 			spawns.Add(1)
-			successor = bindVersionedHolder(t, socket, "9.9.9-next")
+			// Like a real holder, the successor vouches for the row once the
+			// replace's remount lands — so the steady ticks must stay quiet.
+			successor = bindVersionedHolder(t, socket, "9.9.9-next", func() []mountd.MountInfo {
+				if fake.setupCount() == 0 {
+					return nil
+				}
+				return []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}}
+			})
 			return nil
 		}
 
@@ -1326,10 +1595,11 @@ func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 		if got := successor.Load(); got != 0 {
 			t.Fatalf("still-skewed successor was shut down %d time(s); want steady state", got)
 		}
-		// Exactly one remount across all ticks (see the revive subtest on why
-		// ready() is not asserted against a canned successor).
+		// Exactly one remount, from the replace: the successor's List vouches
+		// for it, so the steady ticks neither re-replace (the spawn/shutdown
+		// pins above) nor churn mounts — per-tick quiescence.
 		if fake.setupCount() != 1 {
-			t.Fatalf("replace remount incomplete or churned: setups=%d, want 1", fake.setupCount())
+			t.Fatalf("setups=%d, want exactly 1 (replace remount only; steady ticks must stay quiet)", fake.setupCount())
 		}
 		if !s.tryReserve(1) {
 			t.Fatal("replace leaked its claims")
@@ -1344,7 +1614,7 @@ func TestSuperviseReverseSkewSteadyState(t *testing.T) {
 func TestSuperviseTickUnknownVersionNoReplace(t *testing.T) {
 	s, _, fake, rec := newSuperviseServer(t)
 	flipToFuse(t, s, 1)
-	shutdowns := bindVersionedHolder(t, s.holderSocket, "")
+	shutdowns := bindVersionedHolder(t, s.holderSocket, "", nil)
 
 	for range 2 {
 		s.superviseTick(t.Context())

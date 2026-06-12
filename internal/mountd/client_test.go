@@ -221,14 +221,17 @@ func TestClientRoundTrips(t *testing.T) {
 }
 
 func TestClientErrClassMapping(t *testing.T) {
-	const guidance = "fuse mount did not come up: /pool/acct-01 (grant Network Volumes access once in System Settings ▸ Privacy, then retry; symlink is used until then)"
-	sentinels := []error{ErrTCCDenied, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrUnknownClass}
+	// guidance mirrors overlay.mountWaitErr's unproven (TCC) copy — the
+	// realistic ClassTCC payload a holder round-trips over the wire.
+	const guidance = "fuse mount did not come up: /pool/acct-01 (presumed missing macOS TCC grant: this failed attempt is what creates the toggle under System Settings ▸ Privacy & Security ▸ Network Volumes — grant Network Volumes access once and mounts retry automatically)"
+	sentinels := []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch, ErrUnknownClass}
 	tests := []struct {
 		name  string
 		class string
 		want  error // nil: no sentinel may match
 	}{
 		{"tcc", ClassTCC, ErrTCCDenied},
+		{"mount-timeout", ClassMountTimeout, ErrMountTimeout},
 		{"mount-failed", ClassMountFailed, ErrMountFailed},
 		{"wedged", ClassWedged, ErrUnmountWedged},
 		{"foreign-mount", ClassForeignMount, ErrForeignMount},
@@ -306,7 +309,7 @@ func TestClientHolderDiedMidRequest(t *testing.T) {
 	if !errors.Is(err, ErrHolderUnavailable) {
 		t.Fatalf("err = %v, want errors.Is ErrHolderUnavailable", err)
 	}
-	for _, s := range []error{ErrTCCDenied, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch} {
+	for _, s := range []error{ErrTCCDenied, ErrMountTimeout, ErrMountFailed, ErrUnmountWedged, ErrForeignMount, ErrBusy, ErrBaseMismatch} {
 		if errors.Is(err, s) {
 			t.Fatalf("outcome-unknown must not carry an op-level class: errors.Is(err, %v) on %v", s, err)
 		}

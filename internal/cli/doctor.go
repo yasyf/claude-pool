@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
@@ -11,6 +12,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 )
@@ -77,6 +79,27 @@ func newDoctorCmd() *cobra.Command {
 					cached:    cachedHolder,
 				}, countFuse(accts), report)
 				reportCarcasses(accts, report)
+
+				// The wedge and stale-session checks read the holder's List
+				// rows directly over its socket — the same direct dial
+				// probeHolder uses, because these are holder facts and the
+				// holder outlives daemons; the daemon cache above carries
+				// only daemon-owned state (TCC/spawn failures). An
+				// unreachable holder (or a failed List) yields nil rows and
+				// both checks stay quiet, matching the other holder checks'
+				// degrade.
+				var holderMounts []mountd.MountInfo
+				if reachable {
+					holderMounts = listHolderMounts()
+				}
+				reportWedges(accts, holderMounts, report)
+				var sessions []procscan.Session
+				if len(holderMounts) > 0 {
+					// A failed scan skips the stale check silently: it is
+					// advisory, and doctor degrades rather than aborts.
+					sessions, _ = scanSessions()
+				}
+				reportStaleSessions(accts, holderMounts, sessions, report)
 
 				for _, a := range accts {
 					checkAccount(cmd, m, a, fix, report)
@@ -153,10 +176,104 @@ func reportHolder(f holderFacts, fuseRows int, report func(string, bool, string)
 	}
 }
 
+// listHolderMounts fetches the holder's mount registry over its socket. nil
+// on any failure: the wedge and stale-session checks read missing rows as "no
+// facts" and report nothing — reportHolder already covers an unreachable
+// holder.
+func listHolderMounts() []mountd.MountInfo {
+	mounts, err := mountd.NewClient(pool.MountsSocketPath()).List()
+	if err != nil {
+		return nil
+	}
+	return mounts
+}
+
+// reportWedges flags partial-wedge mirrors on fuse rows: mounts that answer
+// shallow metadata stats but hang bulk reads. Two sources, same line: the
+// holder's own List verdict (MountInfo.Wedged, its 30s deep-probe ticker),
+// and a bounded local deep probe of every row the holder still claims Live —
+// the holder's verdict lags its ticker, and with the daemon down nothing else
+// would surface the wedge. ErrProbeMissing is no verdict (a pre-probe
+// holder's mount), never a wedge. nil mounts (holder unreachable) reports
+// nothing. deepProbeAt is bounded by design, like reportCarcasses' stat
+// seams: nothing doctor runs against a possibly wedged mirror may block
+// unboundedly.
+func reportWedges(accts []store.Account, mounts []mountd.MountInfo, report func(string, bool, string)) {
+	byDir := make(map[string]mountd.MountInfo, len(mounts))
+	for _, mi := range mounts {
+		byDir[mi.Dir] = mi
+	}
+	for _, a := range accts {
+		if overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+			continue
+		}
+		mi, held := byDir[a.ConfigDir]
+		if !held {
+			continue
+		}
+		wedged := mi.Wedged
+		if !wedged && mi.Live {
+			if err := deepProbeAt(a.ConfigDir); err != nil && !errors.Is(err, overlay.ErrProbeMissing) {
+				wedged = true
+			}
+		}
+		if wedged {
+			report(fmt.Sprintf("acct-%02d mirror", a.ID), false,
+				"wedged (serves metadata but hangs reads) — daemon will remount; relaunch its sessions")
+		}
+	}
+}
+
+// staleSessionSlack absorbs the second-granularity rounding on both sides of
+// the stale-session comparison (ps etime and the holder's MountedAt stamp)
+// plus scan-vs-List clock jitter. Strictly MORE than the slack flags; exactly
+// the slack does not.
+const staleSessionSlack = 5 * time.Second
+
+// reportStaleSessions flags live sessions bound to a mount that no longer
+// exists: a session on a fuse row whose start predates the holder's current
+// mount of that dir (by more than staleSessionSlack) was launched against a
+// previous mount epoch — its open fds point at the yanked mirror and every
+// read hangs or fails until relaunch. A zero MountedAt (a holder predating
+// the field) or a zero StartedAt (unparseable ps etime) is silently skipped:
+// no fact, no flag.
+func reportStaleSessions(accts []store.Account, mounts []mountd.MountInfo, sessions []procscan.Session, report func(string, bool, string)) {
+	mountedAt := make(map[string]time.Time, len(mounts))
+	for _, mi := range mounts {
+		if mi.MountedAt != 0 {
+			mountedAt[mi.Dir] = time.Unix(mi.MountedAt, 0)
+		}
+	}
+	for _, a := range accts {
+		if overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+			continue
+		}
+		at, ok := mountedAt[a.ConfigDir]
+		if !ok {
+			continue
+		}
+		for _, s := range sessions {
+			if s.ConfigDir != a.ConfigDir || s.StartedAt.IsZero() {
+				continue
+			}
+			if at.Sub(s.StartedAt) > staleSessionSlack {
+				report(fmt.Sprintf("acct-%02d session", a.ID), false,
+					fmt.Sprintf("pid %d predates the current mirror (remounted %s) — it is bound to a yanked mount; relaunch it",
+						s.PID, at.Format("15:04:05")))
+			}
+		}
+	}
+}
+
 // reportCarcasses flags dead mounts on fuse rows: the dir is a mountpoint but
 // ~/.claude is not visible through it — a carcass left by a holder that died.
 // The daemon's supervision remounts these within its tick; doctor seeing one
-// means that has not happened yet (or the daemon is down).
+// means that has not happened yet (or the daemon is down). Both seams are
+// bounded (overlay's stat-probe harness): on a wedged mirror an unanswered
+// mountpoint stat reads still-mounted and an unanswered aliveness stat reads
+// dead — a carcass-suspect that cannot answer a 2s stat is exactly what this
+// check exists to flag — so the row is reported within the bound instead of
+// parking doctor in the very uninterruptible sleep it is checking for.
 func reportCarcasses(accts []store.Account, report func(string, bool, string)) {
 	for _, a := range accts {
 		if overlay.Kind(a.OverlayKind) != overlay.KindFuse {

@@ -30,6 +30,7 @@ type mirrorFS struct {
 	root        string          // ~/.claude
 	privateRoot string          // per-account backing for ExcludedEntries
 	cj          *claudeJSONView // merged read view + base write-through for /.claude.json
+	probe       *probeView      // virtual read-only /.ccp-probe for deep wedge probing
 }
 
 func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
@@ -40,6 +41,7 @@ func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
 		root:        absRoot,
 		privateRoot: absPriv,
 		cj:          newClaudeJSONView(filepath.Join(absPriv, ".claude.json"), absBase),
+		probe:       newProbeView(),
 	}
 }
 
@@ -87,6 +89,12 @@ func errno(err error) int {
 }
 
 func (fs *mirrorFS) Statfs(path string, stat *fuse.Statfs_t) int {
+	if path == probeFusePath {
+		// The virtual probe lives on root's filesystem: answer with root's
+		// stats instead of ENOENT (no shadow entry) or a passthrough to a
+		// shadowed base entry's path.
+		path = "/"
+	}
 	var s syscall.Statfs_t
 	if err := syscall.Statfs(fs.real(path), &s); err != nil {
 		return errno(err)
@@ -103,6 +111,11 @@ func (fs *mirrorFS) Statfs(path string, stat *fuse.Statfs_t) int {
 }
 
 func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
+	if probeFh(fh) || path == probeFusePath {
+		// Probe interception precedes the real() mapping everywhere: the file
+		// is purely virtual and shadows any real base entry of the same name.
+		return fs.probe.getattr(stat)
+	}
 	if syntheticFh(fh) {
 		return fs.cj.getattrSnapshot(fh, stat)
 	}
@@ -127,6 +140,9 @@ func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 }
 
 func (fs *mirrorFS) Open(path string, flags int) (int, uint64) {
+	if path == probeFusePath {
+		return fs.probe.open(flags)
+	}
 	if path == claudeJSONFusePath && flags&syscall.O_ACCMODE == syscall.O_RDONLY {
 		return fs.cj.openSnapshot()
 	}
@@ -138,6 +154,9 @@ func (fs *mirrorFS) Open(path string, flags int) (int, uint64) {
 }
 
 func (fs *mirrorFS) Create(path string, flags int, mode uint32) (int, uint64) {
+	if path == probeFusePath {
+		return -int(syscall.EPERM), ^uint64(0)
+	}
 	fd, err := syscall.Open(fs.real(path), flags|syscall.O_CREAT, mode)
 	if err != nil {
 		return errno(err), ^uint64(0)
@@ -146,6 +165,9 @@ func (fs *mirrorFS) Create(path string, flags int, mode uint32) (int, uint64) {
 }
 
 func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+	if probeFh(fh) {
+		return fs.probe.read(fh, buff, ofst)
+	}
 	if syntheticFh(fh) {
 		return fs.cj.readSnapshot(fh, buff, ofst)
 	}
@@ -157,6 +179,11 @@ func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (fs *mirrorFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+	if probeFh(fh) {
+		// Probe handles are read-only; without this guard the huge handle ID
+		// would be passed to pwrite as a bogus fd int.
+		return -int(syscall.EBADF)
+	}
 	if syntheticFh(fh) {
 		// Synthetic merged-view handles are read-only; without this guard the
 		// huge handle ID would be passed to pwrite as a bogus fd int.
@@ -173,6 +200,9 @@ func (fs *mirrorFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
+	if path == probeFusePath || probeFh(fh) {
+		return -int(syscall.EPERM)
+	}
 	if syntheticFh(fh) {
 		// Synthetic merged-view handles are read-only; without this guard the
 		// huge handle ID would be passed to ftruncate as a bogus fd int.
@@ -191,13 +221,17 @@ func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
 }
 
 func (fs *mirrorFS) Fsync(path string, datasync bool, fh uint64) int {
-	if syntheticFh(fh) {
-		return 0 // a merged snapshot is memory; nothing to sync
+	if probeFh(fh) || syntheticFh(fh) {
+		return 0 // probe bytes and merged snapshots are memory; nothing to sync
 	}
 	return errno(syscall.Fsync(int(fh)))
 }
 
 func (fs *mirrorFS) Release(path string, fh uint64) int {
+	if probeFh(fh) {
+		fs.probe.release(fh)
+		return 0
+	}
 	if syntheticFh(fh) {
 		fs.cj.closeSnapshot(fh)
 		return 0
@@ -214,6 +248,11 @@ func (fs *mirrorFS) Release(path string, fh uint64) int {
 }
 
 func (fs *mirrorFS) Opendir(path string) (int, uint64) {
+	if path == probeFusePath {
+		// The virtual probe is a regular file (and unreachable here while
+		// Getattr says so); never open a shadowed base directory through it.
+		return -int(syscall.ENOTDIR), ^uint64(0)
+	}
 	fd, err := syscall.Open(fs.real(path), syscall.O_RDONLY, 0)
 	if err != nil {
 		return errno(err), ^uint64(0)
@@ -240,6 +279,13 @@ func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 	seen := map[string]bool{}
 	for _, name := range names {
 		seen[name] = true
+		if path == "/" && name == ProbeFileName {
+			// A shadowed base .ccp-probe must not surface its NAME either:
+			// the probe is purely virtual and never listed (its content and
+			// attrs are already shadowed by the path intercepts). Root only —
+			// a nested .ccp-probe is an ordinary real file.
+			continue
+		}
 		if !fill(name, nil, 0) {
 			return 0
 		}
@@ -268,26 +314,53 @@ func (fs *mirrorFS) Releasedir(path string, fh uint64) int {
 }
 
 func (fs *mirrorFS) Mkdir(path string, mode uint32) int {
+	if path == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	return errno(syscall.Mkdir(fs.real(path), mode))
 }
 
 func (fs *mirrorFS) Unlink(path string) int {
+	if path == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	return errno(syscall.Unlink(fs.real(path)))
 }
 
 func (fs *mirrorFS) Rmdir(path string) int {
+	if path == probeFusePath {
+		// Unreachable today (Getattr presents S_IFREG, so the client VFS fails
+		// rmdir with ENOTDIR first), but guarded like every other mutation op:
+		// a shadowed base DIRECTORY named .ccp-probe must never be deletable
+		// through the probe name.
+		return -int(syscall.EPERM)
+	}
 	return errno(syscall.Rmdir(fs.real(path)))
 }
 
 func (fs *mirrorFS) Link(oldpath string, newpath string) int {
+	if oldpath == probeFusePath || newpath == probeFusePath {
+		// Either side would reach the backing dir's real .ccp-probe path; with
+		// a shadowed base entry present, the oldpath side would hardlink that
+		// entry to a new name inside base. Same both-sides posture as Rename.
+		return -int(syscall.EPERM)
+	}
 	return errno(syscall.Link(fs.real(oldpath), fs.real(newpath)))
 }
 
 func (fs *mirrorFS) Symlink(target string, newpath string) int {
+	if newpath == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	return errno(syscall.Symlink(target, fs.real(newpath)))
 }
 
 func (fs *mirrorFS) Readlink(path string) (int, string) {
+	if path == probeFusePath {
+		// The virtual probe is a regular file; answering here keeps a shadowed
+		// base symlink's target from leaking through the probe name.
+		return -int(syscall.EINVAL), ""
+	}
 	buf := make([]byte, 4096)
 	n, err := syscall.Readlink(fs.real(path), buf)
 	if err != nil {
@@ -297,6 +370,11 @@ func (fs *mirrorFS) Readlink(path string) (int, string) {
 }
 
 func (fs *mirrorFS) Rename(oldpath string, newpath string) int {
+	if oldpath == probeFusePath || newpath == probeFusePath {
+		// Renaming the virtual probe away, or a real file onto it, would reach
+		// the backing dir's real .ccp-probe path — never touched for probing.
+		return -int(syscall.EPERM)
+	}
 	st := errno(syscall.Rename(fs.real(oldpath), fs.real(newpath)))
 	if st == 0 && newpath == claudeJSONFusePath {
 		// claude's atomic save (tmp + rename) just committed the private file;
@@ -310,14 +388,23 @@ func (fs *mirrorFS) Rename(oldpath string, newpath string) int {
 }
 
 func (fs *mirrorFS) Chmod(path string, mode uint32) int {
+	if path == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	return errno(syscall.Chmod(fs.real(path), mode))
 }
 
 func (fs *mirrorFS) Chown(path string, uid uint32, gid uint32) int {
+	if path == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	return errno(syscall.Lchown(fs.real(path), int(uid), int(gid)))
 }
 
 func (fs *mirrorFS) Utimens(path string, tmsp []fuse.Timespec) int {
+	if path == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	if len(tmsp) < 2 {
 		return errno(syscall.EINVAL)
 	}
@@ -335,7 +422,10 @@ func (fs *mirrorFS) Utimens(path string, tmsp []fuse.Timespec) int {
 // fallback from littering ._ sidecars, and fuse-t requires Listxattr or
 // Getxattr fails outright (fuse-t issue #62). /.claude.json gets no merged-view
 // carve-out: the merge covers file CONTENT only, so its xattrs live on the
-// private backing file like any other private path.
+// private backing file like any other private path. /.ccp-probe, by contrast,
+// IS carved out like its other ops: it is answered virtually (no xattrs;
+// mutations EPERM) so a shadowed base entry can never be read or modified
+// through the probe name.
 
 // Setxattr passes through, translating ENOTSUP to EPERM: ENOTSUP from setxattr
 // is the one status that trips xnu's AppleDouble ._ fallback — the exact bug
@@ -343,6 +433,9 @@ func (fs *mirrorFS) Utimens(path string, tmsp []fuse.Timespec) int {
 // error (notably EPERM for the SIP-protected com.apple.provenance) passes
 // through unchanged.
 func (fs *mirrorFS) Setxattr(path string, name string, value []byte, flags int) int {
+	if path == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	return setxattrErrno(unix.Lsetxattr(fs.real(path), name, value, flags))
 }
 
@@ -357,6 +450,9 @@ func setxattrErrno(err error) int {
 }
 
 func (fs *mirrorFS) Getxattr(path string, name string) (int, []byte) {
+	if path == probeFusePath {
+		return -int(syscall.ENOATTR), nil // the virtual probe has no xattrs
+	}
 	backing := fs.real(path)
 	for {
 		sz, err := unix.Lgetxattr(backing, name, nil)
@@ -379,6 +475,9 @@ func (fs *mirrorFS) Getxattr(path string, name string) (int, []byte) {
 }
 
 func (fs *mirrorFS) Listxattr(path string, fill func(name string) bool) int {
+	if path == probeFusePath {
+		return 0 // the virtual probe has no xattrs
+	}
 	backing := fs.real(path)
 	var buf []byte
 	for {
@@ -412,6 +511,9 @@ func (fs *mirrorFS) Listxattr(path string, fill func(name string) bool) int {
 }
 
 func (fs *mirrorFS) Removexattr(path string, name string) int {
+	if path == probeFusePath {
+		return -int(syscall.EPERM)
+	}
 	return errno(unix.Lremovexattr(fs.real(path), name))
 }
 

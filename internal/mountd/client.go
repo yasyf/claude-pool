@@ -21,6 +21,11 @@ var (
 	// ErrTCCDenied: the mount was issued but never came live — almost always
 	// the one-time macOS "Network Volumes" grant.
 	ErrTCCDenied = errors.New("mount blocked pending TCC grant")
+	// ErrMountTimeout: the mount did not come live within the holder's
+	// bounded wait in a process whose "Network Volumes" grant is already
+	// proven — NOT the TCC condition. Transient; drivers retry, never surface
+	// TCC guidance for it, and must never treat it as grounds to convert.
+	ErrMountTimeout = errors.New("mount timed out under a proven grant")
 	// ErrMountFailed: the mount failed outright.
 	ErrMountFailed = errors.New("mount failed")
 	// ErrUnmountWedged: the unmount did not take; the dir is still a live
@@ -113,6 +118,8 @@ func respErr(resp *Response) error {
 	switch resp.ErrClass {
 	case ClassTCC:
 		sentinel = ErrTCCDenied
+	case ClassMountTimeout:
+		sentinel = ErrMountTimeout
 	case ClassMountFailed:
 		sentinel = ErrMountFailed
 	case ClassWedged:
@@ -159,17 +166,20 @@ func (c *Client) Probe() (bool, error) {
 
 // Mount asks the holder to ensure a live mirror of base at dir: a fresh dir
 // is mounted, the exact pair already held AND live is an idempotent OK, and a
-// held-but-dead mirror is torn down and remounted. errors.Is classes:
-// ErrTCCDenied, ErrMountFailed, ErrForeignMount, ErrBaseMismatch, ErrBusy,
-// and ErrUnmountWedged (a dead mirror whose corpse would not come down).
+// held-but-dead (or deep-wedged) mirror is torn down and remounted.
+// errors.Is classes: ErrTCCDenied, ErrMountTimeout, ErrMountFailed,
+// ErrForeignMount, ErrBaseMismatch, ErrBusy, and ErrUnmountWedged (a dead
+// mirror whose corpse would not come down).
 func (c *Client) Mount(base, dir string) error {
 	// 25s sits above the server's 20s OpMount deadline — like Shutdown's 65s
 	// over the server's 60s — so the op deadline, not the client deadline, is
-	// the binding bound. The holder's worst-case ensure-mount (a dead-mirror
-	// teardown's ~5s of grace timers plus a TCC-prone remount's ~11s of mount
-	// wait) fits the server deadline but not a shorter client one, and a blown
-	// client deadline maps to ErrHolderUnavailable (wireErr): the holder's real
-	// error class would never reach the driver.
+	// the binding bound. The holder's worst-case single leg is a first mount
+	// in a fresh holder: the liveness probe (≤2s liveProbeTimeout) plus the
+	// 14s first-mount wait plus the 3s done-drain (overlay/fuse.go) = 19s,
+	// under the 20s op deadline; a dead-mirror teardown's ~5s of grace timers
+	// plus a proven-grant remount's 8s wait + 3s drain fits the same bound.
+	// A blown client deadline maps to ErrHolderUnavailable (wireErr): the
+	// holder's real error class would never reach the driver.
 	resp, err := c.do(Request{Op: OpMount, Base: base, Dir: dir}, 25*time.Second)
 	if err != nil {
 		return err

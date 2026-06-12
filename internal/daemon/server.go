@@ -1073,8 +1073,9 @@ const (
 
 // healFuse establishes a fuse account's mirror, classifying failures instead
 // of blindly converting: transient holder conditions (holder unreachable, the
-// dir busy, a wedged unmount in the way, or an error class only a newer
-// holder understands — none is a mount verdict) and a
+// dir busy, a wedged unmount in the way, a mount-up timeout under a proven
+// "Network Volumes" grant, or an error class only a newer holder
+// understands — none is a mount verdict) and a
 // mount blocked pending the macOS "Network Volumes" TCC grant all retry next
 // poll, and only a genuine mount failure falls back to symlink — itself gated
 // on the account being idle (see fallbackToSymlink). Used by the startup
@@ -1107,6 +1108,12 @@ func (s *Server) healFuse(a store.Account) healOutcome {
 		// retry, loudly, every poll until the daemon is upgraded (mirroring
 		// the unknown-op-reads-as-not-supported policy, never as failure).
 		s.log.Printf("acct-%02d mount failed with an error class this daemon does not recognize (newer holder; upgrade the daemon), retrying next poll: %v", a.ID, err)
+		return healRetry
+	case errors.Is(err, overlay.ErrMountTimeout):
+		// The mount timed out in a holder whose "Network Volumes" grant is
+		// already proven by an earlier live mount — transient fuse-t slowness,
+		// never the TCC condition. No recordTCC, no scary guidance.
+		s.log.Printf("acct-%02d fuse mount did not come up within the mount wait; retrying: %v", a.ID, err)
 		return healRetry
 	case errors.Is(err, overlay.ErrMountNotLive):
 		s.holder.recordTCC(err.Error())

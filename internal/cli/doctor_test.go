@@ -1,11 +1,15 @@
 package cli
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yasyf/cc-pool/internal/daemon"
+	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
 )
@@ -141,6 +145,235 @@ func TestReportCarcasses(t *testing.T) {
 	got := (*calls)[0]
 	if got.label != "acct-01 mount" || got.healthy || !strings.Contains(got.detail, "dead mount (carcass)") {
 		t.Errorf("report = %+v, want acct-01 mount flagged as a dead mount (carcass)", got)
+	}
+}
+
+// TestReportCarcassesBoundedOnParkedProbe pins doctor's behavior on the exact
+// failure the carcass check exists for: a wedged mirror whose kernel stats
+// park in uninterruptible sleep. The seams run a real overlay.StatProbes
+// harness — the same machinery the production seam targets
+// (overlay.MountedWithin / overlay.MountAliveWithin) are built on — with the
+// timeout shrunk and both stat bodies for one row parked on a channel.
+// reportCarcasses must still return within the bound and flag the parked row
+// (the production folds: an unanswered mountpoint stat reads still-mounted,
+// an unanswered aliveness stat reads NOT alive), while the healthy fast row
+// stays silent.
+func TestReportCarcassesBoundedOnParkedProbe(t *testing.T) {
+	const parkedDir, healthyDir = "/p/acct-01", "/p/acct-02"
+	accts := []store.Account{
+		{ID: 1, ConfigDir: parkedDir, OverlayKind: string(overlay.KindFuse)},
+		{ID: 2, ConfigDir: healthyDir, OverlayKind: string(overlay.KindFuse)},
+	}
+	const probeTimeout = 20 * time.Millisecond
+	var mountedProbes, aliveProbes overlay.StatProbes[bool]
+	release := make(chan struct{})
+	swapVar(t, &dirMounted, func(dir string) bool {
+		mounted, ok := mountedProbes.Do(dir, probeTimeout, func() bool {
+			if dir == parkedDir {
+				<-release
+			}
+			return true
+		})
+		// mountedBounded's fold: an unanswered stat reads still-mounted.
+		return !ok || mounted
+	})
+	swapVar(t, &mountAliveAt, func(_, dir string) bool {
+		alive, ok := aliveProbes.Do(dir, probeTimeout, func() bool {
+			if dir == parkedDir {
+				<-release
+			}
+			return true
+		})
+		// overlay.MountAliveWithin's fold: an unanswered stat reads NOT alive.
+		return ok && alive
+	})
+	// Unpark and drain the probe bodies before the seam restores run
+	// (cleanups run LIFO).
+	t.Cleanup(func() {
+		close(release)
+		deadline := time.Now().Add(5 * time.Second)
+		for mountedProbes.Inflight()+aliveProbes.Inflight() != 0 {
+			if time.Now().After(deadline) {
+				t.Error("parked probe bodies never drained")
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+
+	report, calls := captureReports()
+	start := time.Now()
+	reportCarcasses(accts, report)
+	elapsed := time.Since(start)
+
+	// Beating the 2s production statProbeTimeout proves the verdict is
+	// bounded, with a wide margin over the two 20ms fake timeouts to keep the
+	// assertion unflaky.
+	if elapsed >= 2*time.Second {
+		t.Fatalf("reportCarcasses took %v against parked probes, want a bounded verdict", elapsed)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("got %d reports %+v, want exactly the parked carcass", len(*calls), *calls)
+	}
+	got := (*calls)[0]
+	if got.label != "acct-01 mount" || got.healthy || !strings.Contains(got.detail, "dead mount (carcass)") {
+		t.Errorf("report = %+v, want acct-01 mount flagged as a dead mount (carcass)", got)
+	}
+}
+
+// TestReportWedges pins the partial-wedge check: a holder-flagged Wedged row
+// is reported; a Live row is deep-probed locally and reported only when the
+// probe fails with a real verdict (ErrProbeMissing is no verdict); nil mounts
+// (unreachable holder) and symlink rows report nothing and never probe. The
+// wedge copy must carry the metadata-vs-reads signature and the relaunch
+// guidance.
+func TestReportWedges(t *testing.T) {
+	accts := []store.Account{
+		{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(overlay.KindFuse)},
+		{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(overlay.KindSymlink)},
+	}
+	wedgeDetail := "wedged (serves metadata but hangs reads) — daemon will remount; relaunch its sessions"
+	cases := map[string]struct {
+		mounts     []mountd.MountInfo
+		probeErr   error // returned by deepProbeAt when probed
+		want       []reportCall
+		wantProbed []string // dirs deepProbeAt must be called with, in order
+	}{
+		"wedged row reported without probing": {
+			mounts: []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Wedged: true}},
+			want:   []reportCall{{"acct-01 mirror", false, wedgeDetail}},
+		},
+		"live row with failing deep probe reported": {
+			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
+			probeErr:   fmt.Errorf("%w: hung", overlay.ErrProbeWedged),
+			want:       []reportCall{{"acct-01 mirror", false, wedgeDetail}},
+			wantProbed: []string{"/p/acct-01"},
+		},
+		"live row with missing probe file is silent": {
+			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
+			probeErr:   fmt.Errorf("%w: /p/acct-01/.ccp-probe", overlay.ErrProbeMissing),
+			wantProbed: []string{"/p/acct-01"},
+		},
+		"live healthy row is silent": {
+			mounts:     []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b", Live: true}},
+			wantProbed: []string{"/p/acct-01"},
+		},
+		"holder unreachable (nil mounts) is silent and never probes": {
+			mounts: nil,
+		},
+		"dead unwedged row is silent (reportCarcasses' beat)": {
+			mounts: []mountd.MountInfo{{Dir: "/p/acct-01", Base: "/b"}},
+		},
+		"symlink row is never probed or reported": {
+			mounts: []mountd.MountInfo{{Dir: "/p/acct-02", Base: "/b", Live: true, Wedged: true}},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var probed []string
+			swapVar(t, &deepProbeAt, func(dir string) error {
+				probed = append(probed, dir)
+				return tc.probeErr
+			})
+			report, calls := captureReports()
+			reportWedges(accts, tc.mounts, report)
+			if len(*calls) != len(tc.want) {
+				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
+			}
+			for i, want := range tc.want {
+				got := (*calls)[i]
+				if got.label != want.label || got.healthy != want.healthy || !strings.Contains(got.detail, want.detail) {
+					t.Errorf("report[%d] = %+v, want label %q healthy %v detail containing %q", i, got, want.label, want.healthy, want.detail)
+				}
+			}
+			if len(probed) != len(tc.wantProbed) {
+				t.Fatalf("deepProbeAt called with %v, want %v", probed, tc.wantProbed)
+			}
+			for i, dir := range tc.wantProbed {
+				if probed[i] != dir {
+					t.Errorf("deepProbeAt call[%d] = %q, want %q", i, probed[i], dir)
+				}
+			}
+		})
+	}
+}
+
+// TestReportStaleSessions pins the yanked-mount session check: only a session
+// on a fuse row that started MORE than staleSessionSlack before the holder's
+// current mount of that dir is flagged (exactly the slack is not — the >
+// semantics); a zero MountedAt (old holder), a zero StartedAt (unparseable
+// etime), a symlink row, and a session born after the mount all stay silent.
+func TestReportStaleSessions(t *testing.T) {
+	mounted := time.Date(2026, 6, 12, 13, 32, 1, 0, time.Local)
+	fuse := store.Account{ID: 1, ConfigDir: "/p/acct-01", OverlayKind: string(overlay.KindFuse)}
+	sym := store.Account{ID: 2, ConfigDir: "/p/acct-02", OverlayKind: string(overlay.KindSymlink)}
+	row := func(dir string, at time.Time) mountd.MountInfo {
+		mi := mountd.MountInfo{Dir: dir, Base: "/b", Live: true, Epoch: 2}
+		if !at.IsZero() {
+			mi.MountedAt = at.Unix()
+		}
+		return mi
+	}
+	cases := map[string]struct {
+		accts    []store.Account
+		mounts   []mountd.MountInfo
+		sessions []procscan.Session
+		want     []reportCall
+	}{
+		"session predating the mirror is flagged": {
+			accts:    []store.Account{fuse},
+			mounts:   []mountd.MountInfo{row("/p/acct-01", mounted)},
+			sessions: []procscan.Session{{PID: 4242, ConfigDir: "/p/acct-01", StartedAt: mounted.Add(-6 * time.Second)}},
+			want: []reportCall{{
+				"acct-01 session", false,
+				"pid 4242 predates the current mirror (remounted 13:32:01) — it is bound to a yanked mount; relaunch it",
+			}},
+		},
+		"exactly the slack is not flagged (strict >)": {
+			accts:    []store.Account{fuse},
+			mounts:   []mountd.MountInfo{row("/p/acct-01", mounted)},
+			sessions: []procscan.Session{{PID: 4242, ConfigDir: "/p/acct-01", StartedAt: mounted.Add(-staleSessionSlack)}},
+		},
+		"zero MountedAt (old holder) skips silently": {
+			accts:    []store.Account{fuse},
+			mounts:   []mountd.MountInfo{row("/p/acct-01", time.Time{})},
+			sessions: []procscan.Session{{PID: 4242, ConfigDir: "/p/acct-01", StartedAt: mounted.Add(-time.Hour)}},
+		},
+		"zero StartedAt (unparseable etime) skips silently": {
+			accts:    []store.Account{fuse},
+			mounts:   []mountd.MountInfo{row("/p/acct-01", mounted)},
+			sessions: []procscan.Session{{PID: 4242, ConfigDir: "/p/acct-01"}},
+		},
+		"symlink account is skipped": {
+			accts:    []store.Account{sym},
+			mounts:   []mountd.MountInfo{row("/p/acct-02", mounted)},
+			sessions: []procscan.Session{{PID: 4242, ConfigDir: "/p/acct-02", StartedAt: mounted.Add(-time.Hour)}},
+		},
+		"session born after the mount is not flagged": {
+			accts:    []store.Account{fuse},
+			mounts:   []mountd.MountInfo{row("/p/acct-01", mounted)},
+			sessions: []procscan.Session{{PID: 4242, ConfigDir: "/p/acct-01", StartedAt: mounted.Add(10 * time.Second)}},
+		},
+		"session on another dir is not flagged": {
+			accts:    []store.Account{fuse},
+			mounts:   []mountd.MountInfo{row("/p/acct-01", mounted)},
+			sessions: []procscan.Session{{PID: 4242, ConfigDir: "/p/elsewhere", StartedAt: mounted.Add(-time.Hour)}},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			report, calls := captureReports()
+			reportStaleSessions(tc.accts, tc.mounts, tc.sessions, report)
+			if len(*calls) != len(tc.want) {
+				t.Fatalf("got %d reports %+v, want %d", len(*calls), *calls, len(tc.want))
+			}
+			for i, want := range tc.want {
+				got := (*calls)[i]
+				if got.label != want.label || got.healthy != want.healthy || !strings.Contains(got.detail, want.detail) {
+					t.Errorf("report[%d] = %+v, want label %q healthy %v detail containing %q", i, got, want.label, want.healthy, want.detail)
+				}
+			}
+		})
 	}
 }
 

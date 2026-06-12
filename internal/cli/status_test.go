@@ -624,6 +624,47 @@ func TestHolderFooter(t *testing.T) {
 	}
 }
 
+// TestHolderFooterWedged pins the wedged-mirror footer: silent at zero,
+// singular at one, plural beyond, ranked below the holder-blocking failures
+// (TCC, spawn) but above cosmetic skew.
+func TestHolderFooterWedged(t *testing.T) {
+	cases := map[string]struct {
+		h    *daemon.HolderStatus
+		want string
+	}{
+		"zero wedged mirrors is silent": {
+			&daemon.HolderStatus{Version: version.String(), Mounts: 2}, "",
+		},
+		"one wedged mirror is singular": {
+			&daemon.HolderStatus{Version: version.String(), Mounts: 2, WedgedMounts: 1},
+			"mount holder: 1 wedged mirror — run `ccp doctor`",
+		},
+		"three wedged mirrors is plural": {
+			&daemon.HolderStatus{Version: version.String(), Mounts: 3, WedgedMounts: 3},
+			"mount holder: 3 wedged mirrors — run `ccp doctor`",
+		},
+		"wedged outranks skew": {
+			&daemon.HolderStatus{Version: "0.0.1-old", Skewed: true, WedgedMounts: 1},
+			"mount holder: 1 wedged mirror — run `ccp doctor`",
+		},
+		"TCC outranks wedged": {
+			&daemon.HolderStatus{TCCError: "tcc-msg", WedgedMounts: 1},
+			"mount holder: TCC blocked — tcc-msg",
+		},
+		"spawn outranks wedged": {
+			&daemon.HolderStatus{SpawnError: "spawn-msg", WedgedMounts: 1},
+			"mount holder: respawn failing — spawn-msg",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := stripANSI(holderFooter(tc.h)); got != tc.want {
+				t.Errorf("holderFooter = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRunStatusPlainHolderFooter drives the plain status path against a fake
 // daemon socket: an alerting holder adds exactly one footer line under the
 // table, and a healthy holder leaves the output free of any holder mention.
