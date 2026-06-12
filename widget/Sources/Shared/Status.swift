@@ -47,7 +47,8 @@ extension PoolStatus {
         let mood: Mood = usable.isEmpty
             ? .panic : Mood(remaining5h: mean5, dryProjected: false)
         return PoolOutlook(remaining5hPct: mean5, remaining7dPct: mean7,
-                           burnRaw: nil, dryAtRaw: nil, moodRaw: mood.rawValue)
+                           burnRaw: nil, netBurnRaw: nil, dryAtRaw: nil,
+                           moodRaw: mood.rawValue)
     }
 }
 
@@ -59,10 +60,14 @@ struct PoolOutlook: Decodable {
     // fileprivate, not private: the memberwise initializer inherits the most
     // restrictive property's access, and the fixtures below must call it.
     fileprivate let burnRaw: Double? // omitempty
+    fileprivate let netBurnRaw: Double? // omitempty
     fileprivate let dryAtRaw: Date? // omitzero
     fileprivate let moodRaw: String?
 
     var burn5hPerHour: Double { burnRaw ?? 0 }
+    /// Mean drain net of upcoming 5h refills, pp/h. nil from daemons that
+    /// predate the field — callers fall back to the gross burn.
+    var netBurn5hPerHour: Double? { netBurnRaw }
     var dryAt: Date? { dryAtRaw?.nonZero }
     /// An unknown future mood name degrades by re-deriving from the numbers
     /// the daemon shipped, not by failing decode or defaulting to calm.
@@ -75,6 +80,7 @@ struct PoolOutlook: Decodable {
         case remaining5hPct = "remaining_5h_pct"
         case remaining7dPct = "remaining_7d_pct"
         case burnRaw = "burn_5h_per_hour"
+        case netBurnRaw = "net_burn_5h_per_hour"
         case dryAtRaw = "dry_at"
         case moodRaw = "mood"
     }
@@ -305,7 +311,8 @@ extension PoolStatus {
         ],
         pool: PoolOutlook(
             remaining5hPct: 38, remaining7dPct: 56,
-            burnRaw: 13, dryAtRaw: Date().addingTimeInterval(2.6 * 3600),
+            burnRaw: 13, netBurnRaw: 4,
+            dryAtRaw: Date().addingTimeInterval(2.6 * 3600),
             moodRaw: Mood.worried.rawValue))
 
     /// Variant of `sample` pinning a specific mascot mood, for the
@@ -317,7 +324,7 @@ extension PoolStatus {
             generatedAt: Date().addingTimeInterval(-90),
             accounts: sample.accounts,
             pool: PoolOutlook(
-                remaining5hPct: 38, remaining7dPct: 56, burnRaw: 13,
+                remaining5hPct: 38, remaining7dPct: 56, burnRaw: 13, netBurnRaw: 4,
                 dryAtRaw: mood == .chill ? nil : Date().addingTimeInterval(2.6 * 3600),
                 moodRaw: mood.rawValue))
     }

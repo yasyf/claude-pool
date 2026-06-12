@@ -93,34 +93,41 @@ func compactETA(to date: Date, from now: Date = .now) -> String {
 extension AccountStatus {
     /// Burn-based projection for the row: the depletion ETA when the window
     /// runs dry before its reset (the user's real deadline), else the
-    /// projected remaining at reset while burning meaningfully. nil when
+    /// projected used % at reset while burning meaningfully. nil when
     /// unusable (the reset badge owns that slot) or idle — absence reads as
     /// idle, so dense rows never print filler.
-    func predictionText(now: Date = .now, detailed: Bool = false) -> String? {
+    func predictionText(now: Date = .now) -> String? {
         if unusable { return nil }
         if let depleted = depleted5hAt {
             guard depleted > now else { return "dry" }
             return "~\(compactETA(to: depleted, from: now)) left"
         }
         if let projected = projected5hAtReset, (burn5hPerHour ?? 0) > 0.5 {
-            let pct = "→\(Int(projected.rounded()))%"
-            return detailed ? "\(pct) by reset" : pct
+            return "→\(Int((100 - projected).rounded()))% by reset"
         }
         return nil
     }
 }
 
 extension PoolOutlook {
-    /// The headline caption: the dry-out clock when one is projected, the
-    /// drain rate while burning, "cruising" when becalmed.
+    /// The headline caption: the dry-out clock when one is projected, else
+    /// the shared burn phrase.
     func caption(now: Date = .now) -> String {
         if let dry = dryAt {
             guard dry > now else { return "drying now" }
             return "dry ~" + dry.formatted(date: .omitted, time: .shortened)
         }
-        if burn5hPerHour >= 1 {
-            return "−\(Int(burn5hPerHour.rounded()))%/h"
-        }
+        return burnPhrase
+    }
+
+    /// Drain phrase shared by the small/medium caption and the large header's
+    /// second line: NET burn (drain minus upcoming 5h refills) when the
+    /// daemon ships it, gross for older daemons. A negative net — refills
+    /// outpacing drain — reads as refilling; under ±1 pp/h reads as cruising.
+    var burnPhrase: String {
+        let rate = netBurn5hPerHour ?? burn5hPerHour
+        if rate >= 1 { return "burn \(Int(rate.rounded()))%/h" }
+        if rate <= -1 { return "refilling \(Int((-rate).rounded()))%/h" }
         return "cruising"
     }
 }

@@ -219,12 +219,18 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertKeys(t, "pool", poolBlock, []string{
-			"remaining_5h_pct", "remaining_7d_pct", "burn_5h_per_hour", "dry_at", "mood",
+			"remaining_5h_pct", "remaining_7d_pct", "burn_5h_per_hour",
+			"net_burn_5h_per_hour", "dry_at", "mood",
 		})
 		// Only acct-2 is usable (acct-1 is rate-limited): mean remaining 50,
 		// projected dry with no reset relief bumps easy to uneasy.
 		if got := string(poolBlock["mood"]); got != `"uneasy"` {
 			t.Errorf("pool mood = %s, want uneasy", got)
+		}
+		// With one usable account and no reset inside the hour, net equals
+		// its burn: 50→40 over the hour.
+		if got := string(poolBlock["net_burn_5h_per_hour"]); got != "10" {
+			t.Errorf("pool net_burn_5h_per_hour = %s, want 10", got)
 		}
 
 		// score.Components has no json tags, so its keys are PascalCase amid
@@ -270,6 +276,56 @@ func TestStatusSnapshotJSONKeys(t *testing.T) {
 		// its locally-derived outlook when "pool" is absent.
 		if _, ok := top["pool"]; ok {
 			t.Error("never-sampled pool must omit the pool block")
+		}
+	})
+
+	t.Run("idle pool omits gross burn, pins net at 0", func(t *testing.T) {
+		// A sampled but idle account: the pool block is present and the gross
+		// burn is exactly 0, which omitempty drops — the widget models it as
+		// an optional. Net burn is deliberately NOT omitempty: 0 is a real
+		// value (a balanced pool), and an absent key reads as "daemon
+		// predates the field", flipping the widget to its gross fallback.
+		idle := AccountStatus{ID: 1, HasUsage: true, Remaining5h: 50, Remaining7d: 50}
+		data, err := json.Marshal(NewStatusSnapshot([]AccountStatus{idle}, now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(data, &top); err != nil {
+			t.Fatal(err)
+		}
+		var poolBlock map[string]json.RawMessage
+		if err := json.Unmarshal(top["pool"], &poolBlock); err != nil {
+			t.Fatal(err)
+		}
+		assertKeys(t, "idle pool", poolBlock, []string{
+			"remaining_5h_pct", "remaining_7d_pct", "net_burn_5h_per_hour", "mood",
+		})
+		if got := string(poolBlock["net_burn_5h_per_hour"]); got != "0" {
+			t.Errorf("idle pool net_burn_5h_per_hour = %s, want 0", got)
+		}
+	})
+
+	t.Run("recovering pool serializes negative net burn", func(t *testing.T) {
+		// An exhausted account refilling inside the horizon: net is negative
+		// (recovering) and must reach the wire — the widget's "refilling"
+		// caption depends on it.
+		drained := AccountStatus{ID: 1, HasUsage: true, Remaining5h: 0, Remaining7d: 50,
+			Resets5h: now.Add(20 * time.Minute)}
+		data, err := json.Marshal(NewStatusSnapshot([]AccountStatus{drained}, now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(data, &top); err != nil {
+			t.Fatal(err)
+		}
+		var poolBlock map[string]json.RawMessage
+		if err := json.Unmarshal(top["pool"], &poolBlock); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(poolBlock["net_burn_5h_per_hour"]); got != "-100" {
+			t.Errorf("recovering pool net_burn_5h_per_hour = %s, want -100", got)
 		}
 	})
 
@@ -357,6 +413,10 @@ func TestWriteStatusSnapshotForecast(t *testing.T) {
 	}
 	if snap.Pool.Burn5hPerHour != 40 {
 		t.Errorf("pool burn_5h_per_hour = %v, want 40", snap.Pool.Burn5hPerHour)
+	}
+	// No reset lands inside the hour, so net is the mean of burns: (40+0)/2.
+	if snap.Pool.NetBurn5hPerHour != 20 {
+		t.Errorf("pool net_burn_5h_per_hour = %v, want 20", snap.Pool.NetBurn5hPerHour)
 	}
 	if snap.Pool.DryAt.IsZero() {
 		t.Error("pool dry_at missing despite positive burn and no reset relief")

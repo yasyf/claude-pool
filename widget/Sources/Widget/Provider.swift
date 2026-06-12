@@ -29,15 +29,25 @@ struct StatusProvider: TimelineProvider {
 
     func getTimeline(in _: Context, completion: @escaping (Timeline<StatusEntry>) -> Void) {
         let now = Date()
-        // One entry, staleness judged at build time. Deliberately NO
+        // One load, staleness judged at build time. Deliberately NO
         // future-dated pre-dimmed entry: reloads are budget-throttled
         // (reloadAllTimelines included), so a synthetic stale flip at
         // generated_at+staleAfter false-positives between throttled reloads —
         // the widget spent most of its life dimmed over a perfectly fresh
-        // file. Stale dimming is therefore best-effort (next rebuild); the
-        // self-updating relative "updated … ago" footer carries true age.
-        let entry = load(at: now)
-        completion(Timeline(entries: [entry], policy: .after(now.addingTimeInterval(5 * 60))))
+        // file. Stale dimming is therefore best-effort (next rebuild). The
+        // footer's "updated Nm ago" is static text, so the same state is
+        // paginated as future-dated entries — each rendering a fresher
+        // entry.date against the same generated_at — to keep the age honest:
+        // minute-spaced across the requested refresh window, then 5-minute
+        // steps out to an hour because the .after(5m) ask sits below the same
+        // reload throttle; without the tail the age would freeze at "4m ago"
+        // for however long WidgetKit defers the reload.
+        let state = load(at: now).state
+        let minuteOffsets = Array(0 ..< 5) + Array(stride(from: 5, through: 60, by: 5))
+        let entries = minuteOffsets.map { minute in
+            StatusEntry(date: now.addingTimeInterval(Double(minute) * 60), state: state)
+        }
+        completion(Timeline(entries: entries, policy: .after(now.addingTimeInterval(5 * 60))))
     }
 
     private func load(at now: Date) -> StatusEntry {

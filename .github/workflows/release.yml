@@ -38,6 +38,8 @@ jobs:
       app_sha256: ${{ steps.shas.outputs.app }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history — the widget's CURRENT_PROJECT_VERSION is the commit count
 
       - uses: actions/setup-go@v6
         with:
@@ -83,14 +85,24 @@ jobs:
           brew install xcodegen
           cd widget
           xcodegen generate
+          # chronod caches widget metadata (supported size families) keyed by
+          # bundle version — stamp a real, monotonic version per release or the
+          # gallery keeps a stale descriptor and never gains new widget sizes.
           xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
-            -configuration Release -derivedDataPath build build
+            -configuration Release -derivedDataPath build build \
+            MARKETING_VERSION="${GITHUB_REF_NAME#v}" \
+            CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)"
           APP=build/Build/Products/Release/CCPoolStatus.app
           # The appex must carry the sandbox + ~/.cc-pool read exception, or the
           # widget silently can't read status.json — fail the release instead.
           codesign --verify --strict "$APP"
           codesign -d --entitlements - "$APP/Contents/PlugIns/CCPoolStatusWidget.appex" 2>&1 |
             grep -q "temporary-exception.files.home-relative-path.read-only"
+          # The stamp must actually reach both bundles ($(…) wiring lives in
+          # project.yml's info.properties) — a silent 1/1.0 re-ships the
+          # stale-gallery bug. The appex is the bundle chronod inspects.
+          test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" != 1
+          test "$(plutil -extract CFBundleVersion raw "$APP/Contents/PlugIns/CCPoolStatusWidget.appex/Contents/Info.plist")" != 1
           # ditto -c -k preserves the bundle metadata a plain zip would drop.
           ditto -c -k --keepParent "$APP" "../dist/cc-pool-status-${GITHUB_REF_NAME}-darwin.zip"
 

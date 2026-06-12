@@ -45,8 +45,12 @@ Requires full Xcode (CommandLineTools alone cannot build app targets) and
 ```sh
 cd widget
 xcodegen generate
+# macOS caches widget metadata by bundle version — bump it every build or the
+# gallery keeps a stale descriptor. Epoch seconds is unique per build (commit
+# count, used in CI, wouldn't change across uncommitted rebuilds).
 xcodebuild -project CCPoolStatus.xcodeproj -scheme CCPoolStatus \
-  -configuration Release -derivedDataPath build build
+  -configuration Release -derivedDataPath build build \
+  CURRENT_PROJECT_VERSION=$(date +%s)
 ditto build/Build/Products/Release/CCPoolStatus.app ~/Applications/CCPoolStatus.app
 open ~/Applications/CCPoolStatus.app
 ```

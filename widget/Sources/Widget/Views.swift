@@ -56,7 +56,8 @@ struct PoolBoardView: View {
             PoolHeaderView(outlook: status.outlook,
                            critterSize: style == .detailed ? 44 : 26,
                            detailed: style == .detailed, seed: seed)
-            AccountListView(status: status, stale: stale, maxRows: maxRows, style: style)
+            AccountListView(status: status, stale: stale, now: seed,
+                            maxRows: maxRows, style: style)
         }
         .opacity(stale ? 0.55 : 1)
     }
@@ -106,7 +107,7 @@ struct PoolHeaderView: View {
     }
 
     private func headline(_ o: PoolOutlook) -> String {
-        let pct = "Pool \(Int(o.remaining5hPct.rounded()))%"
+        let pct = "Pool \(Int((100 - o.remaining5hPct).rounded()))% used"
         guard detailed else { return pct }
         // The compact caption moves into the headline on the large widget;
         // burn lives on the second line, so only the dry clock joins here.
@@ -117,11 +118,7 @@ struct PoolHeaderView: View {
     }
 
     private func secondLine(_ o: PoolOutlook) -> String {
-        var parts = ["7d \(Int(o.remaining7dPct.rounded()))%"]
-        if o.burn5hPerHour >= 1 {
-            parts.append("burn \(Int(o.burn5hPerHour.rounded()))%/h")
-        }
-        return parts.joined(separator: " · ")
+        "7d \(Int((100 - o.remaining7dPct).rounded()))% · " + o.burnPhrase
     }
 }
 
@@ -131,6 +128,7 @@ struct PoolHeaderView: View {
 struct AccountListView: View {
     let status: PoolStatus
     let stale: Bool
+    let now: Date
     let maxRows: Int
     let style: RowStyle
 
@@ -141,7 +139,7 @@ struct AccountListView: View {
                 AccountRow(account: account, style: style, rank: rank)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             }
-            FooterView(generatedAt: status.generatedAt, stale: stale,
+            FooterView(generatedAt: status.generatedAt, now: now, stale: stale,
                        overflow: max(0, ranked.count - maxRows))
                 .padding(.top, 2)
         }
@@ -205,7 +203,7 @@ struct AccountRow: View {
     /// the CLI's RESETS column for both windows plus overage spend.
     private var detail: String? {
         var parts: [String] = []
-        if let prediction = account.predictionText(detailed: true) {
+        if let prediction = account.predictionText() {
             parts.append(prediction)
         }
         if let reset = account.resets5h?.nonZero {
@@ -242,9 +240,12 @@ struct SmallView: View {
                 CritterView(mood: status.outlook?.mood ?? .chill, size: 54, seed: seed)
                 VStack(alignment: .leading, spacing: 0) {
                     if let outlook = status.outlook {
-                        Text("\(Int(outlook.remaining5hPct.rounded()))%")
+                        Text("\(Int((100 - outlook.remaining5hPct).rounded()))%")
                             .font(.system(size: 26, weight: .bold, design: .rounded))
                             .monospacedDigit()
+                            + Text(" used")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         Text(outlook.caption())
                             .font(.caption2)
                             .monospacedDigit()
@@ -287,7 +288,7 @@ struct SmallView: View {
                 }
             }
             Spacer(minLength: 0)
-            FooterView(generatedAt: status.generatedAt, stale: stale, overflow: 0)
+            FooterView(generatedAt: status.generatedAt, now: seed, stale: stale, overflow: 0)
         }
         .opacity(stale ? 0.55 : 1)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -300,9 +301,9 @@ extension AccountStatus {
     var unusable: Bool { rateLimited || isExhausted }
 }
 
-/// Capsule gauge. The bar fills with % USED (matching the `ccp status`
-/// columns); the gradient runs the window's identity hues, heating toward
-/// amber/red as headroom drains.
+/// Capsule gauge. The bar fills with % USED — matching the `ccp status`
+/// columns and the row's number. The gradient runs the window's identity
+/// hues, heating toward amber/red as headroom drains.
 struct HeadroomBar: View {
     let remaining: Double // clamped to 0...100 by the caller
     let alert: Bool
@@ -315,9 +316,10 @@ struct HeadroomBar: View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule().fill(.quaternary)
+                // Floor at the capsule's own diameter so a barely-used
+                // account renders a full dot, not a degenerate sliver —
+                // while an untouched window shows an honest empty track.
                 if usedFraction > 0 {
-                    // Floor at the capsule's own diameter so a barely-used
-                    // account renders a full dot, not a degenerate sliver.
                     Capsule()
                         .fill(usageGradient(kind: kind, remaining: remaining, alert: alert))
                         .frame(width: max(Self.height, geo.size.width * usedFraction))
@@ -330,6 +332,7 @@ struct HeadroomBar: View {
 
 /// "5h ▮▮▮░ 58%" cell: fixed label and percent columns around a flexible
 /// bar, so bars align across rows and split leftover width with siblings.
+/// Bar and number both show % used (see HeadroomBar).
 struct UsageCell: View {
     let window: String
     let remaining: Double
@@ -422,6 +425,11 @@ struct BadgeRow: View {
 
 struct FooterView: View {
     let generatedAt: Date
+    /// The timeline-entry date. The age text is deliberately static — the
+    /// auto-ticking Text(_, style: .relative) counts seconds, far more
+    /// precision than a 3-minute poll cadence deserves — so the provider
+    /// paginates minute-spaced entries to advance it.
+    let now: Date
     let stale: Bool
     let overflow: Int
 
@@ -434,27 +442,23 @@ struct FooterView: View {
             }
             Spacer(minLength: 0)
             if stale {
-                Text("stale · ")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                + Text(generatedAt, style: .relative)
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                + Text(" ago")
+                Text("stale · \(age) ago")
                     .font(.caption2)
                     .foregroundStyle(.orange)
             } else {
-                Text("updated ")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                + Text(generatedAt, style: .relative)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                + Text(" ago")
+                Text("updated \(age) ago")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
         }
+    }
+
+    /// Coarse single-unit age: "<1m", "3m", "2h" (floored).
+    private var age: String {
+        let s = max(0, now.timeIntervalSince(generatedAt))
+        if s < 60 { return "<1m" }
+        if s < 3600 { return "\(Int(s / 60))m" }
+        return "\(Int(s / 3600))h"
     }
 }
 

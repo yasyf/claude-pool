@@ -122,15 +122,22 @@ type StatusSnapshot struct {
 }
 
 // PoolOutlook is the wire form of the forecast pool rollup: mean remaining
-// capacity, summed burn, projected dry-out, and the alarm mood. Mood is
-// computed here, daemon-side, so the widget mascot and any CLI rendering
+// capacity, summed and net burn, projected dry-out, and the alarm mood. Mood
+// is computed here, daemon-side, so the widget mascot and any CLI rendering
 // always agree.
 type PoolOutlook struct {
-	Remaining5hPct float64       `json:"remaining_5h_pct"`
-	Remaining7dPct float64       `json:"remaining_7d_pct"`
-	Burn5hPerHour  float64       `json:"burn_5h_per_hour,omitempty"`
-	DryAt          time.Time     `json:"dry_at,omitzero"`
-	Mood           forecast.Mood `json:"mood"`
+	Remaining5hPct float64 `json:"remaining_5h_pct"`
+	Remaining7dPct float64 `json:"remaining_7d_pct"`
+	Burn5hPerHour  float64 `json:"burn_5h_per_hour,omitempty"`
+	// NetBurn5hPerHour is forecast.Pool.NetBurnPerHour: the projected drop of
+	// Remaining5hPct over the next hour, points/hr, crediting refills inside
+	// that hour. Deliberately NOT omitempty: a balanced pool's net is exactly
+	// 0, and the widget treats an absent key as "daemon predates the field"
+	// and falls back to the gross burn — omitting 0 would caption a balanced
+	// pool with its gross rate.
+	NetBurn5hPerHour float64       `json:"net_burn_5h_per_hour"`
+	DryAt            time.Time     `json:"dry_at,omitzero"`
+	Mood             forecast.Mood `json:"mood"`
 }
 
 // NewStatusSnapshot stamps accounts with the protocol version, build version,
@@ -165,11 +172,12 @@ func NewStatusSnapshot(accounts []AccountStatus, now time.Time) StatusSnapshot {
 	}
 	if p, ok := forecast.PoolOf(pa, now); ok {
 		snap.Pool = &PoolOutlook{
-			Remaining5hPct: p.Remaining5h,
-			Remaining7dPct: p.Remaining7d,
-			Burn5hPerHour:  p.BurnPerHour,
-			DryAt:          p.DryAt,
-			Mood:           p.Mood,
+			Remaining5hPct:   p.Remaining5h,
+			Remaining7dPct:   p.Remaining7d,
+			Burn5hPerHour:    p.BurnPerHour,
+			NetBurn5hPerHour: p.NetBurnPerHour,
+			DryAt:            p.DryAt,
+			Mood:             p.Mood,
 		}
 	}
 	return snap

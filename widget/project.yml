@@ -32,6 +32,12 @@ targets:
       path: Generated/App-Info.plist
       properties:
         CFBundleDisplayName: cc-pool Status
+        # XcodeGen writes literal values into the generated plist; without these
+        # $(…) references the MARKETING_VERSION/CURRENT_PROJECT_VERSION build
+        # settings (and any command-line overrides) never reach the bundle — and
+        # chronod caches widget metadata keyed by bundle version.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSUIElement: true # agent app: no Dock icon, no menu bar
         LSApplicationCategoryType: public.app-category.developer-tools
     settings:
@@ -58,6 +64,10 @@ targets:
       path: Generated/Widget-Info.plist
       properties:
         CFBundleDisplayName: cc-pool Status
+        # Same $(…) wiring as the host app — the appex must carry the stamped
+        # version too; it is the bundle chronod actually inspects.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:

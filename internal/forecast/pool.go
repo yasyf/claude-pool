@@ -53,6 +53,13 @@ type Pool struct {
 	// BurnPerHour is the summed drain across usable accounts, in
 	// percent-of-one-account's-window per hour.
 	BurnPerHour float64
+	// NetBurnPerHour is the projected change of the pool's mean 5h remaining
+	// over the next hour, in percentage points per hour, crediting 5h-window
+	// refills that land inside that hour. Positive means draining; negative
+	// means refills outpace burn (the pool is recovering). Unlike the summed
+	// BurnPerHour it is mean-based, so it describes exactly how fast
+	// Remaining5h moves.
+	NetBurnPerHour float64
 	// DryAt is when the pool's combined 5h remaining hits 0 at the combined
 	// burn, assuming selection keeps rebalancing load freely. Zero when burn
 	// is 0 or a reset refills some window first — absence means "relief
@@ -81,7 +88,7 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 	}
 
 	var usable int
-	var sum5, sum7, burn float64
+	var sum5, sum7, burn, drop float64
 	var earliestReset time.Time
 	for _, a := range accts {
 		if !a.HasUsage || a.RateLimited {
@@ -91,6 +98,7 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 		sum5 += clamp(a.Remaining5h)
 		sum7 += clamp(a.Remaining7d)
 		burn += a.BurnPerHour
+		drop += netDrop(a, now)
 		if a.Resets5h.After(now) && (earliestReset.IsZero() || a.Resets5h.Before(earliestReset)) {
 			earliestReset = a.Resets5h
 		}
@@ -100,6 +108,7 @@ func PoolOf(accts []PoolAccount, now time.Time) (Pool, bool) {
 		p.Remaining5h = sum5 / float64(usable)
 		p.Remaining7d = sum7 / float64(usable)
 		p.BurnPerHour = burn
+		p.NetBurnPerHour = drop / float64(usable) / netBurnHorizon.Hours()
 		if burn > 0 {
 			dry := now.Add(hours(sum5 / burn)).Truncate(time.Second)
 			if earliestReset.IsZero() || dry.Before(earliestReset) {
@@ -135,6 +144,23 @@ func moodOf(usable int, remaining5h float64, dryProjected bool) Mood {
 		m = m.worse()
 	}
 	return m
+}
+
+// netBurnHorizon is the NetBurnPerHour lookahead: refills landing inside it
+// are credited, later ones ignored.
+const netBurnHorizon = time.Hour
+
+// netDrop projects how many points of a's clamped 5h remaining vanish over
+// the next netBurnHorizon: a window resetting inside the horizon refills to
+// 100 and keeps draining for the rest of it, and remaining never drains below
+// 0. Negative means the refill outweighs the burn.
+func netDrop(a PoolAccount, now time.Time) float64 {
+	start := clamp(a.Remaining5h)
+	if a.Resets5h.After(now) && !a.Resets5h.After(now.Add(netBurnHorizon)) {
+		rest := netBurnHorizon - a.Resets5h.Sub(now)
+		return start - max(0, 100-a.BurnPerHour*rest.Hours())
+	}
+	return start - max(0, start-a.BurnPerHour*netBurnHorizon.Hours())
 }
 
 func clamp(v float64) float64 { return max(0, min(100, v)) }
