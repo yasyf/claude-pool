@@ -11,10 +11,11 @@
 // from sharing because they are instance-local runtime state that would
 // conflict across concurrent sessions; see ExcludedEntries and PrivateEntry.
 // Held-back files stay per-account, but .claude.json's shareable top-level
-// keys (everything outside ClaudeJSONPrivateKeys) still propagate: one-way
-// base→account at launch under symlink (pool.MergeBaseClaudeJSON), two-way
-// under fuse (live merged read view plus shareable-key write-through to
-// ~/.claude.json).
+// keys (everything outside ClaudeJSONPrivateKeys, plus the per-project
+// approval keys ClaudeJSONSharedProjectKeys carves out of "projects") still
+// propagate: one-way base→account at launch under symlink
+// (pool.MergeBaseClaudeJSON), two-way under fuse (live merged read view plus
+// shareable-key write-through to ~/.claude.json).
 package overlay
 
 import "strings"
@@ -64,10 +65,11 @@ var skipEntries = map[string]bool{
 // the excluded dirs above, plus claude's primary state file .claude.json and
 // its atomic-write temp files (.claude.json.tmp.XXXX) — the file itself is
 // never linked or mirrored, but only its ClaudeJSONPrivateKeys (identity like
-// oauthAccount, per-account state) are truly private; every other key
-// propagates between base and account (symlink: one-way base-wins launch
-// merge, pool.MergeBaseClaudeJSON; fuse: live merged view with shareable keys
-// written through to ~/.claude.json). Plus .credentials.json (and its
+// oauthAccount, per-account state) are truly private — and even there,
+// "projects" carves out the per-project ClaudeJSONSharedProjectKeys, which
+// cross both ways; every other key propagates between base and account
+// (symlink: one-way base-wins launch merge, pool.MergeBaseClaudeJSON; fuse:
+// live merged view with shareable keys written through to ~/.claude.json). Plus .credentials.json (and its
 // temp/lock siblings), claude's plaintext credential
 // store — the OAuth token blob it writes to $CONFIG_DIR/.credentials.json when
 // the macOS Keychain is unavailable (e.g. a headless SSH session). Sharing it

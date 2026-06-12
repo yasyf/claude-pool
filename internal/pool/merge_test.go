@@ -314,6 +314,53 @@ func TestMergeClaudeJSON(t *testing.T) {
 			t.Fatal("merge must not land in the mountpoint dir")
 		}
 	})
+
+	t.Run("base project approval lands once, then pins unchanged on re-run", func(t *testing.T) {
+		// The pretty-printed src is the production shape (claude's own writer);
+		// a second MergeApplied here is the launch-flap bug, not a tie-break.
+		acct := t.TempDir()
+		dst := writeDst(t, acct, `{"theme": "light", "projects": {"/p":{"history":["mine"]}}}`)
+		src := writeSrc(t, `{
+  "theme": "light",
+  "projects": {
+    "/p": {
+      "history": ["theirs"],
+      "hasTrustDialogAccepted": true
+    }
+  }
+}`)
+		out, err := mergeClaudeJSON(prov, acct, src)
+		if err != nil || out != MergeApplied {
+			t.Fatalf("first merge: outcome = %q err = %v, want %q", out, err, MergeApplied)
+		}
+		proj := rawTop(t, rawTop(t, readFile(t, dst))["projects"])
+		entry := rawTop(t, proj["/p"])
+		if string(entry["hasTrustDialogAccepted"]) != `true` {
+			t.Errorf("approval did not reach the account: %s", proj["/p"])
+		}
+		if string(entry["history"]) != `["mine"]` {
+			t.Errorf("base project history clobbered the account's own: %s", entry["history"])
+		}
+		out, err = mergeClaudeJSON(prov, acct, src)
+		if err != nil || out != MergeUnchanged {
+			t.Fatalf("second merge: outcome = %q err = %v, want %q", out, err, MergeUnchanged)
+		}
+	})
+
+	t.Run("recreated account file carries skeleton project entries, shared keys only", func(t *testing.T) {
+		acct := t.TempDir()
+		src := writeSrc(t, `{"theme": "light", "projects": {"/p":{"history":["theirs"],"lastSessionId":"s","hasTrustDialogAccepted":true,"enabledMcpjsonServers":["srv"]}}}`)
+		out, err := mergeClaudeJSON(prov, acct, src)
+		if err != nil || out != MergeRecreated {
+			t.Fatalf("outcome = %q err = %v, want %q", out, err, MergeRecreated)
+		}
+		proj := rawTop(t, rawTop(t, readFile(t, filepath.Join(acct, ".claude.json")))["projects"])
+		// Byte-exact skeleton (json.Marshal key-sorts): the two shared keys and
+		// nothing else — base history and session state never land.
+		if string(proj["/p"]) != `{"enabledMcpjsonServers":["srv"],"hasTrustDialogAccepted":true}` {
+			t.Fatalf(`recreated projects["/p"] = %s, want the shared keys only`, proj["/p"])
+		}
+	})
 }
 
 // TestMergeBaseClaudeJSON pins the Manager-level gate: only accounts whose

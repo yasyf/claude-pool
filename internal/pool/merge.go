@@ -21,7 +21,10 @@ const (
 	// MergeNoBase: no ~/.claude.json exists; there is nothing to propagate.
 	MergeNoBase MergeOutcome = "no-base"
 	// MergeRecreated: the account file was missing and was recreated as
-	// base-minus-blacklist — no onboarding wizard, no inherited identity.
+	// base-minus-blacklist — no onboarding wizard, no inherited identity. The
+	// recreated file does mint a skeleton projects entry per base project
+	// carrying only overlay.ClaudeJSONSharedProjectKeys (desired: trust and
+	// MCP approvals carry over, history and session state never do).
 	MergeRecreated MergeOutcome = "recreated"
 	// MergeSkippedOverlay: the account's recorded overlay kind is not symlink;
 	// the fuse arm owns its own merged view, so the launch merge stays out.
@@ -29,9 +32,9 @@ const (
 )
 
 // mergeClaudeJSON propagates ~/.claude.json's shareable top-level keys
-// (everything outside overlay.ClaudeJSONPrivateKeys, base wins) into an
-// account's private .claude.json at launch time. An unchanged merge skips the
-// write entirely. The merge is only guaranteed visible to the session being
+// (everything outside overlay.ClaudeJSONPrivateKeys, base wins) plus the
+// per-project overlay.ClaudeJSONSharedProjectKeys into an account's private
+// .claude.json at launch time. An unchanged merge skips the write entirely. The merge is only guaranteed visible to the session being
 // launched: a concurrently live session on the same account rewrites the file
 // from memory and later clobbers merged values — an accepted limitation, with
 // no machinery against it. A launch merging mid-conversion is the same
