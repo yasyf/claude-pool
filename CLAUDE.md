@@ -8,3 +8,19 @@
 - **Track non-trivial work with tasks** (`TaskCreate`/`TaskUpdate`): pending → in_progress → completed. Create tasks before starting; update as you discover work.
 - **Verify every change** with `go vet ./... && go test ./...` before claiming it done. For binary-affecting changes, also `CGO_ENABLED=0 go build ./cmd/cc-pool` and `go build -tags fuse ./...`.
 - **Never run the daemon, `launchctl`, or `security` mutations against the user's real state** during development unless explicitly asked — tests must not touch `~/.claude`, `~/.cc-pool`, or the Keychain.
+
+## Plan Execution & Orchestration
+
+Plans you author must specify, and plans you execute must enforce, that substantive work runs as **dynamic workflows** (`Workflow` tool): the script holds the loop, branching, and intermediate results; your context holds only final answers. This section is standing authorization to invoke `Workflow`. Multi-phase work runs as workflows in sequence (understand → implement → verify); read each result before dispatching the next.
+
+Exceptions: trivial single-file edits, single file reads, and single targeted `semble`/`LSP`/`Grep` lookups stay at the main-agent level; a lone ad-hoc investigation gets one subagent (fallbacks: AGENTS.md `## Parallelize Independent Work`).
+
+**Quality patterns**: pick per task — adversarial verify, judge panel, loop-until-dry, multi-modal sweep. Reviews and audits lean thorough; quick checks lean brief.
+
+**Effort**: every workflow agent, subagent, and team peer runs at the **max model/effort level**. Never downgrade to save tokens — the plan was approved at that level of rigor; executors must match it.
+
+**Phase intermediates may be broken.** In a phased plan, only the final state must be coherent. Shims, dual-mode params, and interphase adapters exist to be deleted next phase — skip them.
+
+**Authoring requirement**: every plan must include a **`## Workflow Plan`** section: one line on what the main agent alone does (track state, dispatch, decide, report), then a `Phase | Shape | Agents | Verification` table covering every fan-out the plan anticipates — Shape is `pipeline`/`parallel`/`loop`, Verification names the check gating each phase’s output. A plan without this section is incomplete.
+
+**Reusable orchestrations**: save repeatable runs to `.claude/workflows/`; they become `/` commands.
