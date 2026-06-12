@@ -1,6 +1,6 @@
 # cc-pool
 
-![cc-pool banner](docs/assets/readme-banner.png)
+![cc-pool banner](docs/assets/readme-banner.webp)
 
 [![CI](https://img.shields.io/github/actions/workflow/status/yasyf/cc-pool/ci.yml?branch=main&label=CI)](https://github.com/yasyf/cc-pool/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/yasyf/cc-pool)](https://github.com/yasyf/cc-pool/releases)
