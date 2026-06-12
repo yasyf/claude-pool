@@ -17,8 +17,8 @@
 class CcPool < Formula
   desc "Predictive multi-account load-balancing for Claude Code"
   homepage "https://github.com/yasyf/cc-pool"
-  url "https://github.com/yasyf/cc-pool/releases/download/v0.22.0/cc-pool-v0.22.0-darwin-universal.tar.gz"
-  sha256 "14bd058ebede6fe52ab7cd980044d14138998626cacaf10b93bef88728519073" # pure
+  url "https://github.com/yasyf/cc-pool/releases/download/v0.23.0/cc-pool-v0.23.0-darwin-universal.tar.gz"
+  sha256 "47425e24188e69fb77f0328070a385cce71c4170806397d3ca0e4cdf68e25965" # pure
   license "PolyForm-Noncommercial-1.0.0"
 
   livecheck do
@@ -41,8 +41,8 @@ class CcPool < Formula
   # The fuse-variant binary (cgo, -tags fuse). A resource keeps the second
   # artifact checksummed; it is only downloaded when staged below.
   resource "fuse" do
-    url "https://github.com/yasyf/cc-pool/releases/download/v0.22.0/cc-pool-v0.22.0-darwin-universal-fuse.tar.gz"
-    sha256 "47927b49d57a0d97b2d7cc6c563c294e6ce686ad5b6fc499d4c726e253046529" # fuse
+    url "https://github.com/yasyf/cc-pool/releases/download/v0.23.0/cc-pool-v0.23.0-darwin-universal-fuse.tar.gz"
+    sha256 "5a3fd46c614d8c9f8718ee064d4a7a014d388b193be5bceba9da5d509bf78969" # fuse
   end
 
   def install
