@@ -43,6 +43,10 @@ type Request struct {
 	// the only process that can perform conversions — it hosts the in-process
 	// fuse mounts and owns the select reservations the conversion gates on.
 	To string `json:"to,omitempty"`
+	// Force: migrate even when accounts have live sessions (the user vouches
+	// they are idle). Reservations still refuse — a reserved account has a
+	// claude launching into it right now.
+	Force bool `json:"force,omitempty"`
 }
 
 // MigrationOutcome classifies one account's migrate result.

@@ -538,6 +538,40 @@ func TestHandleMigrateBudgetExhausted(t *testing.T) {
 	}
 }
 
+// TestConvertAccountForceStillRespectsReservations pins --force's boundary:
+// it skips only the live-session gate. A reservation means a claude is
+// launching into the dir right now — force must not override it.
+func TestConvertAccountForceStillRespectsReservations(t *testing.T) {
+	s, _, fake := newMigrateServer(t)
+	if !s.tryReserve(1) {
+		t.Fatal("tryReserve failed on a free account")
+	}
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := s.convertAccount(a, overlay.KindFuse, true)
+	if res.Outcome != MigrationBusy {
+		t.Fatalf("outcome = %s, want busy despite force", res.Outcome)
+	}
+	if fake.setupCount() != 0 {
+		t.Fatal("forced conversion ran over a live reservation")
+	}
+
+	// Force flows through the wire: with the reservation expired, a forced
+	// sweep converts both accounts.
+	s.mu.Lock()
+	s.reservations[1] = time.Now().Add(-reservationTTL - time.Second)
+	s.mu.Unlock()
+	resp := s.handleMigrate(t.Context(), Request{Op: OpMigrate, To: "fuse", Force: true})
+	if !resp.OK {
+		t.Fatalf("forced migrate failed: %s", resp.Error)
+	}
+	if got := outcomes(resp); got[1] != MigrationDone || got[2] != MigrationDone {
+		t.Fatalf("outcomes = %v, want both done", got)
+	}
+}
+
 // TestConvertAccountRefetchesRow pins the stale-snapshot fix: the row is
 // re-read under the claim, so a kind that changed since the caller's list is
 // honored instead of double-converting (or converting from a wrong source).
@@ -553,7 +587,7 @@ func TestConvertAccountRefetchesRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := s.convertAccount(stale, overlay.KindFuse) // stale still says symlink
+	res := s.convertAccount(stale, overlay.KindFuse, false) // stale still says symlink
 	if res.Outcome != MigrationAlready {
 		t.Fatalf("outcome = %s (%s), want already", res.Outcome, res.Detail)
 	}

@@ -14,6 +14,7 @@ import (
 func newMigrateCmd() *cobra.Command {
 	var account int
 	var to string
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "migrate",
 		Short: "Convert accounts to a different overlay provider (symlink ⇄ fuse)",
@@ -69,7 +70,7 @@ re-run. New accounts follow the last migrated-to provider.`,
 				if account > 0 {
 					acct = &account
 				}
-				resp, err := cl.Migrate(acct, string(kind))
+				resp, err := cl.Migrate(acct, string(kind), force)
 				if err != nil {
 					return fmt.Errorf("migrate: %w", err)
 				}
@@ -85,6 +86,7 @@ re-run. New accounts follow the last migrated-to provider.`,
 	}
 	cmd.Flags().IntVar(&account, "account", 0, "convert only this account id")
 	cmd.Flags().StringVar(&to, "to", string(overlay.KindFuse), "target overlay kind: fuse or symlink")
+	cmd.Flags().BoolVar(&force, "force", false, "migrate despite live sessions (idle ones may briefly error mid-flip; launching ones still refuse)")
 	return cmd
 }
 

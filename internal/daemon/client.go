@@ -85,9 +85,10 @@ const migrateTimeout = 150 * time.Second
 
 // Migrate asks the daemon to convert accounts to the given overlay kind.
 // account nil means every account not already at the kind; busy accounts are
-// skipped and reported, so re-running sweeps the stragglers.
-func (c *Client) Migrate(account *int, to string) (*Response, error) {
-	return c.do(Request{Op: OpMigrate, Account: account, To: to}, migrateTimeout)
+// skipped and reported, so re-running sweeps the stragglers. force skips the
+// live-session gate (reservations still refuse).
+func (c *Client) Migrate(account *int, to string, force bool) (*Response, error) {
+	return c.do(Request{Op: OpMigrate, Account: account, To: to, Force: force}, migrateTimeout)
 }
 
 // Shutdown asks the daemon to step down. An OK reply means it accepted and will
