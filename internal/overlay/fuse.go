@@ -28,7 +28,10 @@ import (
 
 const fuseBuilt = true
 
-func fuseProvider() (Provider, bool) { return &FuseProvider{}, true }
+// InProcessFuse returns the in-process fuse provider, available only in fuse
+// builds. Mounts it creates live and die with the calling process; once the
+// mount-holder lands it must only be consumed by the holder process.
+func InProcessFuse() (Provider, bool) { return &FuseProvider{}, true }
 
 func init() {
 	// This machine (and many dev Macs) may have BOTH macFUSE's libfuse.2.dylib
@@ -125,7 +128,7 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 		case <-done:
 		case <-time.After(3 * time.Second):
 		}
-		return fmt.Errorf("fuse mount of %s did not come up (grant Network Volumes access once in System Settings ▸ Privacy, then retry; symlink is used until then)", accountDir)
+		return fmt.Errorf("%w: %s (grant Network Volumes access once in System Settings ▸ Privacy, then retry; symlink is used until then)", ErrMountNotLive, accountDir)
 	}
 	mountMu.Lock()
 	mounts[accountDir] = &mountHandle{host: host, fs: fs, done: done}
@@ -146,7 +149,7 @@ func (p *FuseProvider) Sync(base, accountDir string) error {
 // retries Setup, which early-returns on the registered mount.
 func (p *FuseProvider) Health(base, accountDir string) error {
 	var liveness error
-	if !mountLive(base, accountDir) {
+	if !MountAlive(base, accountDir) {
 		liveness = fmt.Errorf("fuse mount at %s is not live", accountDir)
 	}
 	mountMu.Lock()
@@ -200,41 +203,18 @@ func (p *FuseProvider) Teardown(base, accountDir string) error {
 	}
 	// Honest teardown: confirm the path is no longer a mountpoint. If the
 	// unmount wedged (e.g. fuse-t issue-45), report it so callers do NOT
-	// RemoveAll through a live mount into the backing ~/.claude.
-	if Mounted(accountDir) {
-		return fmt.Errorf("unmount of %s did not take; refusing to treat it as torn down", accountDir)
+	// RemoveAll through a live mount into the backing ~/.claude. Bounded: the
+	// stat itself can wedge with the mirror a forced unmount failed to clear,
+	// and a probe that does not answer reads still-mounted — never torn down.
+	if m, ok := MountedWithin(accountDir); !ok || m {
+		return fmt.Errorf("%w: %s; refusing to treat it as torn down", ErrUnmountWedged, accountDir)
 	}
 	return nil
 }
 
-// waitMounted polls until base's contents are visible through accountDir.
-func waitMounted(base, accountDir string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if mountLive(base, accountDir) {
-			return true
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return false
-}
-
-// mountLive reports whether accountDir currently mirrors base. It compares a
-// stat of base itself (always exists) seen through the mountpoint.
-func mountLive(base, accountDir string) bool {
-	fi, err := os.Stat(accountDir)
-	if err != nil || !fi.IsDir() {
-		return false
-	}
-	// The mount is "live" if the dir is backed by a fuse fs; a cheap proxy is
-	// that reading it does not error and base's own entries are visible.
-	entries, err := os.ReadDir(base)
-	if err != nil || len(entries) == 0 {
-		return err == nil
-	}
-	_, err = os.Lstat(filepath.Join(accountDir, entries[0].Name()))
-	return err == nil
-}
+// HostProbe attempts a throwaway in-process probe mount; it must run in the
+// process that will host mounts (capability + TCC grant are per-process).
+func HostProbe() bool { return probeFuse() }
 
 // probeFuse attempts a throwaway mount to confirm fuse-t works on this machine
 // (and trips the one-time "Network Volumes" privacy grant). Used by Detect.

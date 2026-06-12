@@ -113,14 +113,5 @@ type Provider interface {
 	PrivateRoot(accountDir string) string
 }
 
-// For returns the provider for a given kind. Unknown/empty kinds fall back to
-// the symlink provider. The fuse provider is only returned when the binary was
-// built with -tags fuse AND fuse-t is usable; otherwise this returns symlink.
-func For(kind Kind) Provider {
-	if kind == KindFuse {
-		if p, ok := fuseProvider(); ok {
-			return p
-		}
-	}
-	return &SymlinkProvider{}
-}
+// FuseBuilt reports whether this binary includes the fuse provider at all.
+func FuseBuilt() bool { return fuseBuilt }

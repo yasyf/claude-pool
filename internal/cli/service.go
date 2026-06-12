@@ -3,14 +3,40 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
+	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/peerpid"
 	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/service"
+	"github.com/yasyf/cc-pool/internal/store"
 	"github.com/yasyf/cc-pool/internal/version"
+)
+
+// Test seams. CLI tests must never scan real processes, stat real
+// mountpoints, signal real pids, or drive launchctl/brew; each var is the
+// real implementation in production and a fake in tests.
+var (
+	scanSessions   = procscan.Scan
+	dirMounted     = overlay.Mounted
+	mountAliveAt   = overlay.MountAlive
+	killHolderPeer = peerpid.Kill
+	stopDaemon     = stopDaemonService
+	brewManaged    = service.IsBrewManaged
+	brewStop       = service.BrewStop
+	// holderGoneWait bounds each wait for the mount holder to release its
+	// socket after Shutdown (and again after the kill escalation). The
+	// holder's sweep runs under a 60s op deadline and the client's Shutdown
+	// timeout is 65s, so this sits just above both — the same rationale as
+	// the daemon's defaultHolderGoneWait.
+	holderGoneWait = 70 * time.Second
 )
 
 func newServiceCmd() *cobra.Command {
@@ -28,7 +54,7 @@ func newServiceCmd() *cobra.Command {
 		newServiceUninstallCmd(),
 		&cobra.Command{
 			Use:   "status",
-			Short: "Show daemon/LaunchAgent status",
+			Short: "Show daemon/LaunchAgent and mount-holder status",
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				out := cmd.OutOrStdout()
@@ -46,6 +72,13 @@ func newServiceCmd() *cobra.Command {
 					fmt.Fprintln(out, "Daemon: not responding")
 				}
 				fmt.Fprintf(out, "Socket: %s\n", pool.SocketPath())
+				fuseRows, err := fuseAccountRows()
+				if err != nil {
+					return err
+				}
+				if line := holderStatusLine(mountd.NewClient(pool.MountsSocketPath()), fuseRows); line != "" {
+					fmt.Fprintln(out, line)
+				}
 				return nil
 			},
 		},
@@ -53,54 +86,265 @@ func newServiceCmd() *cobra.Command {
 	return cmd
 }
 
+// holderStatusLine renders the mount-holder line for `ccp service status`, or
+// "" when there is nothing truthful to say (no holder running and no fuse
+// rows that would need one). It dials the holder directly rather than asking
+// the daemon's cache: the holder outlives daemons by design, and service
+// status is exactly where the user looks when the two disagree. Same trust as
+// the daemon dial above it — a local 0600 socket.
+func holderStatusLine(cl *mountd.Client, fuseRows int) string {
+	if !cl.Available() {
+		if fuseRows > 0 {
+			return "Mount holder: not running"
+		}
+		return ""
+	}
+	ver, err := cl.Health()
+	if err != nil {
+		return "Mount holder: not responding"
+	}
+	mounts, err := cl.List()
+	if err != nil {
+		return fmt.Sprintf("Mount holder: running (%s, mounts unknown: %v)", ver, err)
+	}
+	line := fmt.Sprintf("Mount holder: running (%s, %s)", ver, plural(len(mounts), "mount"))
+	if ver != version.String() {
+		line += ", version skew — will be replaced when idle"
+	}
+	return line
+}
+
+// fuseAccountRows counts the fuse-kind account rows; `ccp service status`
+// needs it to decide whether an absent holder is worth a line.
+func fuseAccountRows() (int, error) {
+	n := 0
+	err := withManager(func(m *pool.Manager) error {
+		accts, err := m.Store.ListAccounts()
+		if err != nil {
+			return err
+		}
+		n = countFuse(accts)
+		return nil
+	})
+	return n, err
+}
+
+// countFuse counts the fuse-kind rows in an account list.
+func countFuse(accts []store.Account) int {
+	n := 0
+	for _, a := range accts {
+		if overlay.Kind(a.OverlayKind) == overlay.KindFuse {
+			n++
+		}
+	}
+	return n
+}
+
 func newServiceUninstallCmd() *cobra.Command {
 	var purge bool
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Stop and remove the LaunchAgent; --purge also removes pool state",
-		Args:  cobra.NoArgs,
+		Short: "Stop the daemon and mount holder; --purge also removes pool state",
+		Long: `uninstall stops the background daemon and shuts down the detached mount
+holder, unmounting every fuse account. It refuses while live claude sessions
+sit on dirs it would yank — fuse accounts for a plain uninstall, every
+account with --purge — unless --force vouches for them. --purge additionally
+removes all pool accounts, their Keychain items, and ~/.cc-pool; ~/.claude is
+never touched.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			out := cmd.OutOrStdout()
-			if service.IsBrewManaged() {
-				if err := service.BrewStop(); err != nil {
-					warn(cmd.ErrOrStderr(), "couldn't stop the brew service: %v", err)
-				}
-				// Remove any stale self-rolled agent from before the brew switch.
-				_ = service.Uninstall()
-				success(out, "Stopped the daemon.")
-			} else {
-				if err := service.Uninstall(); err != nil {
-					return err
-				}
-				success(out, "Removed the LaunchAgent.")
-			}
-
-			// Always unmount any fuse overlays and re-assert nothing is left mounted.
-			_ = withManager(func(m *pool.Manager) error {
-				accts, _ := m.Store.ListAccounts()
-				for _, a := range accts {
-					if a.OverlayKind != string(overlay.KindFuse) {
-						continue
-					}
-					_ = overlay.For(overlay.KindFuse).Teardown(pool.ClaudeDir(), a.ConfigDir)
-				}
-				return nil
-			})
-
-			if !purge {
-				note(out, "Your accounts and state are preserved. Run `ccp service install` to resume.")
-				return nil
-			}
-			return purgeAll(cmd)
+			return runServiceUninstall(cmd, purge, force)
 		},
 	}
 	cmd.Flags().BoolVar(&purge, "purge", false, "also remove all pool accounts and state; never touches ~/.claude")
+	cmd.Flags().BoolVar(&force, "force", false, "skip the live-session gate (sessions on unmounted dirs will break)")
 	return cmd
+}
+
+// runServiceUninstall is the uninstall flow, strictly gate-before-destruction:
+// (a) refuse while live sessions depend on dirs this run would destroy,
+// (b) stop the daemon (mount-safe: it never touches the holder's mounts),
+// (c) retire the mount holder, (d) re-verify against kernel truth that no
+// account dir is still a mountpoint, and only then (e) purge if asked.
+func runServiceUninstall(cmd *cobra.Command, purge, force bool) error {
+	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
+
+	accts, err := poolAccounts()
+	if err != nil {
+		return err
+	}
+
+	if !force {
+		if err := gateUninstallSessions(accts, purge); err != nil {
+			return err
+		}
+	}
+
+	if err := stopDaemon(cmd); err != nil {
+		return err
+	}
+
+	shutdownHolder(cmd)
+
+	// Kernel-truth sweep verification. A purge must hard-abort on any
+	// survivor: RemoveAll through a live mirror deletes inside ~/.claude.
+	if survivors := mountedAccounts(accts); len(survivors) > 0 {
+		names := make([]string, len(survivors))
+		for i, a := range survivors {
+			names[i] = fmt.Sprintf("acct-%02d", a.ID)
+			warn(errOut, "acct-%02d (%s) is still a live mountpoint", a.ID, a.ConfigDir)
+		}
+		if purge {
+			return fmt.Errorf("refusing to purge: %s is still a live mountpoint; unmount it first (purging through a live mirror would delete inside ~/.claude)", strings.Join(names, ", "))
+		}
+		return fmt.Errorf("%s still mounted after the holder shutdown; check %s", plural(len(survivors), "account dir"), abbreviateHome(pool.MountHolderLogPath()))
+	}
+
+	if !purge {
+		note(out, "Your accounts and state are preserved. Run `ccp service install` to resume.")
+		return nil
+	}
+	return purgeAll(cmd)
+}
+
+// gateUninstallSessions refuses the uninstall while live claude sessions sit
+// on dirs it is about to destroy: a plain uninstall sweeps only the fuse
+// mounts (symlink dirs survive untouched), while --purge removes every
+// account dir. A failed scan aborts — proceeding blind could yank a dir out
+// from under a session we could not see.
+func gateUninstallSessions(accts []store.Account, purge bool) error {
+	sessions, err := scanSessions()
+	if err != nil {
+		return fmt.Errorf("cannot verify no live sessions: %w; re-run with --force to skip this check", err)
+	}
+	var busy []string
+	for _, a := range accts {
+		if !purge && overlay.Kind(a.OverlayKind) != overlay.KindFuse {
+			continue
+		}
+		var pids []string
+		for _, s := range sessions {
+			if a.ConfigDir != "" && s.ConfigDir == a.ConfigDir {
+				pids = append(pids, strconv.Itoa(s.PID))
+			}
+		}
+		if len(pids) > 0 {
+			busy = append(busy, fmt.Sprintf("acct-%02d (pid %s)", a.ID, strings.Join(pids, ", ")))
+		}
+	}
+	if len(busy) > 0 {
+		return fmt.Errorf("live claude sessions are using pool accounts: %s — close them or pass --force", strings.Join(busy, "; "))
+	}
+	return nil
+}
+
+// stopDaemonService stops the daemon: via `brew services` when
+// Homebrew-managed (also clearing any stale self-rolled agent), else the
+// self-rolled LaunchAgent. Mount-safe by design — the daemon never touches
+// the holder's mounts on shutdown. A failed stop is fatal, never a warning:
+// everything after this step (the holder sweep, the purge) is only safe once
+// the daemon is actually down — a still-live daemon respawns the holder and
+// remounts fuse rows on its next supervision tick.
+func stopDaemonService(cmd *cobra.Command) error {
+	out := cmd.OutOrStdout()
+	if brewManaged() {
+		if err := brewStop(); err != nil {
+			return fmt.Errorf("brew services stop: %w — a still-running daemon would respawn the mount holder mid-uninstall", err)
+		}
+		// Remove any stale self-rolled agent from before the brew switch.
+		_ = service.Uninstall()
+		success(out, "Stopped the daemon.")
+		return nil
+	}
+	if err := service.Uninstall(); err != nil {
+		return err
+	}
+	success(out, "Removed the LaunchAgent.")
+	return nil
+}
+
+// shutdownHolder retires the detached mount holder: ask it to sweep its
+// mounts and exit, wait out its socket, and escalate to a socket-peer kill —
+// loudly — only when it wedges. A holder that was never reachable is skipped
+// silently (no holder means no process is serving mounts for us), but the
+// caller still re-verifies kernel truth afterwards: a dead holder can leave
+// mount carcasses.
+func shutdownHolder(cmd *cobra.Command) {
+	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	cl := mountd.NewClient(pool.MountsSocketPath())
+	if !cl.Available() {
+		return
+	}
+	failed, err := cl.Shutdown()
+	if err != nil {
+		warn(errOut, "mount holder shutdown: %v", err)
+	}
+	for _, mi := range failed {
+		warn(errOut, "the mount holder couldn't unmount %s", mi.Dir)
+	}
+	if cl.WaitGone(holderGoneWait) {
+		success(out, "Stopped the mount holder.")
+		return
+	}
+	warn(errOut, "the mount holder won't release %s; killing the process holding it", pool.MountsSocketPath())
+	if _, kerr := killHolderPeer(pool.MountsSocketPath()); kerr != nil {
+		warn(errOut, "couldn't kill the mount holder: %v", kerr)
+	}
+	if cl.WaitGone(holderGoneWait) {
+		success(out, "Stopped the mount holder.")
+		return
+	}
+	warn(errOut, "the mount holder still holds %s; check `ccp service status`", pool.MountsSocketPath())
+}
+
+// poolAccounts lists every account row (empty when the pool has none).
+func poolAccounts() ([]store.Account, error) {
+	var accts []store.Account
+	err := withManager(func(m *pool.Manager) error {
+		var e error
+		accts, e = m.Store.ListAccounts()
+		return e
+	})
+	return accts, err
+}
+
+// mountedAccounts returns the accounts whose config dirs are still
+// mountpoints — kernel truth, independent of what the holder reported.
+func mountedAccounts(accts []store.Account) []store.Account {
+	var still []store.Account
+	for _, a := range accts {
+		if dirMounted(a.ConfigDir) {
+			still = append(still, a)
+		}
+	}
+	return still
+}
+
+// mountedStateDirs returns any dir under ~/.cc-pool/accounts that is still a
+// mountpoint, independent of the (possibly already deleted) account rows. A
+// missing accounts dir means nothing can be mounted under it.
+func mountedStateDirs() []string {
+	entries, err := os.ReadDir(pool.AccountsDir())
+	if err != nil {
+		return nil
+	}
+	var still []string
+	for _, e := range entries {
+		dir := filepath.Join(pool.AccountsDir(), e.Name())
+		if dirMounted(dir) {
+			still = append(still, dir)
+		}
+	}
+	return still
 }
 
 // purgeAll removes every pool account (overlay + Keychain items) and the
 // state dir (which contains the account dirs). ~/.claude and plain claude's
-// canonical credential are never touched.
+// canonical credential are never touched. Callers must already have verified
+// no account dir is a live mountpoint; the re-check immediately before the
+// recursive delete is belt and braces for the catastrophic path — RemoveAll
+// through a live mirror deletes inside ~/.claude.
 func purgeAll(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	err := withManager(func(m *pool.Manager) error {
@@ -118,7 +362,12 @@ func purgeAll(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	_ = os.RemoveAll(pool.StateDir())
+	if still := mountedStateDirs(); len(still) > 0 {
+		return fmt.Errorf("refusing to purge: %s is still a live mountpoint; unmount it first (purging through a live mirror would delete inside ~/.claude)", strings.Join(still, ", "))
+	}
+	if err := os.RemoveAll(pool.StateDir()); err != nil {
+		return fmt.Errorf("remove %s: %w", pool.StateDir(), err)
+	}
 	success(out, "Purged all pool state. ~/.claude is untouched.")
 	return nil
 }
@@ -170,10 +419,10 @@ func ensureDaemon(cmd *cobra.Command) {
 		// pre-upgrade image, or a detached EnsureRunning spawn launchd never
 		// tracked.
 		step(cmd.OutOrStdout(), "Restarting the cc-pool daemon to pick up the new version…")
-		// Bootout first: for a launchd-tracked daemon this terminates it (its
-		// signal handler is still armed, so it unmounts cleanly) and disables
-		// KeepAlive so launchd can't respawn the pre-upgrade image under us. A
-		// no-op for an orphan launchd never tracked.
+		// Bootout first: this terminates a launchd-tracked daemon — mount-safe,
+		// since the detached holder keeps serving any fuse mirrors across it —
+		// and disables KeepAlive so launchd can't respawn the pre-upgrade image
+		// under us. A no-op for an orphan launchd never tracked.
 		if service.IsBrewManaged() {
 			_ = service.BrewStop()
 		} else {
@@ -185,7 +434,7 @@ func ensureDaemon(cmd *cobra.Command) {
 		if !cl.WaitGone(evictTimeout) {
 			_, _ = cl.Shutdown()
 			if !cl.WaitGone(evictTimeout) {
-				if _, err := cl.KillHolder(); err != nil {
+				if _, err := cl.KillSocketPeer(); err != nil {
 					warn(cmd.ErrOrStderr(), "couldn't evict the old daemon (%s): %v", resp.Version, err)
 				}
 				if !cl.WaitGone(evictTimeout) {

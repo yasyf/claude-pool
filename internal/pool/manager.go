@@ -59,9 +59,20 @@ type Manager struct {
 	OAuth    Refresher
 	Keychain CredentialStore
 
-	// OverlayFor resolves an overlay kind to a provider; nil means overlay.For.
-	// Tests inject fakes here so conversion logic runs without a live mount.
+	// OverlayFor resolves an overlay kind to a provider; nil means
+	// pool.OverlayProviderFor. Tests inject fakes here so conversion logic
+	// runs without a live mount.
 	OverlayFor func(overlay.Kind) overlay.Provider
+
+	// DetectOverlay resolves the overlay kind for new accounts when none is
+	// recorded yet; nil means pool.DetectOverlayKind. Tests inject verdicts so
+	// Init never spawns a mount holder.
+	DetectOverlay func() (overlay.Kind, string)
+
+	// CanHostFuse reports whether fuse may be recorded as the new-account
+	// default; nil means pool.CanHostFuse. Tests inject true so conversion
+	// flows run on fake providers in builds that cannot host mounts.
+	CanHostFuse func() bool
 
 	// LockDir holds the per-account cross-process refresh lock files. Open sets
 	// it under the state dir; tests point it at a temp dir so they never touch

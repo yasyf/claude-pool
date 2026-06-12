@@ -81,6 +81,16 @@ func LogPath() string {
 	return filepath.Join(StateDir(), "daemon.log")
 }
 
+// MountsSocketPath is the mount-holder's unix socket path.
+func MountsSocketPath() string {
+	return filepath.Join(StateDir(), "mounts.sock")
+}
+
+// MountHolderLogPath is the mount-holder log path.
+func MountHolderLogPath() string {
+	return filepath.Join(StateDir(), "mount-holder.log")
+}
+
 // StatusSnapshotPath is the daemon's on-disk status mirror
 // (~/.cc-pool/status.json), rewritten atomically after every completed poll
 // for out-of-process readers like the Notification Center widget.

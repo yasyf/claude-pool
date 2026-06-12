@@ -15,36 +15,53 @@ func (m *Manager) overlayFor(kind overlay.Kind) overlay.Provider {
 	if m.OverlayFor != nil {
 		return m.OverlayFor(kind)
 	}
-	return overlay.For(kind)
+	return OverlayProviderFor(kind)
 }
 
-// ErrConvertUnsupported means the requested overlay kind is not actually
-// available in this build: overlay.For would silently hand back the symlink
-// provider, and a conversion that *thinks* it is operating fuse-side while
-// running symlink code paths is exactly how account state gets destroyed.
-var ErrConvertUnsupported = errors.New("overlay kind unavailable in this build")
+// detectOverlay resolves overlay-kind detection through the Manager's
+// injectable seam.
+func (m *Manager) detectOverlay() (overlay.Kind, string) {
+	if m.DetectOverlay != nil {
+		return m.DetectOverlay()
+	}
+	return DetectOverlayKind()
+}
+
+// canHostFuse resolves the fuse-hosting capability check through the
+// Manager's injectable seam.
+func (m *Manager) canHostFuse() bool {
+	if m.CanHostFuse != nil {
+		return m.CanHostFuse()
+	}
+	return CanHostFuse()
+}
+
+// ErrConvertUnsupported means the provider resolved for a conversion's source
+// or target kind does not actually report that kind. The real resolver cannot
+// produce this (KindFuse always maps to the holder-backed RemoteProvider,
+// which always reports KindFuse), so the Kind() fences guard against
+// wrong-kind INJECTED fakes — a conversion that *thinks* it is operating
+// fuse-side while running symlink code paths is exactly how account state
+// gets destroyed. It also fences fuse as the new-account default in builds
+// that cannot host mounts (SetDefaultOverlayKind).
+var ErrConvertUnsupported = errors.New("overlay kind unavailable")
 
 // ConvertOverlay switches an account's overlay provider: it relocates the
 // account's private files between the providers' private roots, tears down the
 // old overlay, establishes the new one, and persists the row — in that order,
 // with the row flip last, so an interrupted conversion always leaves a re-run
-// that converges. The fuse direction hosts an in-process mount and therefore
-// MUST run inside the daemon; callers gate on live sessions/reservations. A
-// failed fuse mount is rolled back to a byte-identical symlink overlay before
-// returning. Converting to the kind the account already has is a no-op.
+// that converges. The fuse direction mounts through the detached mount holder
+// but still MUST run inside the daemon, which alone gates the conversion
+// against live sessions and its own reservations. A failed fuse mount is
+// rolled back to a byte-identical symlink overlay before returning.
+// Converting to the kind the account already has is a no-op.
 func (m *Manager) ConvertOverlay(a store.Account, to overlay.Kind) (store.Account, error) {
 	from := overlay.Kind(a.OverlayKind)
 	if from == to {
 		return a, nil
 	}
 	fromProv, toProv := m.overlayFor(from), m.overlayFor(to)
-	// The fuse→symlink retreat must work even in a build without the fuse
-	// provider (fuse-t uninstalled, cc-pool reinstalled as pure Go) — it is
-	// the only way such a machine can unwedge its fuse rows. No in-process
-	// mount can exist there, so convertToSymlink substitutes a teardown that
-	// verifies the dir is unmounted instead of unmounting.
-	retreat := from == overlay.KindFuse && to == overlay.KindSymlink
-	if fromProv.Kind() != from && !retreat {
+	if fromProv.Kind() != from {
 		return a, fmt.Errorf("convert acct-%02d: source %q: %w", a.ID, from, ErrConvertUnsupported)
 	}
 	if toProv.Kind() != to {
@@ -56,8 +73,8 @@ func (m *Manager) ConvertOverlay(a store.Account, to overlay.Kind) (store.Accoun
 	case overlay.KindSymlink:
 		return m.convertToSymlink(a, fromProv, toProv)
 	default:
-		// Unreachable: For() maps unknown kinds to symlink, so the Kind()
-		// equality checks above already rejected them.
+		// Unreachable: OverlayProviderFor maps unknown kinds to symlink, so
+		// the Kind() equality fences above already rejected them.
 		return a, fmt.Errorf("convert acct-%02d: unknown target %q", a.ID, to)
 	}
 }
@@ -136,24 +153,15 @@ func (m *Manager) rollbackToSymlink(a store.Account, symProv, fuseProv overlay.P
 
 // convertToSymlink turns a fuse account into a symlink one: unmount (verified
 // — never lay links into a live mirror), move private files back beside the
-// links, re-link, flip the row.
+// links, re-link, flip the row. With nothing mounted, the fuse provider's
+// Teardown is an immediate no-op (RemoteProvider contacts no holder), which is
+// exactly the retreat path for a machine whose fuse rows outlived their
+// mounts: the dir is already link-free and unmounted, so the retreat is pure
+// file moves — in every build.
 func (m *Manager) convertToSymlink(a store.Account, fuseProv, symProv overlay.Provider) (store.Account, error) {
 	base, dir := ClaudeDir(), a.ConfigDir
 	priv := overlay.FusePrivateRoot(dir)
-	teardown := func() error { return fuseProv.Teardown(base, dir) }
-	if fuseProv.Kind() != overlay.KindFuse {
-		// Retreat in a build without the fuse provider: never hand the dir to
-		// the silently-substituted symlink provider's Teardown (it would
-		// RemoveAll the excluded dirs). No mount can exist in this build, so
-		// verifying that fact IS the teardown.
-		teardown = func() error {
-			if overlay.Mounted(dir) {
-				return fmt.Errorf("%s is a live mountpoint but this build has no fuse provider to unmount it", dir)
-			}
-			return nil
-		}
-	}
-	if err := teardown(); err != nil {
+	if err := fuseProv.Teardown(base, dir); err != nil {
 		return a, fmt.Errorf("convert acct-%02d: unmount: %w", a.ID, err)
 	}
 	if _, err := os.Stat(priv); err == nil {
@@ -216,15 +224,17 @@ func (m *Manager) HealStrandedPrivate(a store.Account) (bool, error) {
 }
 
 // SetDefaultOverlayKind records kind as the provider for accounts added later
-// (the meta key ensureOverlayKind consults). Fuse is refused in builds without
-// the provider: recording a default this binary cannot establish would mint
-// accounts whose rows promise a mirror their dirs don't have.
+// (the meta key ensureOverlayKind consults). Fuse is refused when this build
+// cannot host fuse mounts (CanHostFuse): the RemoteProvider always reports
+// KindFuse, so a provider-kind fence would always pass, while recording a
+// default whose mount holder this machine cannot spawn would mint accounts
+// whose rows promise a mirror their dirs don't have.
 func (m *Manager) SetDefaultOverlayKind(kind overlay.Kind) error {
 	switch kind {
 	case overlay.KindSymlink:
 	case overlay.KindFuse:
-		if m.overlayFor(overlay.KindFuse).Kind() != overlay.KindFuse {
-			return fmt.Errorf("set default overlay %q: %w", kind, ErrConvertUnsupported)
+		if !m.canHostFuse() {
+			return fmt.Errorf("set default overlay %q: this build cannot host fuse mounts — install fuse-t (brew install macos-fuse-t/cask/fuse-t), then brew reinstall cc-pool: %w", kind, ErrConvertUnsupported)
 		}
 	default:
 		return fmt.Errorf("set default overlay: unknown kind %q", kind)

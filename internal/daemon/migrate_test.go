@@ -1,54 +1,111 @@
 package daemon
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/mountd"
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
 // fakeFuseProv stands in for the fuse provider so handler-level conversion
 // runs without a live mount. Mechanics (file moves, identity verification,
 // rollback ordering) are pinned by internal/pool's convert tests; these tests
-// pin the daemon's gating and wiring.
+// pin the daemon's gating and wiring. The fn seams override the static errors
+// when set and run outside the fake's lock so they may inspect the fake.
 type fakeFuseProv struct {
 	mu          sync.Mutex
+	calls       []string // "setup"/"teardown" in invocation order
 	setups      int
 	teardowns   int
+	healths     int
 	setupErr    error
 	teardownErr error
+	healthErr   error
+	setupFn     func(base, dir string) error
+	teardownFn  func(base, dir string) error
 }
 
-func (f *fakeFuseProv) Kind() overlay.Kind            { return overlay.KindFuse }
-func (f *fakeFuseProv) Sync(base, dir string) error   { return nil }
-func (f *fakeFuseProv) Health(base, dir string) error { return nil }
+func (f *fakeFuseProv) Kind() overlay.Kind          { return overlay.KindFuse }
+func (f *fakeFuseProv) Sync(base, dir string) error { return nil }
+
+func (f *fakeFuseProv) Health(base, dir string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.healths++
+	return f.healthErr
+}
+
+func (f *fakeFuseProv) healthCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.healths
+}
+
 func (f *fakeFuseProv) PrivateRoot(dir string) string { return overlay.FusePrivateRoot(dir) }
 
 func (f *fakeFuseProv) Setup(base, dir string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.setups++
-	return f.setupErr
+	f.calls = append(f.calls, "setup")
+	fn, err := f.setupFn, f.setupErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(base, dir)
+	}
+	return err
 }
 
 func (f *fakeFuseProv) Teardown(base, dir string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.teardowns++
-	return f.teardownErr
+	f.calls = append(f.calls, "teardown")
+	fn, err := f.teardownFn, f.teardownErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(base, dir)
+	}
+	return err
 }
 
 func (f *fakeFuseProv) setupCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.setups
+}
+
+func (f *fakeFuseProv) teardownCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.teardowns
+}
+
+func (f *fakeFuseProv) callOrder() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// fakeOverlayMounted overrides the daemon's kernel-mountpoint seam for one
+// test, restoring it after. Tests using it must not run in parallel.
+func fakeOverlayMounted(t *testing.T, fn func(dir string) bool) {
+	t.Helper()
+	prev := overlayMounted
+	overlayMounted = fn
+	t.Cleanup(func() { overlayMounted = prev })
 }
 
 // newMigrateServer wires newTestServer for migration: hermetic HOME, account
@@ -71,6 +128,11 @@ func newMigrateServer(t *testing.T) (*Server, map[int]string, *fakeFuseProv) {
 		return &overlay.SymlinkProvider{}
 	}
 	s.fuseGateFn = func() string { return "" }
+	// SetDefaultOverlayKind's fence keys on real fuse-hosting capability
+	// (pool.CanHostFuse); these conversions run on fakes, so vouch for
+	// hosting explicitly or the post-migrate default recording would fail in
+	// a pure-build test run.
+	s.m.CanHostFuse = func() bool { return true }
 	return s, dirs, fake
 }
 
@@ -96,7 +158,7 @@ func kindOf(t *testing.T, s *Server, id int) string {
 }
 
 func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
-	s, _, fake := newMigrateServer(t)
+	s, dirs, fake := newMigrateServer(t)
 
 	resp := s.handleMigrate(t.Context(), migrateReq(nil, "fuse"))
 	if !resp.OK {
@@ -111,6 +173,12 @@ func TestHandleMigrateConvertsIdleAccounts(t *testing.T) {
 	}
 	if fake.setupCount() != 2 {
 		t.Fatalf("fuse setups = %d, want 2", fake.setupCount())
+	}
+	// The fresh mounts are visible to selection immediately — the next cache
+	// refresh is up to a full poll away, and an excluded freshly-converted
+	// account would refuse every `ccp run` until then.
+	if !s.holder.ready(dirs[1]) || !s.holder.ready(dirs[2]) {
+		t.Fatal("converted accounts not vouched for in the holder cache")
 	}
 	// The new-account default follows the migration.
 	v, ok, err := s.m.Store.GetMeta("overlay_kind")
@@ -149,11 +217,16 @@ func TestHandleMigrateReverse(t *testing.T) {
 	if kindOf(t, s, 1) != "symlink" || kindOf(t, s, 2) != "symlink" {
 		t.Fatal("rows not flipped back to symlink")
 	}
-	if fake.teardowns != 2 {
-		t.Fatalf("fuse teardowns = %d, want 2", fake.teardowns)
+	if fake.teardownCount() != 2 {
+		t.Fatalf("fuse teardowns = %d, want 2", fake.teardownCount())
 	}
 	if v, _, _ := s.m.Store.GetMeta("overlay_kind"); v != "symlink" {
 		t.Fatalf("meta overlay_kind = %q, want symlink after retreat", v)
+	}
+	// The retreat dropped the cache entries: HolderStatus.Mounts must not keep
+	// counting dismounted mirrors.
+	if got := s.holder.wireStatus().Mounts; got != 0 {
+		t.Fatalf("holder cache still counts %d mount(s) after the retreat", got)
 	}
 	// The dirs are usable symlink accounts again.
 	for _, dir := range dirs {
@@ -376,6 +449,43 @@ func TestFallbackToSymlinkRestoresPrivateFiles(t *testing.T) {
 	}
 }
 
+// TestFallbackToSymlinkClaimAtomicAgainstSelect pins the fallback's claim
+// atomicity: the converting claim is taken BEFORE the idle scan (the migrate
+// path's claim-first order), so a select cannot reserve the account between
+// the gate and ConvertOverlay's force-unmount. The scan seam doubles as the
+// mid-fallback select: a tryReserve issued from inside it must be refused.
+func TestFallbackToSymlinkClaimAtomicAgainstSelect(t *testing.T) {
+	s, _, _ := newMigrateServer(t)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	reservedMidFallback := false
+	s.scanSessions = func() ([]procscan.Session, error) {
+		reservedMidFallback = s.tryReserve(1)
+		return nil, nil
+	}
+
+	s.fallbackToSymlink(a)
+
+	if reservedMidFallback {
+		t.Fatal("a select reserved the account between the idle gate and the conversion")
+	}
+	if kindOf(t, s, 1) != "symlink" {
+		t.Fatal("idle fallback did not convert")
+	}
+	if s.isConverting(1) {
+		t.Fatal("fallback leaked its converting claim")
+	}
+	if !s.tryReserve(1) {
+		t.Fatal("account not reservable after the fallback completed")
+	}
+}
+
 func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 	s, dirs, fake := newMigrateServer(t)
 
@@ -389,8 +499,9 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// acct-2: fuse row whose mount cannot come up — startup must fall back to
-	// a fully usable symlink account.
+	// acct-2: fuse row whose mirror is down (Health fails) and whose mount
+	// cannot come up — startup must fall back to a fully usable symlink
+	// account rather than adopting.
 	a2, err := s.m.Store.GetAccount(2)
 	if err != nil {
 		t.Fatal(err)
@@ -406,6 +517,7 @@ func TestReconcileOverlaysHealsStrandedAndFallsBack(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(priv2, ".claude.json"), []byte("identity2"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	fake.healthErr = errors.New("not a mountpoint")
 	fake.setupErr = errors.New("mount did not come up")
 
 	s.reconcileOverlays(t.Context())
@@ -488,29 +600,63 @@ func TestMountFuseSweepsUnderlay(t *testing.T) {
 		t.Fatalf("setups = %d, want 1", fake.setupCount())
 	}
 
-	// Unavailable provider must refuse loudly, never silently degrade.
+	// A wrong-kind injected fake must be refused loudly, never mounted
+	// through — the real resolver always yields a fuse provider, so the fence
+	// guards against fakes that would run symlink code on fuse paths.
 	s.m.OverlayFor = func(kind overlay.Kind) overlay.Provider { return &overlay.SymlinkProvider{} }
-	if err := s.mountFuse(a); err == nil || !strings.Contains(err.Error(), "unavailable") {
-		t.Fatalf("mountFuse with no fuse provider = %v, want unavailable error", err)
+	if err := s.mountFuse(a); err == nil || !strings.Contains(err.Error(), "reports kind") {
+		t.Fatalf("mountFuse with a wrong-kind provider = %v, want a kind refusal", err)
 	}
 }
 
-// TestMountReadySymmetric pins the kind-symmetric gate: a fuse row needs a
-// mount, a non-fuse row needs the absence of one (a mountpoint under a symlink
-// row is an aborted rollback's wreckage). /dev (devfs) stands in for a mount.
-func TestMountReadySymmetric(t *testing.T) {
-	s, dirs, _ := newMigrateServer(t)
-	if !s.mountReady(store.Account{OverlayKind: "symlink", ConfigDir: dirs[1]}) {
-		t.Fatal("unmounted symlink account not ready")
+// TestMountReady pins the readiness gate: a fuse row trusts ONLY the holder
+// cache (never a filesystem stat — an lstat through a dead fuse-t mount can
+// hang the select path), and a non-fuse row needs the absence of a mountpoint
+// (one under a symlink row is an aborted rollback's wreckage).
+func TestMountReady(t *testing.T) {
+	const dir = "/pool/acct-01"
+	fuse := store.Account{OverlayKind: "fuse", ConfigDir: dir}
+	sym := store.Account{OverlayKind: "symlink", ConfigDir: dir}
+	cases := map[string]struct {
+		a             store.Account
+		healthy       bool
+		mounts        map[string]bool
+		kernelMounted bool
+		want          bool
+	}{
+		"fuse healthy and listed live": {
+			a: fuse, healthy: true, mounts: map[string]bool{dir: true}, kernelMounted: true, want: true,
+		},
+		"fuse healthy but missing from the list": {
+			a: fuse, healthy: true, mounts: map[string]bool{}, kernelMounted: true, want: false,
+		},
+		"fuse healthy but listed dead": {
+			a: fuse, healthy: true, mounts: map[string]bool{dir: false}, kernelMounted: true, want: false,
+		},
+		// THE carcass case: the dir is still a mountpoint per the kernel, but
+		// with the holder dead nothing serves it — selection must never trust
+		// it (the old overlay.Mounted check did).
+		"fuse unhealthy cache ignores a live-looking mountpoint": {
+			a: fuse, healthy: false, mounts: map[string]bool{dir: true}, kernelMounted: true, want: false,
+		},
+		"symlink unmounted": {
+			a: sym, healthy: false, kernelMounted: false, want: true,
+		},
+		"symlink mounted is rollback wreckage": {
+			a: sym, healthy: true, mounts: map[string]bool{dir: true}, kernelMounted: true, want: false,
+		},
 	}
-	if s.mountReady(store.Account{OverlayKind: "fuse", ConfigDir: dirs[1]}) {
-		t.Fatal("unmounted fuse account ready")
-	}
-	if s.mountReady(store.Account{OverlayKind: "symlink", ConfigDir: "/dev"}) {
-		t.Fatal("mounted dir under a symlink row ready")
-	}
-	if !s.mountReady(store.Account{OverlayKind: "fuse", ConfigDir: "/dev"}) {
-		t.Fatal("mounted fuse account not ready")
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, _, _ := newMigrateServer(t)
+			fakeOverlayMounted(t, func(string) bool { return tc.kernelMounted })
+			s.holder.mu.Lock()
+			s.holder.healthy, s.holder.mounts = tc.healthy, tc.mounts
+			s.holder.mu.Unlock()
+			if got := s.mountReady(tc.a); got != tc.want {
+				t.Fatalf("mountReady = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -641,5 +787,397 @@ func TestPollOnceSkipsConvertingAccount(t *testing.T) {
 	s.pollOnce(t.Context())
 	if got := fo.refreshCount(); got != 1 {
 		t.Fatalf("idle near-expiry account refreshed %d time(s), want 1", got)
+	}
+}
+
+// TestReconcileAdoptsLiveMount pins the daemon-restart common case: a fuse row
+// whose mirror is already live (the detached holder survived the restart) is
+// adopted untouched — no teardown, no sweep, no remount — and vouched for in
+// the holder cache directly, not left to the startup refresh's snapshot.
+func TestReconcileAdoptsLiveMount(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	// healthErr nil (the default): the mirror reads mounted and live.
+
+	s.reconcileOverlays(t.Context())
+
+	if got := fake.callOrder(); len(got) != 0 {
+		t.Fatalf("adoption touched the mount: calls = %v, want none", got)
+	}
+	if !strings.Contains(buf.String(), fmt.Sprintf("acct-%02d adopted live mount", a.ID)) {
+		t.Fatalf("adoption not logged: %q", buf.String())
+	}
+	// The adopt path vouches in place: the startup refresh ran against a dead
+	// holder socket here (markUnhealthy), so only noteMounted can explain a
+	// ready dir — a live mirror implies the holder serving it.
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("adopted mount not vouched for in the holder cache")
+	}
+}
+
+// TestMountFuseClearsDeadMountThenSweepsThenMounts pins mountFuse's fixed
+// order: a mounted-but-dead mirror comes down first, then the (now unmounted)
+// underlay is swept, then Setup — and the fresh mount lands in the holder
+// cache so a select before the next poll trusts it.
+func TestMountFuseClearsDeadMountThenSweepsThenMounts(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirs[1], ".claude.json"), []byte("underlay-identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var mounted atomic.Bool
+	mounted.Store(true)
+	fakeOverlayMounted(t, func(string) bool { return mounted.Load() })
+	fake.healthErr = errors.New("mirror is dead")
+	fake.teardownFn = func(string, string) error { mounted.Store(false); return nil }
+	fake.setupFn = func(string, string) error {
+		// The sweep must complete before the mount: the identity must already
+		// be in the backing dir, or the mirror would shadow it.
+		if _, err := os.Stat(filepath.Join(overlay.FusePrivateRoot(dirs[1]), ".claude.json")); err != nil {
+			return fmt.Errorf("setup ran before the sweep: %v", err)
+		}
+		return nil
+	}
+
+	if err := s.mountFuse(a); err != nil {
+		t.Fatalf("mountFuse: %v", err)
+	}
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"teardown", "setup"}) {
+		t.Fatalf("call order = %v, want [teardown setup]", got)
+	}
+	if _, err := os.Lstat(filepath.Join(dirs[1], ".claude.json")); !os.IsNotExist(err) {
+		t.Fatal("identity left in the underlay")
+	}
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("fresh mount not recorded in the holder cache")
+	}
+}
+
+// TestMountFuseWedgedPreClearAborts pins the never-through-a-wedge rule: when
+// the dead mount will not come down, mountFuse returns the error without
+// sweeping or mounting.
+func TestMountFuseWedgedPreClearAborts(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirs[1], ".claude.json"), []byte("underlay-identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeOverlayMounted(t, func(string) bool { return true })
+	fake.healthErr = errors.New("mirror is dead")
+	fake.teardownErr = errors.New("umount: resource busy")
+
+	merr := s.mountFuse(a)
+	if merr == nil || !strings.Contains(merr.Error(), "clear dead mount") {
+		t.Fatalf("mountFuse over a wedged unmount = %v, want a clear-dead-mount error", merr)
+	}
+	if fake.setupCount() != 0 {
+		t.Fatal("mounted through a wedged pre-clear")
+	}
+	if _, err := os.Stat(filepath.Join(dirs[1], ".claude.json")); err != nil {
+		t.Fatalf("underlay identity disturbed despite the abort: %v", err)
+	}
+	if s.holder.ready(dirs[1]) {
+		t.Fatal("wedged dir recorded as ready")
+	}
+}
+
+// TestMountFuseForeignCarcassClearedAndRetriedOnce pins the dead-holder
+// carcass contract from step 4: Setup's foreign-mount refusal is answered with
+// a Teardown (whose registry-miss path clears the carcass) and exactly one
+// sweep+Setup retry.
+func TestMountFuseForeignCarcassClearedAndRetriedOnce(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foreign atomic.Bool
+	foreign.Store(true)
+	fake.setupFn = func(_, dir string) error {
+		if foreign.Load() {
+			return fmt.Errorf("mount %s: %w", dir, mountd.ErrForeignMount)
+		}
+		return nil
+	}
+	fake.teardownFn = func(string, string) error { foreign.Store(false); return nil }
+
+	if err := s.mountFuse(a); err != nil {
+		t.Fatalf("mountFuse: %v", err)
+	}
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
+		t.Fatalf("call order = %v, want [setup teardown setup]", got)
+	}
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("remounted carcass not recorded in the holder cache")
+	}
+}
+
+// TestMountFuseBaseMismatchClearedAndRetriedOnce pins the ErrBaseMismatch
+// routing: a holder registry row pinning a different base is registry state,
+// not a mount verdict — it gets the same unmount-then-retry treatment as a
+// foreign carcass (the holder's handleUnmount tears down by its registered
+// base), never the gated symlink conversion.
+func TestMountFuseBaseMismatchClearedAndRetriedOnce(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mismatched atomic.Bool
+	mismatched.Store(true)
+	fake.setupFn = func(_, dir string) error {
+		if mismatched.Load() {
+			return fmt.Errorf("mount %s: %w", dir, mountd.ErrBaseMismatch)
+		}
+		return nil
+	}
+	fake.teardownFn = func(string, string) error { mismatched.Store(false); return nil }
+
+	if err := s.mountFuse(a); err != nil {
+		t.Fatalf("mountFuse: %v", err)
+	}
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
+		t.Fatalf("call order = %v, want [setup teardown setup]", got)
+	}
+	if !s.holder.ready(dirs[1]) {
+		t.Fatal("remounted mismatched dir not recorded in the holder cache")
+	}
+}
+
+// TestMountFusePersistentForeignFailsAfterOneRetry is the twin negative: a dir
+// that stays foreign after the teardown surfaces the error — exactly one
+// retry, never a loop.
+func TestMountFusePersistentForeignFailsAfterOneRetry(t *testing.T) {
+	s, dirs, fake := newMigrateServer(t)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.setupErr = fmt.Errorf("mount %s: %w", dirs[1], mountd.ErrForeignMount)
+
+	merr := s.mountFuse(a)
+	if !errors.Is(merr, mountd.ErrForeignMount) {
+		t.Fatalf("mountFuse = %v, want errors.Is ErrForeignMount", merr)
+	}
+	if got := fake.callOrder(); !reflect.DeepEqual(got, []string{"setup", "teardown", "setup"}) {
+		t.Fatalf("call order = %v, want exactly one teardown+retry", got)
+	}
+	if s.holder.ready(dirs[1]) {
+		t.Fatal("failed mount recorded as ready")
+	}
+}
+
+// TestHealFuseTaxonomy pins the mount-failure classification: transient holder
+// conditions (unreachable holder, busy dir) and a mount blocked pending the
+// TCC grant never convert — they retry next poll — and only a genuine mount
+// failure falls back to symlink, gated on the account being idle (no live
+// session, no reservation, and never on a failed scan).
+func TestHealFuseTaxonomy(t *testing.T) {
+	cases := map[string]struct {
+		setupErr    error
+		scanKind    string // "" = real scan (idle), "live" = session on the dir, "err" = scan failure
+		reserve     bool
+		wantOutcome healOutcome
+		wantKind    string
+		wantTCC     bool
+	}{
+		"holder unavailable retries next poll": {
+			setupErr:    fmt.Errorf("mount: %w", mountd.ErrHolderUnavailable),
+			wantOutcome: healRetry, wantKind: "fuse",
+		},
+		// The exact chain the production spawn leg produces (RemoteProvider.Setup
+		// wrapping EnsureRunning's come-up timeout): a holder spawn blip must
+		// land in the retry arm, never the conversion arm.
+		"spawn timeout (holder unavailable chain) retries next poll": {
+			setupErr: fmt.Errorf("mount /pool/acct-01: %w",
+				fmt.Errorf("%w: mount holder did not come up on /tmp/m.sock within 5s; check /tmp/holder.log", mountd.ErrHolderUnavailable)),
+			wantOutcome: healRetry, wantKind: "fuse",
+		},
+		"busy dir retries next poll": {
+			setupErr:    fmt.Errorf("mount: %w", mountd.ErrBusy),
+			wantOutcome: healRetry, wantKind: "fuse",
+		},
+		"tcc block recorded and retried": {
+			setupErr:    fmt.Errorf("mount: %w", overlay.ErrMountNotLive),
+			wantOutcome: healTCCBlocked, wantKind: "fuse", wantTCC: true,
+		},
+		// A wedged unmount is no more a mount verdict than ErrBusy — and the
+		// fallback's ConvertOverlay would hit the same wedge, so converting
+		// would fail closed every poll for nothing.
+		"wedged unmount retries next poll": {
+			setupErr:    fmt.Errorf("mount: %w", overlay.ErrUnmountWedged),
+			wantOutcome: healRetry, wantKind: "fuse",
+		},
+		// Forward skew: a newer holder's error class this daemon predates is
+		// unclassifiable — the protocol's sanctioned extension path must read
+		// as retry, never as the mount failure that converts.
+		"unknown holder error class retries next poll": {
+			setupErr:    fmt.Errorf("mount: %w", fmt.Errorf("%w (quota-exceeded): per-account quota exhausted", mountd.ErrUnknownClass)),
+			wantOutcome: healRetry, wantKind: "fuse",
+		},
+		"genuine failure on an idle account converts": {
+			setupErr:    errors.New("mount exploded"),
+			wantOutcome: healFallback, wantKind: "symlink",
+		},
+		"genuine failure under a live session defers": {
+			setupErr: errors.New("mount exploded"), scanKind: "live",
+			wantOutcome: healFallback, wantKind: "fuse",
+		},
+		"genuine failure under a reservation defers": {
+			setupErr: errors.New("mount exploded"), reserve: true,
+			wantOutcome: healFallback, wantKind: "fuse",
+		},
+		"genuine failure with a failed scan fails closed": {
+			setupErr: errors.New("mount exploded"), scanKind: "err",
+			wantOutcome: healFallback, wantKind: "fuse",
+		},
+		"clean mount": {wantOutcome: healMounted, wantKind: "fuse"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, dirs, fake := newMigrateServer(t)
+			a, err := s.m.Store.GetAccount(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.OverlayKind = "fuse"
+			if err := s.m.Store.UpsertAccount(a); err != nil {
+				t.Fatal(err)
+			}
+			fake.setupErr = tc.setupErr
+			switch tc.scanKind {
+			case "live":
+				s.scanSessions = func() ([]procscan.Session, error) {
+					return []procscan.Session{{PID: 4242, ConfigDir: dirs[1]}}, nil
+				}
+			case "err":
+				s.scanSessions = func() ([]procscan.Session, error) {
+					return nil, errors.New("ps exploded")
+				}
+			}
+			if tc.reserve && !s.tryReserve(1) {
+				t.Fatal("tryReserve failed on a free account")
+			}
+
+			if got := s.healFuse(a); got != tc.wantOutcome {
+				t.Fatalf("healFuse outcome = %d, want %d", got, tc.wantOutcome)
+			}
+			if got := kindOf(t, s, 1); got != tc.wantKind {
+				t.Fatalf("row kind = %q, want %q", got, tc.wantKind)
+			}
+			if s.isConverting(1) {
+				t.Fatal("heal leaked a converting claim")
+			}
+			if gotTCC := s.holder.wireStatus().TCCError != ""; gotTCC != tc.wantTCC {
+				t.Fatalf("TCC recorded = %v, want %v", gotTCC, tc.wantTCC)
+			}
+			if tc.wantOutcome == healMounted && !s.holder.ready(dirs[1]) {
+				t.Fatal("clean mount not recorded in the holder cache")
+			}
+		})
+	}
+}
+
+// TestSelectServesFuseAccountWhenHolderVouches is the positive arm of the
+// carcass fix: a fuse account is selectable exactly when the holder cache
+// vouches for its mirror.
+func TestSelectServesFuseAccountWhenHolderVouches(t *testing.T) {
+	s, dirs, _ := newMigrateServer(t)
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	s.holder.noteMounted(dirs[1])
+
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 {
+		t.Fatalf("select = %+v, want vouched-for acct-1 (the emptier account)", resp)
+	}
+}
+
+// fuseRowWithCannedHolder flips acct-1 to a fuse row and points the server's
+// holder socket at a canned holder that lists acct-1's mirror live.
+func fuseRowWithCannedHolder(t *testing.T, s *Server, dirs map[int]string) store.Account {
+	t.Helper()
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	s.holderSocket = startCannedHolder(t, []mountd.MountInfo{{Dir: dirs[1], Base: "/base", Live: true}})
+	return a
+}
+
+// TestSelectColdStartPrimesHolderCacheLazily pins the cold-start window: the
+// daemon socket binds before the startup goroutine primes the holder cache,
+// so a select landing in that window must lazily refresh (bounded socket RPC,
+// no filesystem touch) instead of refusing every fuse account while the
+// detached holder serves the mounts fine.
+func TestSelectColdStartPrimesHolderCacheLazily(t *testing.T) {
+	s, dirs, _ := newMigrateServer(t)
+	fuseRowWithCannedHolder(t, s, dirs)
+
+	// The cache is zero-valued — never refreshed — exactly the bind→prime gap.
+	resp := s.handleSelect(t.Context(), Request{Op: OpSelect, NoMark: true})
+	if !resp.OK || resp.SelectedID == nil || *resp.SelectedID != 1 {
+		t.Fatalf("cold-start select = %+v, want lazily-primed acct-1 (the emptier account)", resp)
+	}
+
+	// The forced path flows through the same lazy prime — pre-fix it refused
+	// with "fuse mount is not up yet" while the mount served fine.
+	s2, dirs2, _ := newMigrateServer(t)
+	fuseRowWithCannedHolder(t, s2, dirs2)
+	one := 1
+	resp = s2.handleSelect(t.Context(), Request{Op: OpSelect, Account: &one, NoMark: true})
+	if !resp.OK || resp.Dir != dirs2[1] {
+		t.Fatalf("cold-start forced select = %+v, want acct-1's dir", resp)
+	}
+}
+
+// TestMountReadyRefreshesOnCacheMiss pins the outside-the-daemon mount edge: a
+// fuse dir absent from a stale cache (a mirror `ccp add` just mounted from the
+// CLI process) triggers one refresh, while a fresh cache rate-limits the
+// round-trip — a genuinely down mount must not turn every select into holder
+// RPCs.
+func TestMountReadyRefreshesOnCacheMiss(t *testing.T) {
+	s, dirs, _ := newMigrateServer(t)
+	a := fuseRowWithCannedHolder(t, s, dirs)
+
+	// Fresh cache missing the dir: inside the floor, no refresh — not ready.
+	s.holder.mu.Lock()
+	s.holder.healthy, s.holder.mounts, s.holder.refreshedAt = true, map[string]bool{}, time.Now()
+	s.holder.mu.Unlock()
+	if s.mountReady(a) {
+		t.Fatal("a refresh fired inside the rate-limit floor")
+	}
+
+	// Stale cache: the miss refreshes and the fresh mount is picked up.
+	s.holder.mu.Lock()
+	s.holder.refreshedAt = time.Now().Add(-holderRefreshFloor - time.Second)
+	s.holder.mu.Unlock()
+	if !s.mountReady(a) {
+		t.Fatal("a stale cache miss did not refresh")
 	}
 }

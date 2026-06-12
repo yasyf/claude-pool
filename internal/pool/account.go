@@ -20,7 +20,11 @@ var ErrNotInitialized = errors.New("pool not initialized")
 // InitResult summarizes what `ccp init` did.
 type InitResult struct {
 	OverlayKind overlay.Kind
-	Already     bool // the pool was already initialized
+	// OverlayFallbackReason says why detection settled on symlink when THIS
+	// Init ran the detection; "" when fuse was chosen or a kind was already
+	// recorded.
+	OverlayFallbackReason string
+	Already               bool // the pool was already initialized
 }
 
 // Init prepares the pool: ~/.cc-pool state dirs, the overlay provider choice
@@ -38,14 +42,14 @@ func (m *Manager) Init() (*InitResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	kind, err := m.ensureOverlayKind()
+	kind, reason, err := m.ensureOverlayKind()
 	if err != nil {
 		return nil, err
 	}
 	if err := m.Store.SetMeta(metaInitialized, "1"); err != nil {
 		return nil, err
 	}
-	return &InitResult{OverlayKind: kind, Already: already}, nil
+	return &InitResult{OverlayKind: kind, OverlayFallbackReason: reason, Already: already}, nil
 }
 
 // PendingAdd describes a half-created account awaiting interactive login.
@@ -54,8 +58,14 @@ type PendingAdd struct {
 	ConfigDir       string
 	KeychainService string
 	OverlayKind     overlay.Kind
-	LoginCommand    string
-	ClaudeJSONSeed  SeedOutcome
+	// FallbackReason says why fuse was ruled out for this account: a requested
+	// fuse overlay fell back to symlinks at Setup time, or detection ran inside
+	// this PrepareAdd (legacy pools with no recorded kind) and ruled fuse out.
+	// OverlayKind then records symlink. "" when fuse was established or never
+	// in play.
+	FallbackReason string
+	LoginCommand   string
+	ClaudeJSONSeed SeedOutcome
 }
 
 // DuplicateIdentity returns an existing pool account that shares want's
@@ -101,13 +111,35 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		return nil, err
 	}
 	acctDir := AccountDir(n)
-	kind, err := m.ensureOverlayKind()
+	kind, detectReason, err := m.ensureOverlayKind()
 	if err != nil {
 		return nil, err
 	}
-	prov := overlay.For(kind)
-	if err := prov.Setup(ClaudeDir(), acctDir); err != nil {
-		return nil, fmt.Errorf("set up overlay for %s: %w", acctDir, err)
+	prov := m.overlayFor(kind)
+	// A detection that just ran here (legacy pool with no recorded kind) and
+	// ruled fuse out is surfaced exactly like a Setup-time fallback.
+	fallbackReason := detectReason
+	if setupErr := prov.Setup(ClaudeDir(), acctDir); setupErr != nil {
+		if kind != overlay.KindFuse {
+			return nil, fmt.Errorf("set up overlay for %s: %w", acctDir, setupErr)
+		}
+		// A fuse Setup failure means the mount holder is unavailable right
+		// now, not that the add must die: fall back to symlinks EXPLICITLY.
+		// The kind actually established is recorded below and the reason
+		// rides along so `ccp add` says the substitution out loud.
+		fallbackReason = setupErr.Error()
+		prov = m.overlayFor(overlay.KindSymlink)
+		if err := prov.Setup(ClaudeDir(), acctDir); err != nil {
+			// Both causes ride the chain: the symlink complaint alone would
+			// mask the fuse failure that started this (e.g. ErrForeignMount),
+			// and callers match on either with errors.Is.
+			return nil, fmt.Errorf("set up fallback symlink overlay for %s (after fuse setup failed: %w): %w", acctDir, setupErr, err)
+		}
+		// The fuse attempt may have left an empty backing dir behind (the
+		// holder creates it before mounting); drop it so the symlink account
+		// doesn't accrete an inert acct-NN.private. Only-if-empty: anything
+		// inside is unclassified state that must not be destroyed.
+		removePrivateRootIfEmpty(overlay.FusePrivateRoot(acctDir))
 	}
 	seed, err := seedClaudeJSON(prov, acctDir, ClaudeJSONPath())
 	if err != nil {
@@ -137,10 +169,11 @@ func (m *Manager) PrepareAdd() (*PendingAdd, error) {
 		Index:           n,
 		ConfigDir:       acctDir,
 		KeychainService: svc,
-		// The provider actually established, not the requested kind: in a build
-		// without fuse, For() falls back to symlink, and recording the request
+		// The provider actually established, not the requested kind: a failed
+		// fuse Setup fell back to symlinks above, and recording the request
 		// would mint a row promising a mirror the dir doesn't have.
-		OverlayKind: prov.Kind(),
+		OverlayKind:    prov.Kind(),
+		FallbackReason: fallbackReason,
 		// The plugin var pins claude's plugin root to the shared base so the
 		// login session (where first-launch marketplace auto-install can run)
 		// writes canonical ~/.claude plugin paths, not acct-anchored ones that
@@ -223,7 +256,7 @@ func (m *Manager) AbandonAdd(p *PendingAdd) error {
 	default:
 		credErr = m.Keychain.Delete(p.KeychainService, account)
 	}
-	return errors.Join(credErr, m.removeAccountDir(overlay.For(p.OverlayKind), p.ConfigDir))
+	return errors.Join(credErr, m.removeAccountDir(m.overlayFor(p.OverlayKind), p.ConfigDir))
 }
 
 // Remove deletes an account from the pool: tears down its overlay, removes its
@@ -234,7 +267,7 @@ func (m *Manager) Remove(id int, deleteCredential bool) error {
 	if err != nil {
 		return err
 	}
-	prov := overlay.For(overlay.Kind(a.OverlayKind))
+	prov := m.overlayFor(overlay.Kind(a.OverlayKind))
 	if err := m.removeAccountDir(prov, a.ConfigDir); err != nil {
 		return err
 	}
@@ -275,16 +308,18 @@ func (m *Manager) SyncOverlay(a store.Account) error {
 }
 
 // ensureOverlayKind returns the overlay provider kind for new accounts: the
-// kind recorded at init, detecting and recording one first if absent.
-func (m *Manager) ensureOverlayKind() (overlay.Kind, error) {
+// kind recorded at init, detecting and recording one first if absent. The
+// returned reason is non-empty only when detection just ran and ruled out
+// fuse; it says why, so callers can surface the substitution to the user.
+func (m *Manager) ensureOverlayKind() (overlay.Kind, string, error) {
 	if v, ok, err := m.Store.GetMeta(metaOverlayKind); err != nil {
-		return "", err
+		return "", "", err
 	} else if ok {
-		return overlay.Kind(v), nil
+		return overlay.Kind(v), "", nil
 	}
-	kind := overlay.Detect()
+	kind, reason := m.detectOverlay()
 	if err := m.Store.SetMeta(metaOverlayKind, string(kind)); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return kind, nil
+	return kind, reason, nil
 }

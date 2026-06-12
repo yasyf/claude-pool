@@ -30,9 +30,7 @@ same setup automatically.`,
 					success(out, "Set up cc-pool.")
 				}
 
-				if res.OverlayKind == overlay.KindSymlink && !overlay.FuseBuilt() {
-					note(out, "For a live-mirror overlay, install fuse-t with `brew install macos-fuse-t/cask/fuse-t`.")
-				}
+				reportOverlayChoice(cmd, res)
 
 				if !noService {
 					ensureDaemon(cmd)
@@ -45,4 +43,19 @@ same setup automatically.`,
 	}
 	cmd.Flags().BoolVar(&noService, "no-service", false, "do not start the daemon now; `ccp add` will start it")
 	return cmd
+}
+
+// reportOverlayChoice tells the user how Init's overlay choice landed. A
+// fuse-capable build that had to settle for symlinks warns with detection's
+// reason — fuse was expected there. A pure build gets the curated install
+// note instead: symlinks are its expected default, not a failure, so the
+// detection reason (always "this build cannot host fuse mounts…") would be
+// warn-toned noise on every first run.
+func reportOverlayChoice(cmd *cobra.Command, res *pool.InitResult) {
+	switch {
+	case res.OverlayFallbackReason != "" && overlay.FuseBuilt():
+		warn(cmd.ErrOrStderr(), "fuse overlay unavailable (%s); using symlinks", res.OverlayFallbackReason)
+	case res.OverlayKind == overlay.KindSymlink && !overlay.FuseBuilt():
+		note(cmd.OutOrStdout(), "For a live-mirror overlay, install fuse-t with `brew install macos-fuse-t/cask/fuse-t`.")
+	}
 }

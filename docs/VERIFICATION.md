@@ -82,8 +82,10 @@ mount | grep cc-pool                  # account dir is a fuse-t mirror mount
 ccp run -- -p "hello"                     # (human) owns the PID; adopts rotated token on exit
 ccp status                                # active sessions for that account back to baseline
 
-ccp service uninstall                     # stops daemon, unmounts any fuse overlays
+ccp service uninstall                     # stops daemon + mount holder, unmounts fuse accounts
+                                          # (refuses under live sessions; --force overrides)
 ccp service uninstall --purge             # also removes pool accounts/dirs/state
+                                          # (aborts if any account dir is still a mountpoint)
 brew uninstall cc-pool                # (if installed via brew)
 test -d ~/.claude && claude --version     # (human) ~/.claude intact; plain claude still works
 ```

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/yasyf/cc-pool/internal/daemon"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/score"
@@ -575,6 +577,131 @@ func TestStatusSnapshotJSONDaemonBranch(t *testing.T) {
 			}
 			if tc.wantSampleAge != "" && a.SampleAge != tc.wantSampleAge {
 				t.Errorf("sample_age = %q, want %q passed through verbatim", a.SampleAge, tc.wantSampleAge)
+			}
+		})
+	}
+}
+
+// TestHolderFooter pins the plain-table holder alert: nothing for a nil or
+// healthy-current holder (status stays clean), one line per failure shape,
+// and the priority order TCC > spawn > skew when several apply.
+func TestHolderFooter(t *testing.T) {
+	cases := map[string]struct {
+		h    *daemon.HolderStatus
+		want string
+	}{
+		"nil (live path / pre-holder daemon)": {nil, ""},
+		"healthy current holder is silent": {
+			&daemon.HolderStatus{Version: version.String(), Mounts: 3}, "",
+		},
+		"skewed": {
+			&daemon.HolderStatus{Version: "0.0.1-old", Mounts: 1, Skewed: true},
+			"mount holder 0.0.1-old skewed; will be replaced when idle",
+		},
+		"TCC blocked": {
+			&daemon.HolderStatus{TCCError: "grant Network Volumes access"},
+			"mount holder: TCC blocked — grant Network Volumes access",
+		},
+		"respawn failing": {
+			&daemon.HolderStatus{SpawnError: "exec format error"},
+			"mount holder: respawn failing — exec format error",
+		},
+		"TCC outranks spawn and skew": {
+			&daemon.HolderStatus{Skewed: true, TCCError: "tcc-msg", SpawnError: "spawn-msg"},
+			"mount holder: TCC blocked — tcc-msg",
+		},
+		"spawn outranks skew": {
+			&daemon.HolderStatus{Version: "0.0.1-old", Skewed: true, SpawnError: "spawn-msg"},
+			"mount holder: respawn failing — spawn-msg",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := stripANSI(holderFooter(tc.h)); got != tc.want {
+				t.Errorf("holderFooter = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunStatusPlainHolderFooter drives the plain status path against a fake
+// daemon socket: an alerting holder adds exactly one footer line under the
+// table, and a healthy holder leaves the output free of any holder mention.
+func TestRunStatusPlainHolderFooter(t *testing.T) {
+	cases := map[string]struct {
+		holder *daemon.HolderStatus
+		want   string // "" = no holder mention at all
+	}{
+		"skewed holder prints the footer": {
+			holder: &daemon.HolderStatus{Version: "0.0.1-old", Mounts: 1, Skewed: true},
+			want:   "mount holder 0.0.1-old skewed; will be replaced when idle",
+		},
+		"healthy holder prints nothing": {
+			holder: &daemon.HolderStatus{Version: version.String(), Mounts: 2},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Short HOME under /tmp: macOS caps sun_path at 104 bytes.
+			home, err := os.MkdirTemp("/tmp", "ccp-home")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.RemoveAll(home) })
+			t.Setenv("HOME", home)
+			if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ln, err := net.Listen("unix", pool.SocketPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { ln.Close() })
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					var req daemon.Request
+					_ = json.NewDecoder(conn).Decode(&req)
+					_ = json.NewEncoder(conn).Encode(daemon.Response{
+						Proto: daemon.ProtocolVersion, OK: true, Version: version.String(),
+						Accounts: []daemon.AccountStatus{{
+							ID: 1, Label: "work@example.com",
+							HasUsage: true, Remaining5h: 50, Remaining7d: 50,
+						}},
+						Holder: tc.holder,
+					})
+					conn.Close()
+				}
+			}()
+
+			st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { st.Close() })
+
+			var buf bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetOut(&buf)
+			cmd.SetContext(t.Context())
+			if err := runStatus(cmd, &pool.Manager{Store: st}, false, false, true); err != nil {
+				t.Fatalf("runStatus: %v", err)
+			}
+			out := stripANSI(buf.String())
+			if !strings.Contains(out, "work@example.com") {
+				t.Fatalf("table missing the daemon's account:\n%s", out)
+			}
+			if tc.want == "" {
+				if strings.Contains(out, "mount holder") {
+					t.Errorf("healthy holder must print nothing:\n%s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("output missing footer %q:\n%s", tc.want, out)
 			}
 		})
 	}

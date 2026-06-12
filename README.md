@@ -182,10 +182,11 @@ persist across pooled sessions. Two providers:
 - **symlink** (default, zero-dependency): symlinks each top-level entry of
   `~/.claude` into the account dir. New top-level entries are picked up
   automatically at launch, by the daemon, and by `ccp doctor --fix`.
-- **fuse** (optional, live mirror): an in-process passthrough mirror mounted
-  via [fuse-t](https://github.com/macos-fuse-t/fuse-t) — kext-less, mounted as
-  you, no root. Requires a `-tags fuse` build (cgo) and a one-time *Network
-  Volumes* privacy grant.
+- **fuse** (optional, live mirror): a passthrough mirror mounted via
+  [fuse-t](https://github.com/macos-fuse-t/fuse-t) — kext-less, mounted as
+  you, no root — and hosted by a detached cc-pool **mount-holder** process, so
+  daemon restarts and upgrades never disturb live sessions' mounts. Requires a
+  `-tags fuse` build (cgo) and a one-time *Network Volumes* privacy grant.
 
 A few entries stay per-account instead of shared: `daemon/` and `ide/`
 (Claude's PID-keyed supervisor and IDE lock/socket files, which would collide
@@ -229,9 +230,10 @@ endpoint.
 login Keychain. It polls usage every ~3 min with exponential backoff,
 refreshes **idle** accounts' tokens before they expire (a checked-out session
 owns its own refresh; the daemon adopts whatever token it rotated to on
-check-in), caches scores, and — with the fuse overlay — owns the mount
-lifecycle. `ccp add` and `ccp init` start it automatically; if it isn't
-running, `ccp select` auto-spawns it or samples live.
+check-in), caches scores, and — with the fuse overlay — supervises the
+detached mount holder, which owns the mounts (so daemon restarts and upgrades
+never disturb them). `ccp add` and `ccp init` start it automatically; if it
+isn't running, `ccp select` auto-spawns it or samples live.
 
 No secrets are ever stored in cc-pool's database — the macOS Keychain is the
 only secret store.
@@ -254,7 +256,7 @@ prints the same per command.
 | `ccp remove <id>` | Remove an account from the pool |
 | `ccp rename <id> <name>` | Rename an account; `--auto` derives names from account emails |
 | `ccp init` | Set up the pool and start the daemon (optional — `ccp add` does this) |
-| `ccp service install\|uninstall\|status` | Manage the daemon (delegates to `brew services` on Homebrew installs) |
+| `ccp service install\|uninstall\|status` | Manage the daemon and mount holder (delegates to `brew services` on Homebrew installs) |
 | `ccp widget` | Install the Notification Center status widget (Homebrew cask) and show how to enable it |
 
 Flags, by command:
@@ -280,12 +282,14 @@ Flags, by command:
 | `rename` | `--auto` | Derive labels from account emails (skips custom labels) |
 | `rename` | `--force` | With `--auto`, overwrite custom labels too |
 | `init` | `--no-service` | Don't start the daemon now; `ccp add` starts it |
+| `service uninstall` | `--force` | Skip the live-session gate (sessions on unmounted dirs will break) |
 | `service uninstall` | `--purge` | Also remove all pool accounts and state; never touches `~/.claude` |
 
 ## Uninstall
 
 ```sh
-ccp service uninstall            # stop & remove the daemon, unmount fuse overlays
+ccp service uninstall            # stop the daemon + mount holder, unmount fuse overlays
+                                 # (refuses under live sessions; --force overrides)
 ccp service uninstall --purge    # ...and remove all pool accounts/dirs/state
 brew uninstall cc-pool
 ```

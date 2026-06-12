@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -595,5 +596,80 @@ func TestServeDrainsInFlightHandlerOnShutdown(t *testing.T) {
 	// logBuf is safe to read here: every writer goroutine exited before done.
 	if strings.Contains(logBuf.String(), "database is closed") {
 		t.Fatalf("teardown raced an in-flight handler:\n%s", logBuf.String())
+	}
+}
+
+// TestServeShutdownLeavesMountsUntouched pins step 6's core fix: daemon
+// shutdown leaves the fuse mirrors to the detached holder — no Teardown, local
+// or over the holder socket, on any shutdown path. Every provider resolution
+// in the daemon flows through the injected fake, so an empty call recording
+// proves no unmount (and no remount) was attempted anywhere between startup
+// and exit, while a fuse account sat mounted the whole time — exactly the
+// state the deleted teardownMounts used to sweep.
+func TestServeShutdownLeavesMountsUntouched(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, dirs := newTestServer(t)
+	fake := &fakeFuseProv{} // Health nil: the startup reconcile adopts the mount
+	s.m.OverlayFor = func(kind overlay.Kind) overlay.Provider {
+		if kind == overlay.KindFuse {
+			return fake
+		}
+		return &overlay.SymlinkProvider{}
+	}
+	a, err := s.m.Store.GetAccount(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OverlayKind = "fuse"
+	if err := s.m.Store.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	fakeOverlayMounted(t, func(dir string) bool { return dir == dirs[1] })
+
+	// macOS caps sun_path at 104 bytes; the socket gets its own short dir.
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	s.socket = filepath.Join(sockDir, "d.sock")
+	s.evictTimeout = defaultEvictTimeout
+	var buf bytes.Buffer
+	s.log = log.New(&buf, "", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.serve(ctx) }()
+
+	// The socket binds before the startup reconcile goroutine runs, so wait
+	// for the reconcile to reach acct-1's adopt decision (its Health probe)
+	// before shutting down — otherwise the cancelled ctx skips the reconcile
+	// and the adopt assertion below would race startup.
+	deadline := time.Now().Add(10 * time.Second)
+	for fake.healthCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("startup reconcile never probed the fuse mount")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cl := &Client{socket: s.socket}
+	if resp, err := cl.Shutdown(); err != nil || !resp.OK {
+		t.Fatalf("shutdown: resp = %+v, err = %v", resp, err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not return after OpShutdown")
+	}
+
+	if got := fake.callOrder(); len(got) != 0 {
+		t.Fatalf("daemon lifecycle touched the mount: provider calls = %v, want none", got)
+	}
+	if !strings.Contains(buf.String(), "adopted live mount") {
+		t.Fatalf("startup reconcile did not adopt the live mount:\n%s", buf.String())
 	}
 }

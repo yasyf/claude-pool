@@ -100,10 +100,12 @@ func ensureReady(cmd *cobra.Command, m *pool.Manager) error {
 		return err
 	}
 	if !ok {
-		if _, err := m.Init(); err != nil {
+		res, err := m.Init()
+		if err != nil {
 			return err
 		}
 		success(cmd.OutOrStdout(), "Set up cc-pool on this machine.")
+		reportOverlayChoice(cmd, res)
 	}
 	ensureDaemon(cmd)
 	return nil
@@ -119,6 +121,9 @@ func addOne(cmd *cobra.Command, m *pool.Manager, label string, opts addOptions) 
 		return e
 	}); err != nil {
 		return nil, err
+	}
+	if pending.FallbackReason != "" {
+		warn(cmd.ErrOrStderr(), "fuse overlay unavailable (%s); using symlinks", pending.FallbackReason)
 	}
 
 	if err := loginFlow(cmd, pending, opts); err != nil {

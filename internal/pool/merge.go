@@ -99,9 +99,9 @@ func mergeClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (MergeOu
 // MergeBaseClaudeJSON runs the launch-time shareable-settings merge for an
 // account. It gates on the RECORDED overlay kind: any non-symlink kind is
 // MergeSkippedOverlay, because the fuse arm serves its own live merged view —
-// and gating via overlay.For would silently un-gate fuse accounts on a
-// pure-Go binary, where For falls back to the symlink provider. The daemon's
-// fuse fallback and `ccp migrate`'s row flip keep the recorded kind truthful.
+// the gate keys on the row, never on a resolved provider's kind, so no build
+// variant can silently un-gate a fuse account. The daemon's fuse fallback and
+// `ccp migrate`'s row flip keep the recorded kind truthful.
 func (m *Manager) MergeBaseClaudeJSON(a store.Account) (MergeOutcome, error) {
 	if overlay.Kind(a.OverlayKind) != overlay.KindSymlink {
 		return MergeSkippedOverlay, nil

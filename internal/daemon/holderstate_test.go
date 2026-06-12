@@ -1,0 +1,270 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/yasyf/cc-pool/internal/mountd"
+	"github.com/yasyf/cc-pool/internal/version"
+)
+
+// startFakeHolder runs a real mountd.Server backed by the daemon's fake fuse
+// provider on a short /tmp socket (macOS caps sun_path at 104 bytes),
+// returning a client for it.
+func startFakeHolder(t *testing.T, fake *fakeFuseProv) *mountd.Client {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-hold")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	srv := &mountd.Server{
+		Socket: filepath.Join(sockDir, "m.sock"),
+		Host:   fake,
+		Log:    log.New(io.Discard, "", 0),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("fake holder did not stop")
+		}
+	})
+	cl := mountd.NewClient(srv.Socket)
+	deadline := time.Now().Add(5 * time.Second)
+	for !cl.Available() {
+		if time.Now().After(deadline) {
+			t.Fatal("fake holder socket never came up")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cl
+}
+
+// startCannedHolder serves the mountd wire protocol with canned Health/List
+// answers over a short /tmp socket, returning the socket path. Unlike
+// startFakeHolder — a real mountd.Server whose List reports kernel liveness,
+// false for any test dir — it lets daemon tests dictate per-dir Live without
+// real mounts.
+func startCannedHolder(t *testing.T, mounts []mountd.MountInfo) string {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-can")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	socket := filepath.Join(sockDir, "m.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go serveCannedHolder(ln, mounts)
+	return socket
+}
+
+// serveCannedHolder answers the mountd wire protocol on ln — our version on
+// every op, the given List — until the listener closes. Shared by
+// startCannedHolder and spawnRecorder (which binds at an exact socket path to
+// stand in for a freshly spawned holder).
+func serveCannedHolder(ln net.Listener, mounts []mountd.MountInfo) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed: defined exit
+		}
+		var req mountd.Request
+		resp := mountd.Response{OK: true, Version: version.String()}
+		if err := json.NewDecoder(conn).Decode(&req); err == nil && req.Op == mountd.OpList {
+			resp.Mounts = mounts
+		}
+		_ = json.NewEncoder(conn).Encode(resp)
+		conn.Close()
+	}
+}
+
+// TestHolderStateRefresh pins both refresh arms: a dead socket marks the cache
+// unhealthy and drops every mount entry (selection must stop trusting them —
+// THE carcass input), and a live holder stamps its version and per-dir kernel
+// liveness from List — truthfully Live=false for a registered mount whose dir
+// is not really a mountpoint.
+func TestHolderStateRefresh(t *testing.T) {
+	deadDir, err := os.MkdirTemp("/tmp", "ccp-dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(deadDir) })
+
+	h := &holderState{healthy: true, version: "x", mounts: map[string]bool{"/pool/acct-01": true}}
+	h.refresh(mountd.NewClient(filepath.Join(deadDir, "no.sock")))
+	if h.ready("/pool/acct-01") {
+		t.Fatal("unreachable holder left a trusted mount entry")
+	}
+	if ws := h.wireStatus(); ws.Version != "" || ws.Mounts != 0 || ws.Skewed {
+		t.Fatalf("unreachable holder wire view = %+v, want zeroed", ws)
+	}
+
+	cl := startFakeHolder(t, &fakeFuseProv{})
+	base, dir := t.TempDir(), t.TempDir()
+	if err := cl.Mount(base, dir); err != nil {
+		t.Fatalf("register fake mount: %v", err)
+	}
+	h.refresh(cl)
+	if ws := h.wireStatus(); ws.Version != version.String() || ws.Skewed {
+		t.Fatalf("live holder wire view = %+v, want version %q unskewed", ws, version.String())
+	}
+	if h.ready(dir) {
+		t.Fatal("cache vouched for a registered but kernel-dead mount")
+	}
+	h.mu.Lock()
+	live, ok := h.mounts[dir]
+	h.mu.Unlock()
+	if !ok || live {
+		t.Fatalf("mounts[%s] = %v ok=%v, want a present dead entry", dir, live, ok)
+	}
+}
+
+// startGatedListHolder serves the mountd wire protocol with canned answers:
+// Health replies immediately; List signals entered, then parks until release
+// fires before replying with mounts. It lets a test land an in-place cache
+// update inside refresh's Health→List RPC window.
+func startGatedListHolder(t *testing.T, mounts []mountd.MountInfo) (socket string, listEntered <-chan struct{}, release func()) {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "ccp-gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	socket = filepath.Join(sockDir, "m.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	entered := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var enterOnce, relOnce sync.Once
+	release = func() { relOnce.Do(func() { close(releaseCh) }) }
+	t.Cleanup(release) // never leave the serve goroutine parked
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener closed: defined exit
+			}
+			var req mountd.Request
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				conn.Close()
+				continue
+			}
+			resp := mountd.Response{OK: true, Version: version.String()}
+			if req.Op == mountd.OpList {
+				enterOnce.Do(func() { close(entered) })
+				<-releaseCh
+				resp.Mounts = mounts
+			}
+			_ = json.NewEncoder(conn).Encode(resp)
+			conn.Close()
+		}
+	}()
+	return socket, entered, release
+}
+
+// TestHolderStateRefreshDiscardsSnapshotRacedByInPlaceUpdate pins the
+// lost-update guard on THE cache the select path trusts (R2): an in-place
+// update (noteMounted, markUnhealthy) landing while a refresh's Health+List
+// snapshot is in flight is event truth newer than the snapshot, so the
+// snapshot is discarded — never installed over it.
+func TestHolderStateRefreshDiscardsSnapshotRacedByInPlaceUpdate(t *testing.T) {
+	t.Run("noteMounted survives a stale pre-mount List", func(t *testing.T) {
+		socket, entered, release := startGatedListHolder(t, nil) // List: zero mounts
+		h := &holderState{}
+		cl := mountd.NewClient(socket)
+		done := make(chan struct{})
+		go func() { defer close(done); h.refresh(cl) }()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refresh never reached List")
+		}
+		h.noteMounted("/pool/acct-01") // mountFuse completes mid-refresh
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refresh did not return")
+		}
+		if !h.ready("/pool/acct-01") {
+			t.Fatal("stale pre-mount List clobbered a noteMounted mirror")
+		}
+		// The discarded snapshot must not have stamped refreshedAt: that would
+		// rate-limit-suppress mountReady's refreshIfStale backstop for a floor.
+		h.mu.Lock()
+		stamped := !h.refreshedAt.IsZero()
+		h.mu.Unlock()
+		if stamped {
+			t.Fatal("discarded snapshot stamped refreshedAt, suppressing refreshIfStale")
+		}
+		// An unraced refresh then installs polled truth over the noted mount.
+		h.refresh(cl)
+		if h.ready("/pool/acct-01") {
+			t.Fatal("unraced refresh did not install the polled (empty) snapshot")
+		}
+	})
+
+	t.Run("markUnhealthy survives a stale healthy List", func(t *testing.T) {
+		socket, entered, release := startGatedListHolder(t, []mountd.MountInfo{{Dir: "/pool/acct-01", Base: "/b", Live: true}})
+		h := &holderState{}
+		cl := mountd.NewClient(socket)
+		done := make(chan struct{})
+		go func() { defer close(done); h.refresh(cl) }()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refresh never reached List")
+		}
+		h.markUnhealthy() // a replace's shutdown lands mid-refresh
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("refresh did not return")
+		}
+		if h.ready("/pool/acct-01") {
+			t.Fatal("stale pre-shutdown List re-vouched mirrors a replace swept")
+		}
+		if healthy, _ := h.view(); healthy {
+			t.Fatal("stale snapshot resurrected a holder marked unhealthy")
+		}
+	})
+}
+
+// TestHolderStateNoteMounted pins the fresh-mount fast path: a successful
+// mount is trusted before any refresh, and it clears recorded TCC guidance
+// (the grant is per holder process, so one live mount proves it landed).
+func TestHolderStateNoteMounted(t *testing.T) {
+	var h holderState
+	if h.ready("/d") {
+		t.Fatal("zero cache vouched for a dir")
+	}
+	h.recordTCC("grant pending")
+	h.noteMounted("/d")
+	if !h.ready("/d") {
+		t.Fatal("fresh mount not trusted before the first refresh")
+	}
+	if ws := h.wireStatus(); ws.TCCError != "" {
+		t.Fatalf("TCC guidance survived a successful mount: %+v", ws)
+	}
+}

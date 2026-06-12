@@ -56,6 +56,11 @@ func (s *Server) scheduler(ctx context.Context) {
 // pollOnce reconciles sessions, then samples usage for every account,
 // refreshing the token only for idle accounts.
 func (s *Server) pollOnce(ctx context.Context) {
+	// Refresh the holder cache first: every select until the next poll keys
+	// fuse readiness on it. (superviseHolder owns respawn policy; this is
+	// only the cache.)
+	s.holder.refresh(s.holderClient())
+
 	// Only reconcile sessions on a successful scan: AlivePIDs always returns a
 	// non-nil map, so reconciling off a failed (nil) scan would treat every PID
 	// as dead and close every active session.
@@ -131,17 +136,14 @@ func (s *Server) pollAccount(ctx context.Context, sessions []procscan.Session, i
 	// health-checks).
 	if err := s.m.SyncOverlay(a); err != nil {
 		s.log.Printf("acct-%02d overlay sync: %v", a.ID, err)
-		// The daemon is the only process that can host fuse mounts; an
-		// unhealthy fuse overlay here usually means the account was added
-		// (by a CLI that cannot mount) after this daemon started — bring
-		// the mount up now instead of leaving the dir dead until restart.
-		// A mount that cannot come up falls back to symlink, exactly like
-		// reconcileOverlays at startup.
+		// An unhealthy fuse overlay here usually means the mount isn't up —
+		// the holder died, or the account was added while no holder was
+		// reachable — heal it now instead of leaving the dir dead until
+		// restart. healFuse classifies: transient holder conditions and a
+		// pending TCC grant retry next poll; only a genuine mount failure
+		// falls back to symlink, and only when the account is idle.
 		if a.OverlayKind == string(overlay.KindFuse) {
-			if merr := s.mountFuse(a); merr != nil {
-				s.log.Printf("acct-%02d mount failed, falling back to symlink: %v", a.ID, merr)
-				s.fallbackToSymlink(a)
-			}
+			s.healFuse(a)
 		}
 	}
 

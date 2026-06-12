@@ -89,7 +89,7 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 	cwd, _ := os.Getwd() // best-effort: an unreadable cwd just hides pin state
 	render := func() error {
-		snaps, err := gatherStatus(cmd.Context(), m, live)
+		snaps, holder, err := gatherStatus(cmd.Context(), m, live)
 		if err != nil {
 			return err
 		}
@@ -103,6 +103,9 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 			fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // clear
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), out)
+		if line := holderFooter(holder); line != "" {
+			fmt.Fprintln(cmd.OutOrStdout(), line)
+		}
 		return nil
 	}
 	if !watch {
@@ -120,15 +123,40 @@ func runStatus(cmd *cobra.Command, m *pool.Manager, watch, live, plain bool) err
 	}
 }
 
-// gatherStatus prefers the daemon's cached view, falling back to live sampling.
-func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, error) {
+// gatherStatus prefers the daemon's cached view, falling back to live
+// sampling. The second return is the daemon's mount-holder cache — nil on the
+// live path, where no process supervises the holder.
+func gatherStatus(ctx context.Context, m *pool.Manager, forceLive bool) ([]pool.Snapshot, *daemon.HolderStatus, error) {
 	if !forceLive {
 		resp, err := daemon.NewClient().Status()
 		if daemonStatusUsable(resp, err) {
-			return fromDaemon(resp.Accounts), nil
+			return fromDaemon(resp.Accounts), resp.Holder, nil
 		}
 	}
-	return m.Snapshots(ctx, true, pool.DefaultFreshFor)
+	snaps, err := m.Snapshots(ctx, true, pool.DefaultFreshFor)
+	return snaps, nil, err
+}
+
+// holderFooter renders the one-line mount-holder alert under the plain status
+// table — only when something needs attention. A healthy holder at the
+// current version prints nothing, so status stays clean. Plain path only: the
+// TUI's gather closure plumbs statusData (snapshots + pin) and deliberately
+// drops the holder — `ccp doctor` and `ccp service status` carry the same
+// facts for interactive users.
+func holderFooter(h *daemon.HolderStatus) string {
+	if h == nil {
+		return ""
+	}
+	switch {
+	case h.TCCError != "":
+		return warnStyle.Render("mount holder: TCC blocked — " + h.TCCError)
+	case h.SpawnError != "":
+		return warnStyle.Render("mount holder: respawn failing — " + h.SpawnError)
+	case h.Skewed:
+		return warnStyle.Render(fmt.Sprintf("mount holder %s skewed; will be replaced when idle", h.Version))
+	default:
+		return ""
+	}
 }
 
 // dirPin is the launch directory's pin as render input (ok=false: no pin).

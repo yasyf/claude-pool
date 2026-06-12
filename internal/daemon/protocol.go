@@ -40,8 +40,9 @@ type Request struct {
 	// rewrite, reservation, and preflight side effects) to keep waiting.
 	NoFallback bool `json:"no_fallback,omitempty"`
 	// To: target overlay kind for migrate ("fuse" or "symlink"). The daemon is
-	// the only process that can perform conversions — it hosts the in-process
-	// fuse mounts and owns the select reservations the conversion gates on.
+	// the only process that can perform conversions — the mounts live in the
+	// detached holder, but the daemon owns the select reservations and poll
+	// claims the conversion gates on.
 	To string `json:"to,omitempty"`
 	// Force: migrate even when accounts have live sessions (the user vouches
 	// they are idle). Reservations still refuse — a reserved account has a
@@ -67,6 +68,25 @@ type MigrationResult struct {
 	To      string           `json:"to,omitempty"`
 	Outcome MigrationOutcome `json:"outcome"`
 	Detail  string           `json:"detail,omitempty"` // busy reason / failure text
+}
+
+// HolderStatus is the daemon's cached view of the detached mount holder,
+// included in status responses. Additive: a pre-step-6 daemon omits it and an
+// old client ignores it, so ProtocolVersion stays 1.
+type HolderStatus struct {
+	// Version is the holder's reported build version; "" means the holder was
+	// unreachable at the daemon's last refresh.
+	Version string `json:"version"`
+	// Mounts counts the live mirrors in the holder's last List.
+	Mounts int `json:"mounts"`
+	// Skewed means a reachable holder runs a different build than the daemon.
+	Skewed bool `json:"skewed"`
+	// TCCError carries the latest mount-blocked-pending-TCC guidance (the
+	// macOS "Network Volumes" grant walkthrough); "" when no mount is blocked.
+	TCCError string `json:"tcc_error,omitempty"`
+	// SpawnError is the daemon's latest failed attempt to spawn a mount
+	// holder; "" when the last spawn succeeded or none was needed. Additive.
+	SpawnError string `json:"spawn_error,omitempty"`
 }
 
 // AccountStatus is the per-account view returned by status/select.
@@ -208,6 +228,7 @@ type Response struct {
 	// pool is empty) — a structured signal so clients don't match error strings.
 	NoneAvailable bool              `json:"none_available,omitempty"`
 	Accounts      []AccountStatus   `json:"accounts,omitempty"`   // status
+	Holder        *HolderStatus     `json:"holder,omitempty"`     // status: mount-holder cache
 	Version       string            `json:"version,omitempty"`    // health
 	Migrations    []MigrationResult `json:"migrations,omitempty"` // migrate
 	SoonestReset  *time.Time        `json:"soonest_reset,omitempty"`

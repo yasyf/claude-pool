@@ -11,6 +11,17 @@ import (
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
+// inProcessFuseSeam routes the fuse kind to THIS process's in-process
+// provider: these tests host their mounts themselves. The real resolver would
+// hand back the holder-backed RemoteProvider, whose plumbing is pinned in
+// internal/mountd.
+func inProcessFuseSeam(kind overlay.Kind) overlay.Provider {
+	if kind == overlay.KindFuse {
+		return &overlay.FuseProvider{}
+	}
+	return &overlay.SymlinkProvider{}
+}
+
 // TestFuseConvertRoundTrip runs the production symlink→fuse→symlink conversion
 // against a real fuse-t mount in temp dirs — the CI form of the live rollout
 // (and its rollback rehearsal). Requires fuse-t and the one-time "Network
@@ -55,7 +66,7 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Store: st}
+	m := &Manager{Store: st, OverlayFor: inProcessFuseSeam}
 
 	fused, err := m.ConvertOverlay(a, overlay.KindFuse)
 	if err != nil {
@@ -164,7 +175,7 @@ func TestFuseConvertIdentityVerifiedAgainstForeignBase(t *testing.T) {
 	if err := st.UpsertAccount(a); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{Store: st}
+	m := &Manager{Store: st, OverlayFor: inProcessFuseSeam}
 
 	fused, err := m.ConvertOverlay(a, overlay.KindFuse)
 	if err != nil {

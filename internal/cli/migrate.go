@@ -22,7 +22,9 @@ func newMigrateCmd() *cobra.Command {
 by default fuse, the live mirror preferred when fuse-t is installed. Accounts
 created before fuse-t was set up stay on symlinks until migrated.
 
-The conversion runs inside the daemon, which hosts the fuse mounts: an
+The conversion runs inside the daemon, which owns the gates it needs (select
+reservations, poll claims); the mounts themselves live in a detached cc-pool
+mount-holder process, so daemon restarts and upgrades never disturb them. An
 account's private files (.claude.json identity, backups, …) move into its
 private backing dir, the old overlay comes down, the mirror mounts over the
 account dir, and the row records the new provider only once the identity is
@@ -30,9 +32,9 @@ verified through the mount. Accounts with live sessions or in-flight selects
 are skipped and reported — re-run the command as they free up. A failed mount
 rolls back to a working symlink overlay; nothing is left half-converted.
 
-The daemon's first fuse mount may pop macOS's one-time "Network Volumes"
-prompt for cc-pool; grant it (System Settings ▸ Privacy & Security) and
-re-run. New accounts follow the last migrated-to provider.`,
+The mount holder's first fuse mount may pop macOS's one-time "Network
+Volumes" prompt for cc-pool; grant it (System Settings ▸ Privacy & Security)
+and re-run. New accounts follow the last migrated-to provider.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return withManager(func(m *pool.Manager) error {
@@ -48,22 +50,26 @@ re-run. New accounts follow the last migrated-to provider.`,
 				}
 
 				// The daemon performs the conversion; require one at exactly
-				// this version so the new op exists on the other end. NOT
-				// auto-restarted: once accounts are fuse, a restart force-
-				// unmounts them under any live sessions — the user chooses when.
+				// this version so the op and its gates exist on the other
+				// end — a stale-version daemon cannot be trusted to drive
+				// them. NOT auto-restarted, purely to keep this command
+				// read-only on the service; the restart itself is mount-safe
+				// (the detached holder keeps serving the mirrors across it)
+				// and the skew error below recommends it plainly.
 				cl := daemon.NewClient()
 				health, err := cl.Health()
 				switch {
 				case errors.Is(err, daemon.ErrDaemonUnavailable):
-					return fmt.Errorf("migration runs inside the daemon (it hosts the fuse mounts), which is not running; start it with `ccp service install` and re-run: %w", err)
+					return fmt.Errorf("migration runs inside the daemon (it owns the conversion gates), which is not running; start it with `ccp service install` and re-run: %w", err)
 				case err != nil:
 					// A daemon that accepted the dial but failed the probe is
-					// hung, not absent — a restart would force-unmount any
-					// fuse accounts, so don't prescribe one blindly.
+					// hung, not absent. Surface that as-is — a restart would
+					// be mount-safe, but prescribing one for a hang would
+					// mask the real failure.
 					return fmt.Errorf("daemon health check: %w", err)
 				}
 				if health.Version != version.String() {
-					return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — note a restart unmounts any already-migrated fuse accounts, so do it while their sessions are closed", health.Version, version.String())
+					return fmt.Errorf("the daemon is %s but this ccp is %s; restart it (`brew services restart cc-pool` or `ccp service install`) and re-run — mounts and live sessions are unaffected", health.Version, version.String())
 				}
 
 				var acct *int

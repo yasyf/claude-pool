@@ -95,6 +95,9 @@ class CcPool < Formula
         ccp run         # launch claude on the emptiest account
 
       Plain `claude` on ~/.claude keeps working untouched.
+
+      Before `brew uninstall`, run `ccp service uninstall` to stop the daemon
+      and mount holder and unmount pool accounts.
     EOS
   end
 

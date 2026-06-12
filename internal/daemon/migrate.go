@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/yasyf/cc-pool/internal/overlay"
+	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/procscan"
 	"github.com/yasyf/cc-pool/internal/store"
 )
@@ -20,8 +21,9 @@ import (
 const defaultMigrateBudget = 120 * time.Second
 
 // handleMigrate converts accounts between overlay providers. Only the daemon
-// can do this: it hosts the in-process fuse mounts, and it alone can gate the
-// conversion against its own select reservations atomically. Busy accounts
+// can do this: the mounts live in the detached holder, but the daemon alone
+// can gate the conversion against its own select reservations atomically.
+// Busy accounts
 // (live sessions or reservations) are skipped and reported so the client can
 // re-run later; per-account failures are rolled back by ConvertOverlay.
 func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
@@ -90,11 +92,11 @@ func (s *Server) handleMigrate(ctx context.Context, req Request) Response {
 	return resp
 }
 
-// fuseGate reports why this daemon cannot host fuse mirrors right now, or ""
-// when it can. The probe runs daemon-side deliberately: TCC attributes a
-// terminal-spawned CLI to the terminal, so only a probe from this process
-// proves the daemon can mount — and a missing "Network Volumes" grant fails
-// here, before any account is disturbed.
+// fuseGate reports why fuse mirrors cannot be hosted right now, or "" when
+// they can. The probe runs in the mount holder deliberately: mount capability
+// and the macOS "Network Volumes" TCC grant are per-process, and the holder is
+// the process that hosts the mounts — so a missing grant fails here, before
+// any account is disturbed.
 func (s *Server) fuseGate() string {
 	if s.fuseGateFn != nil {
 		return s.fuseGateFn()
@@ -102,8 +104,11 @@ func (s *Server) fuseGate() string {
 	if !overlay.FuseBuilt() {
 		return "this daemon build has no fuse support; install fuse-t (brew install macos-fuse-t/cask/fuse-t), reinstall cc-pool, and restart the daemon"
 	}
-	if overlay.Detect() != overlay.KindFuse {
-		return "fuse-t probe mount failed — grant cc-pool \"Network Volumes\" access in System Settings ▸ Privacy & Security (the failed attempt creates the toggle), then re-run `ccp migrate`"
+	// The reason leads verbatim: a declined probe carries its own fuse-t/TCC
+	// remedy, while holder spawn or probe-RPC failures name their real cause —
+	// advice that fits one would mislead for the others.
+	if kind, reason := pool.DetectOverlayKind(); kind != overlay.KindFuse {
+		return fmt.Sprintf("fuse unavailable: %s — fix this, then re-run `ccp migrate`", reason)
 	}
 	return ""
 }
@@ -121,7 +126,7 @@ func (s *Server) convertAccount(a store.Account, to overlay.Kind, force bool) Mi
 	}
 	if !s.beginConvert(a.ID) {
 		res.Outcome = MigrationBusy
-		res.Detail = "held by a pending select or a daemon poll; retry shortly"
+		res.Detail = "held by a pending select, a daemon poll, or a holder replacement; retry shortly"
 		return res
 	}
 	defer s.endConvert(a.ID)
@@ -164,6 +169,16 @@ func (s *Server) convertAccount(a store.Account, to overlay.Kind, force bool) Mi
 		return res
 	}
 	res.Outcome = MigrationDone
+	// Make the conversion's mount state visible to selection immediately — the
+	// next cache refresh is up to a full poll away, and mountReady would
+	// otherwise exclude every freshly-converted fuse account until then (or
+	// keep counting a dismounted mirror in HolderStatus.Mounts after a
+	// retreat).
+	if to == overlay.KindFuse {
+		s.holder.noteMounted(a.ConfigDir)
+	} else {
+		s.holder.noteUnmounted(a.ConfigDir)
+	}
 	s.log.Printf("acct-%02d overlay migrated %s -> %s", a.ID, res.From, res.To)
 	return res
 }

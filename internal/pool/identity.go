@@ -22,9 +22,16 @@ type Identity struct {
 }
 
 // AccountIdentity returns a pool account's identity from its private
-// .claude.json, written by that account's own login.
+// .claude.json, written by that account's own login. The private path is pure
+// path math off the recorded kind — no provider is resolved, because reading
+// the file must work whether or not a mount or holder is up: fuse keeps it in
+// the private backing dir beside the mountpoint, every other kind in the
+// account dir itself.
 func AccountIdentity(kind overlay.Kind, configDir string) (*Identity, error) {
-	priv := overlay.For(kind).PrivateRoot(configDir)
+	priv := configDir
+	if kind == overlay.KindFuse {
+		priv = overlay.FusePrivateRoot(configDir)
+	}
 	return readIdentity(filepath.Join(priv, ".claude.json"))
 }
 

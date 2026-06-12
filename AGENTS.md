@@ -42,10 +42,12 @@ cc-pool/
 ├── cmd/cc-pool/        # main: CLI entrypoint (installs as cc-pool, ccp symlink)
 ├── internal/
 │   ├── cli/            # ccp subcommands (init, add, select, run, status, doctor, …)
-│   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol
+│   ├── daemon/         # background poller: usage polling, idle token refresh, socket protocol; supervises the detached mount-holder process
 │   ├── keychain/       # macOS Keychain access for Claude Code credentials
+│   ├── mountd/         # detached mount-holder process (protocol, server, client, spawn)
 │   ├── oauth/          # Claude OAuth refresh + /api/oauth/usage client
 │   ├── overlay/        # shared ~/.claude overlay providers (symlink, fuse-t mirror)
+│   ├── peerpid/        # identify/kill the exact process holding a unix socket
 │   ├── pool/           # account dirs, paths, pool manager
 │   ├── procscan/       # detect live claude sessions per config dir
 │   ├── score/          # account scoring (5h/7d headroom, reset credit, burn rate)
@@ -69,6 +71,7 @@ Safety rules baked into the architecture — do not regress them:
 1. **The pool NEVER reads, writes, deletes, or even names the canonical unsuffixed Keychain item (`Claude Code-credentials`), and never mutates plain claude's OAuth state.** There is no exception: `keychain.ServiceName` always emits a hash-suffixed name, and no code path can name the canonical item. Every pool account — including the user's main subscription — gets its own config dir, its own refresh-token chain (from its own `claude /login`), and its own suffixed Keychain item. This is why there is no credential "adoption": forking a pool account off plain claude's login would require spending plain claude's single-use refresh token, which rotation invalidates — signing plain claude out. A fresh login per account is the only safe path.
 2. **No secrets in SQLite** — the macOS Keychain is the sole secret store.
 3. **Account dir strings are hashed for Keychain service names** — the path string `ccp` emits and the string hashed must stay byte-identical. No realpath/normalization divergence.
+4. **Fuse mounts are hosted by a detached cc-pool mount-holder process** (socket `~/.cc-pool/mounts.sock`); daemon restarts/upgrades never disturb mounts. The holder is only replaced when no live sessions exist (or `ccp service uninstall --force`).
 
 Known follow-up (documented, test-pinned in `TestConcurrentPrepareAddIndexRace`): two concurrent `ccp add`s can be handed the same account index because no row exists until FinalizeAdd; fixing it needs a pending-row reservation.
 

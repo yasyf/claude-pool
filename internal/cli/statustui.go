@@ -45,7 +45,10 @@ func runStatusTUI(cmd *cobra.Command, m *pool.Manager, live bool) error {
 		ctx: ctx,
 		cwd: cwd,
 		gather: func(c context.Context) (statusData, error) {
-			snaps, err := gatherStatus(c, m, live)
+			// The holder alert is dropped here on purpose: statusData carries
+			// only snapshots + pin, and the TUI footer already multiplexes
+			// refresh/pin errors — holderFooter stays a plain-path concern.
+			snaps, _, err := gatherStatus(c, m, live)
 			if err != nil {
 				return statusData{}, err
 			}

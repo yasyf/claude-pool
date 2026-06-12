@@ -319,7 +319,8 @@ func TestMergeClaudeJSON(t *testing.T) {
 // TestMergeBaseClaudeJSON pins the Manager-level gate: only accounts whose
 // RECORDED kind is symlink merge (the fuse arm serves its own merged view),
 // and the provider resolves through the injectable OverlayFor seam — a bare
-// overlay.For would ignore the fake and fail the resolved-kinds assertion.
+// OverlayProviderFor would ignore the fake and fail the resolved-kinds
+// assertion.
 func TestMergeBaseClaudeJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

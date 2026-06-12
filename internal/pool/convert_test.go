@@ -140,34 +140,58 @@ func TestConvertOverlayNoopWhenAlreadyTarget(t *testing.T) {
 	}
 }
 
-func TestConvertOverlayUnsupportedWithoutFuseBuild(t *testing.T) {
-	if overlay.FuseBuilt() {
-		t.Skip("fuse build: For(KindFuse) is real, the fallback guard is moot")
-	}
-	m, a, dir := newConvertFixture(t, nil) // no seam: real overlay.For
-	_, err := m.ConvertOverlay(a, overlay.KindFuse)
-	if !errors.Is(err, ErrConvertUnsupported) {
-		t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
-	}
-	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
-		t.Fatalf("identity disturbed by refused convert: %q", got)
-	}
-	if storedKind(t, m, a.ID) != "symlink" {
-		t.Fatal("row changed by refused convert")
-	}
+// TestConvertOverlayRejectsWrongKindFake pins the Kind() equality fences. The
+// real resolver can no longer hand back a wrong-kind provider (KindFuse maps
+// to the holder-backed RemoteProvider, which always reports KindFuse), so the
+// fences guard against wrong-kind INJECTED fakes — a conversion that thinks
+// it is operating fuse-side while running symlink code paths is exactly how
+// account state gets destroyed.
+func TestConvertOverlayRejectsWrongKindFake(t *testing.T) {
+	wrongKind := func(overlay.Kind) overlay.Provider { return &overlay.SymlinkProvider{} }
+
+	t.Run("target fence", func(t *testing.T) {
+		m, a, dir := newConvertFixture(t, nil)
+		m.OverlayFor = wrongKind
+		_, err := m.ConvertOverlay(a, overlay.KindFuse)
+		if !errors.Is(err, ErrConvertUnsupported) {
+			t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
+		}
+		if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+			t.Fatalf("identity disturbed by refused convert: %q", got)
+		}
+		if storedKind(t, m, a.ID) != "symlink" {
+			t.Fatal("row changed by refused convert")
+		}
+	})
+
+	t.Run("source fence", func(t *testing.T) {
+		m, a, dir := newConvertFixture(t, nil)
+		m.OverlayFor = wrongKind
+		a.OverlayKind = "fuse"
+		if err := m.Store.UpsertAccount(a); err != nil {
+			t.Fatal(err)
+		}
+		_, err := m.ConvertOverlay(a, overlay.KindSymlink)
+		if !errors.Is(err, ErrConvertUnsupported) {
+			t.Fatalf("ConvertOverlay error = %v, want ErrConvertUnsupported", err)
+		}
+		if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+			t.Fatalf("identity disturbed by refused convert: %q", got)
+		}
+		if storedKind(t, m, a.ID) != "fuse" {
+			t.Fatal("row changed by refused convert")
+		}
+	})
 }
 
-// TestConvertOverlayRetreatWithoutFuseBuild pins the escape hatch for a
-// machine whose fuse-t was uninstalled (reinstall yields a pure binary while
-// rows still say fuse): the fuse→symlink retreat must work without the fuse
-// provider — no in-process mount can exist, so verifying the dir is unmounted
-// stands in for the unmount — and must never hand the dir to the silently
-// substituted symlink provider's Teardown.
-func TestConvertOverlayRetreatWithoutFuseBuild(t *testing.T) {
-	if overlay.FuseBuilt() {
-		t.Skip("fuse build: the real provider handles the retreat")
-	}
-	m, a, dir := newConvertFixture(t, nil) // no seam: real overlay.For
+// TestConvertOverlayRetreatWithoutLiveMount pins the escape hatch for a
+// machine whose fuse rows outlived their mounts (holder gone, or fuse-t
+// uninstalled entirely): the fuse→symlink retreat resolves the real
+// holder-backed RemoteProvider, whose Teardown is an immediate no-op with
+// zero holder contact when nothing is mounted — so the retreat is pure file
+// moves and works identically in every build.
+func TestConvertOverlayRetreatWithoutLiveMount(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil) // no seam: the real resolver
 	// Stage the fuse rest state: row says fuse, identity and backups live in
 	// the private backing dir, no links in the (unmounted) account dir.
 	priv := overlay.FusePrivateRoot(dir)
@@ -187,7 +211,7 @@ func TestConvertOverlayRetreatWithoutFuseBuild(t *testing.T) {
 
 	back, err := m.ConvertOverlay(a, overlay.KindSymlink)
 	if err != nil {
-		t.Fatalf("retreat without fuse build: %v", err)
+		t.Fatalf("retreat without a live mount: %v", err)
 	}
 	if back.OverlayKind != "symlink" || storedKind(t, m, a.ID) != "symlink" {
 		t.Fatal("row not flipped back to symlink")
@@ -501,8 +525,29 @@ func TestSetDefaultOverlayKind(t *testing.T) {
 		t.Fatal("unknown kind accepted")
 	}
 
+	// The fuse fence keys on hosting capability, not on the resolved
+	// provider's kind — the RemoteProvider always reports KindFuse, so a
+	// provider-kind fence would always pass.
+	m.CanHostFuse = func() bool { return false }
+	if err := m.SetDefaultOverlayKind(overlay.KindFuse); !errors.Is(err, ErrConvertUnsupported) {
+		t.Fatalf("fuse default without fuse hosting = %v, want ErrConvertUnsupported", err)
+	}
+	if v, _, _ := st.GetMeta("overlay_kind"); v != "symlink" {
+		t.Fatalf("refused default rewrote meta to %q", v)
+	}
+
+	m.CanHostFuse = func() bool { return true }
+	if err := m.SetDefaultOverlayKind(overlay.KindFuse); err != nil {
+		t.Fatalf("fuse default with fuse hosting: %v", err)
+	}
+	if v, _, _ := st.GetMeta("overlay_kind"); v != "fuse" {
+		t.Fatalf("meta = %q, want fuse", v)
+	}
+
+	// Unseamed, the fence is this build's real capability.
+	m.CanHostFuse = nil
 	err = m.SetDefaultOverlayKind(overlay.KindFuse)
-	if overlay.FuseBuilt() {
+	if CanHostFuse() {
 		if err != nil {
 			t.Fatalf("fuse default refused in a fuse build: %v", err)
 		}
