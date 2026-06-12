@@ -1,0 +1,321 @@
+//go:build fuse && cgo && darwin
+
+package overlay
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"syscall"
+
+	"github.com/winfsp/cgofuse/fuse"
+)
+
+// claudeJSONFusePath is the fuse path of claude's primary state file — the one
+// name in the mirror with a merged read view and base write-through.
+const claudeJSONFusePath = "/.claude.json"
+
+// syntheticFhBase is the first handle ID handed out for synthetic merged-view
+// read handles. Real handles are raw kernel fds (small ints), so IDs from
+// 1<<62 cannot collide with them; ^uint64(0) means "no handle" and is excluded
+// by syntheticFh.
+const syntheticFhBase = uint64(1) << 62
+
+// writeThroughMu serializes every base ~/.claude.json read→split→write cycle
+// across ALL mounts: each account's mirror writes through to the same base
+// file. It is deliberately held across the cycle's I/O (a documented exception
+// to the lock-scope rule): the read-modify-write must be atomic against other
+// in-process write-throughs, and all mounts live in the single daemon process,
+// so this lock is the complete story. Against a concurrently-running vanilla
+// claude we accept last-writer-wins within the window — blacklisted keys are
+// structurally protected because base is re-read each cycle and blacklisted
+// keys are never copied.
+var writeThroughMu sync.Mutex
+
+// claudeJSONView serves /.claude.json as a live merged document: read opens
+// get base's shareable keys (everything outside ClaudeJSONPrivateKeys)
+// overlaid on the account's committed private file, and committed writes split
+// the shareable keys back through to base. The private file keeps the FULL
+// committed payload — load-bearing for ccp migrate, which relocates it
+// verbatim on every conversion/rollback/heal and re-reads identity through it;
+// do not "optimize" shareable keys out of it.
+type claudeJSONView struct {
+	privatePath string // committed per-account file under the private backing root
+	basePath    string // shared ~/.claude.json, sibling of the mirrored root
+
+	mu        sync.Mutex          // guards every field below — the one synchronization story for this view
+	nextFh    uint64              // next synthetic handle ID
+	snapshots map[uint64][]byte   // synthetic fh → per-handle merged snapshot
+	dirtyFds  map[uint64]struct{} // real /.claude.json fds that wrote or truncated; Release write-throughs only these
+	cacheKey  mergeKey
+	cacheBuf  []byte
+	cacheOK   bool
+	readErr   error // last merged-read failure; cleared by the next successful merge
+	writeErr  error // last write-through failure; cleared only by a successful write-through
+}
+
+// mergeKey identifies one (private, base) input pair for the merge cache.
+// Caching the merge keyed on both files' (mtime, size) is load-bearing, not an
+// optimization: noattrcache — the only coherence lever fuse-t offers — makes
+// the kernel getattr constantly, and the file can be MBs.
+type mergeKey struct {
+	privMtimeNS, privSize int64
+	baseMtimeNS, baseSize int64
+}
+
+func newClaudeJSONView(privatePath, basePath string) *claudeJSONView {
+	return &claudeJSONView{
+		privatePath: privatePath,
+		basePath:    basePath,
+		nextFh:      syntheticFhBase,
+		snapshots:   map[uint64][]byte{},
+		dirtyFds:    map[uint64]struct{}{},
+	}
+}
+
+// syntheticFh reports whether fh is a synthetic merged-view read handle (as
+// opposed to a raw kernel fd or ^uint64(0), "no handle").
+func syntheticFh(fh uint64) bool {
+	return fh >= syntheticFhBase && fh != ^uint64(0)
+}
+
+// statKey builds the merge-cache key. ok is false when the private file cannot
+// be statted — nothing cacheable, the read path is about to fail or race. An
+// absent base is encoded as -1s, distinct from any real stat.
+func (v *claudeJSONView) statKey() (mergeKey, bool) {
+	pfi, err := os.Lstat(v.privatePath)
+	if err != nil {
+		return mergeKey{}, false
+	}
+	k := mergeKey{
+		privMtimeNS: pfi.ModTime().UnixNano(), privSize: pfi.Size(),
+		baseMtimeNS: -1, baseSize: -1,
+	}
+	if bfi, err := os.Lstat(v.basePath); err == nil {
+		k.baseMtimeNS, k.baseSize = bfi.ModTime().UnixNano(), bfi.Size()
+	}
+	return k, true
+}
+
+// merged materializes the current merged /.claude.json: base's shareable keys
+// overlaid on the committed private file. A missing private file is plain
+// -ENOENT — onboarding semantics are preserved, and a view is never fabricated
+// from base alone. An unparseable private or base falls back to the raw
+// private bytes and records the read error for healthErr (claude's own
+// backups/ recovery must still be able to read its state file); the session
+// never sees EIO. Every merge outcome assigns readErr: a success clears it, so
+// a user fixing a corrupt file stops the health noise on the next read.
+func (v *claudeJSONView) merged() ([]byte, int) {
+	key, cacheable := v.statKey()
+	if cacheable {
+		v.mu.Lock()
+		if v.cacheOK && v.cacheKey == key {
+			buf := v.cacheBuf
+			v.readErr = nil
+			v.mu.Unlock()
+			return buf, 0
+		}
+		v.mu.Unlock()
+	}
+	priv, err := os.ReadFile(v.privatePath)
+	if err != nil {
+		return nil, errno(err)
+	}
+	base, err := os.ReadFile(v.basePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			v.setReadErr(fmt.Errorf("merged view of %s: read base: %w", v.privatePath, err))
+			return priv, 0
+		}
+		base = nil
+	}
+	merged, _, err := MergeClaudeJSON(priv, base)
+	if err != nil {
+		v.setReadErr(fmt.Errorf("merged view of %s: %w", v.privatePath, err))
+		return priv, 0
+	}
+	v.mu.Lock()
+	v.readErr = nil
+	if cacheable {
+		v.cacheKey, v.cacheBuf, v.cacheOK = key, merged, true
+	}
+	v.mu.Unlock()
+	return merged, 0
+}
+
+// setReadErr stores a merged-read failure for healthErr. Write-through
+// failures live in the separate writeErr slot, so a read outcome can never
+// mask (or be masked by) a write-through outcome.
+func (v *claudeJSONView) setReadErr(err error) {
+	v.mu.Lock()
+	v.readErr = err
+	v.mu.Unlock()
+}
+
+// openSnapshot materializes a merged snapshot for one read handle. Per-handle
+// snapshots are load-bearing: NFS reads arrive chunked, and re-merging per
+// read could tear the JSON mid-handle if private or base changed between
+// chunks.
+func (v *claudeJSONView) openSnapshot() (int, uint64) {
+	buf, st := v.merged()
+	if st != 0 {
+		return st, ^uint64(0)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	fh := v.nextFh
+	v.nextFh++
+	v.snapshots[fh] = buf
+	return 0, fh
+}
+
+// snapshot returns the snapshot behind a synthetic handle.
+func (v *claudeJSONView) snapshot(fh uint64) ([]byte, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	buf, ok := v.snapshots[fh]
+	return buf, ok
+}
+
+// closeSnapshot drops a synthetic handle.
+func (v *claudeJSONView) closeSnapshot(fh uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	delete(v.snapshots, fh)
+}
+
+// markDirty records that a real /.claude.json fd mutated the private file
+// (Write or fd Truncate), so its Release must run the base write-through. A
+// write-capable fd that never writes stays clean — its Release must not push
+// possibly-stale private shareable keys over a newer base.
+func (v *claudeJSONView) markDirty(fh uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.dirtyFds[fh] = struct{}{}
+}
+
+// takeDirty reports whether fh was marked dirty and clears the flag — kernel
+// fd numbers are reused, so the flag must not outlive the Release.
+func (v *claudeJSONView) takeDirty(fh uint64) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	_, dirty := v.dirtyFds[fh]
+	delete(v.dirtyFds, fh)
+	return dirty
+}
+
+// getattrSnapshot answers Getattr for a synthetic handle: the private file's
+// mode and ownership with the snapshot's size — Getattr.Size must equal what
+// Read returns on this handle or the NFS client serves truncated reads.
+func (v *claudeJSONView) getattrSnapshot(fh uint64, stat *fuse.Stat_t) int {
+	buf, ok := v.snapshot(fh)
+	if !ok {
+		return -int(syscall.EBADF)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Lstat(v.privatePath, &st); err != nil {
+		return errno(err)
+	}
+	copyStat(stat, &st)
+	stat.Size = int64(len(buf))
+	return 0
+}
+
+// readSnapshot serves a chunked read from a synthetic handle's snapshot;
+// reads at or past the end are EOF.
+func (v *claudeJSONView) readSnapshot(fh uint64, buff []byte, ofst int64) int {
+	buf, ok := v.snapshot(fh)
+	if !ok {
+		return -int(syscall.EBADF)
+	}
+	if ofst < 0 {
+		return -int(syscall.EINVAL)
+	}
+	if ofst >= int64(len(buf)) {
+		return 0
+	}
+	return copy(buff, buf[ofst:])
+}
+
+// overrideMergedAttr rewrites a path-based Getattr of /.claude.json (stat
+// already holds the private file's attributes) to the merged view: Size
+// becomes the merged length and Mtim the max of private and base. Base-driven
+// changes must bump size/mtime or the NFS client keeps serving stale data
+// pages — noattrcache disables attribute caching, not data caching.
+func (v *claudeJSONView) overrideMergedAttr(stat *fuse.Stat_t) int {
+	buf, st := v.merged()
+	if st != 0 {
+		return st
+	}
+	stat.Size = int64(len(buf))
+	var bst syscall.Stat_t
+	if err := syscall.Lstat(v.basePath, &bst); err == nil {
+		base := fuse.Timespec{Sec: bst.Mtimespec.Sec, Nsec: bst.Mtimespec.Nsec}
+		if base.Sec > stat.Mtim.Sec || (base.Sec == stat.Mtim.Sec && base.Nsec > stat.Mtim.Nsec) {
+			stat.Mtim = base
+		}
+	}
+	return 0
+}
+
+// writeThrough propagates the committed private /.claude.json's shareable keys
+// into the shared base ~/.claude.json. It runs after claude's commit durably
+// landed (rename or dirty write-handle release), so it must never fail the
+// fuse op: failures land in writeErr and surface through FuseProvider.Health
+// (the daemon logs them every poll; ccp doctor shows them), cleared only by
+// the next successful write-through. A missing base file skips the
+// write-through entirely — deliberate policy: cc-pool must not pre-empt
+// vanilla claude's own onboarding by minting ~/.claude.json.
+func (v *claudeJSONView) writeThrough() {
+	writeThroughMu.Lock()
+	defer writeThroughMu.Unlock()
+	err := v.writeThroughBase()
+	v.mu.Lock()
+	v.writeErr = err
+	v.mu.Unlock()
+}
+
+// writeThroughBase runs one base read→split→write cycle. Caller holds
+// writeThroughMu.
+func (v *claudeJSONView) writeThroughBase() error {
+	base, err := os.ReadFile(v.basePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("write-through to %s: read base: %w", v.basePath, err)
+	}
+	payload, err := os.ReadFile(v.privatePath)
+	if err != nil {
+		return fmt.Errorf("write-through to %s: read committed private file: %w", v.basePath, err)
+	}
+	newBase, err := SplitClaudeJSON(payload, base)
+	if err != nil {
+		return fmt.Errorf("write-through to %s: %w", v.basePath, err)
+	}
+	if bytes.Equal(newBase, base) {
+		// No shareable key changed: skip the rewrite. Writing identical bytes
+		// would still bump base's mtime — invalidating every mount's merge
+		// cache — and widen the vanilla-claude last-writer window for nothing.
+		// The skip IS a successful cycle, so returning nil (clearing writeErr)
+		// is deliberate.
+		return nil
+	}
+	if err := WriteAtomic0600(v.basePath, newBase); err != nil {
+		return fmt.Errorf("write-through to %s: %w", v.basePath, err)
+	}
+	return nil
+}
+
+// healthErr joins the view's two independent failure domains for
+// FuseProvider.Health: the last merged-read failure (cleared by the next
+// successful merge) and the last base write-through failure (cleared only by
+// a successful write-through). The daemon logs the joined error every poll
+// and ccp doctor shows it.
+func (fs *mirrorFS) healthErr() error {
+	fs.cj.mu.Lock()
+	defer fs.cj.mu.Unlock()
+	return errors.Join(fs.cj.readErr, fs.cj.writeErr)
+}

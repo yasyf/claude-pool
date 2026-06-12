@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/yasyf/cc-pool/internal/keychain"
+	"github.com/yasyf/cc-pool/internal/overlay"
 	"github.com/yasyf/cc-pool/internal/store"
 )
 
@@ -157,6 +158,13 @@ func TestPrepareAddRepairsHalfAddedDir(t *testing.T) {
 	if _, err := m.Init(); err != nil {
 		t.Fatal(err)
 	}
+	// The repair semantics pinned here are provider-independent; pin the
+	// recorded kind so a fuse-capable `-tags fuse` run doesn't route PrepareAdd
+	// through an in-process mount this test can't host (Init's Detect would
+	// pick fuse there, moving the private root to acct-01.private).
+	if err := m.SetDefaultOverlayKind(overlay.KindSymlink); err != nil {
+		t.Fatal(err)
+	}
 	pending, err := m.PrepareAdd()
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +234,11 @@ func TestPrepareAddPurgesStaleKeychainItem(t *testing.T) {
 		fk := newFakeKeychain()
 		m := &Manager{Store: openTestStore(t), Keychain: fk}
 		if _, err := m.Init(); err != nil {
+			t.Fatal(err)
+		}
+		// Provider-independent purge semantics; pin symlink for the same reason
+		// as TestPrepareAddRepairsHalfAddedDir (no in-process mounts in tests).
+		if err := m.SetDefaultOverlayKind(overlay.KindSymlink); err != nil {
 			t.Fatal(err)
 		}
 		svc := keychain.ServiceName(AccountDir(1))

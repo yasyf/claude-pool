@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/yasyf/cc-pool/internal/pool"
+	"github.com/yasyf/cc-pool/internal/overlay"
 )
 
 // writeStatusSnapshot mirrors the status op's view to s.snapshot via
@@ -21,7 +21,7 @@ func (s *Server) writeStatusSnapshot(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("encode status snapshot: %w", err)
 	}
-	if err := pool.WriteAtomic0600(s.snapshot, data); err != nil {
+	if err := overlay.WriteAtomic0600(s.snapshot, data); err != nil {
 		return fmt.Errorf("write status snapshot %s: %w", s.snapshot, err)
 	}
 	return nil

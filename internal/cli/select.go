@@ -144,6 +144,7 @@ func resolveSelection(cmd *cobra.Command, m *pool.Manager, req selectReq) (dir, 
 						warnExhaustedFallback(cmd, daemonAccountName(m, resp.SelectedID), resp.ExtraEnabled, derefTime(resp.SoonestReset))
 					}
 					warnPinHeld(cmd, m, resp.PinHeldAccount, resp.SelectedID)
+					mergeDaemonPick(cmd, m, resp.SelectedID)
 					return resp.Dir, daemonSelectionLine(m, resp), nil
 				case outcomeError:
 					return "", "", errors.New(resp.Error)
@@ -269,14 +270,15 @@ func derefTime(t *time.Time) time.Time {
 	return *t
 }
 
-// prepareAccount re-asserts the account's overlay and preflight-refreshes its
-// token — the daemonless equivalent of what the daemon does for its own picks —
-// then returns the config dir. Warnings go to stderr; the caller prints the
-// success line.
+// prepareAccount re-asserts the account's overlay, merges the base's shareable
+// .claude.json settings, and preflight-refreshes its token — the daemonless
+// equivalent of what the daemon does for its own picks — then returns the
+// config dir. Warnings go to stderr; the caller prints the success line.
 func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account) (string, error) {
 	if err := m.SyncOverlay(a); err != nil {
 		warn(cmd.ErrOrStderr(), "couldn't sync this account's settings: %v", err)
 	}
+	mergeLaunchSettings(cmd, m, a)
 	if err := m.PreflightRefresh(cmd.Context(), a); err != nil {
 		if errors.Is(err, pool.ErrNeedsLogin) {
 			warn(cmd.ErrOrStderr(), "%s needs to log in again; run `ccp add` or `claude /login`", accountName(a.Label))
@@ -285,6 +287,32 @@ func prepareAccount(cmd *cobra.Command, m *pool.Manager, a store.Account) (strin
 		}
 	}
 	return a.ConfigDir, nil
+}
+
+// mergeLaunchSettings propagates ~/.claude.json's shareable settings into the
+// account about to be launched, warning and continuing on failure — the same
+// warn-and-launch contract as SyncOverlay and PreflightRefresh: a malformed
+// ~/.claude.json must not brick every pooled launch.
+func mergeLaunchSettings(cmd *cobra.Command, m *pool.Manager, a store.Account) {
+	if _, err := m.MergeBaseClaudeJSON(a); err != nil {
+		warn(cmd.ErrOrStderr(), "couldn't propagate shared settings from ~/.claude.json: %v", err)
+	}
+}
+
+// mergeDaemonPick runs the launch-settings merge for a daemon-served pick,
+// which returns before prepareAccount runs. A nil or unknown SelectedID warns
+// and skips, degrading like daemonAccountName.
+func mergeDaemonPick(cmd *cobra.Command, m *pool.Manager, id *int) {
+	if id == nil {
+		warn(cmd.ErrOrStderr(), "daemon pick carried no account id; skipping the shared-settings merge")
+		return
+	}
+	a, err := m.Store.GetAccount(*id)
+	if err != nil {
+		warn(cmd.ErrOrStderr(), "couldn't load account %d for the shared-settings merge: %v", *id, err)
+		return
+	}
+	mergeLaunchSettings(cmd, m, a)
 }
 
 // announceLine prints the selection diagnostic to stderr, but only when stdout is

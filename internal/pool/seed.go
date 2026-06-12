@@ -30,7 +30,11 @@ const (
 // per-account identity, and `claude /login` writes the new account's own.
 // Everything else (hasCompletedOnboarding, mcpServers, per-project state, …)
 // carries over so a pooled session behaves like plain claude instead of
-// running the first-run wizard.
+// running the first-run wizard. Seeding deliberately strips ONLY
+// overlay.OAuthAccountKey, not the full overlay.ClaudeJSONPrivateKeys
+// blacklist the launch-time merge (mergeClaudeJSON) and the fuse merged view
+// honor: at add time, copying projects and userID gives the new account
+// continuity with plain claude.
 //
 // The file is written to the provider's private root (never through a fuse
 // mount, which may not be up in a CLI process) via temp+rename, so a
@@ -43,7 +47,7 @@ func seedClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (SeedOutc
 	if existing, err := os.ReadFile(dst); err == nil {
 		var cur map[string]json.RawMessage
 		if json.Unmarshal(existing, &cur) == nil {
-			if _, ok := cur["oauthAccount"]; ok {
+			if _, ok := cur[overlay.OAuthAccountKey]; ok {
 				return SeedKeptExisting, nil
 			}
 		}
@@ -63,40 +67,14 @@ func seedClaudeJSON(prov overlay.Provider, accountDir, srcPath string) (SeedOutc
 	if err := json.Unmarshal(src, &top); err != nil {
 		return "", fmt.Errorf("parse %s: %w", srcPath, err)
 	}
-	delete(top, "oauthAccount")
+	delete(top, overlay.OAuthAccountKey)
 	out, err := json.Marshal(top)
 	if err != nil {
 		return "", fmt.Errorf("encode seeded config: %w", err)
 	}
 
-	if err := WriteAtomic0600(dst, out); err != nil {
+	if err := overlay.WriteAtomic0600(dst, out); err != nil {
 		return "", fmt.Errorf("install seeded config: %w", err)
 	}
 	return SeedCopied, nil
-}
-
-// WriteAtomic0600 writes data to dst via temp+rename in dst's directory, so a
-// concurrent reader never sees a partial file. Creates the directory if
-// missing.
-func WriteAtomic0600(dst string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name()) // no-op after a successful rename
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), dst)
 }

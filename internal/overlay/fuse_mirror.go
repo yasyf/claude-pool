@@ -18,18 +18,28 @@ import (
 // PrivateEntry names (daemon/, ide/, backups/, .claude.json and its atomic-write
 // temp files): their whole subtrees are redirected to a private per-account
 // backing dir so concurrent sessions don't fight over one supervisor/IDE
-// registry and per-account state never lands in the shared base — matching the
-// symlink provider's invariant.
+// registry — matching the symlink provider's layout. Identity and the rest of
+// ClaudeJSONPrivateKeys never land in the shared base; the SHAREABLE subset of
+// .claude.json, however, flows both ways through cj: read opens of
+// /.claude.json serve base's shareable keys merged over the private file, and
+// committed writes split the shareable keys back through to the base sibling
+// ~/.claude.json (see fuse_claudejson.go).
 type mirrorFS struct {
 	fuse.FileSystemBase
-	root        string // ~/.claude
-	privateRoot string // per-account backing for ExcludedEntries
+	root        string          // ~/.claude
+	privateRoot string          // per-account backing for ExcludedEntries
+	cj          *claudeJSONView // merged read view + base write-through for /.claude.json
 }
 
-func newMirrorFS(root, privateRoot string) *mirrorFS {
+func newMirrorFS(root, privateRoot, baseClaudeJSON string) *mirrorFS {
 	absRoot, _ := filepath.Abs(root)
 	absPriv, _ := filepath.Abs(privateRoot)
-	return &mirrorFS{root: absRoot, privateRoot: absPriv}
+	absBase, _ := filepath.Abs(baseClaudeJSON)
+	return &mirrorFS{
+		root:        absRoot,
+		privateRoot: absPriv,
+		cj:          newClaudeJSONView(filepath.Join(absPriv, ".claude.json"), absBase),
+	}
 }
 
 // real maps a fuse path ("/foo/bar") to its backing path: under privateRoot for
@@ -79,21 +89,33 @@ func (fs *mirrorFS) Statfs(path string, stat *fuse.Statfs_t) int {
 }
 
 func (fs *mirrorFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
-	var st syscall.Stat_t
-	var err error
-	if fh != ^uint64(0) {
-		err = syscall.Fstat(int(fh), &st)
-	} else {
-		err = syscall.Lstat(fs.real(path), &st)
+	if syntheticFh(fh) {
+		return fs.cj.getattrSnapshot(fh, stat)
 	}
-	if err != nil {
+	var st syscall.Stat_t
+	if fh != ^uint64(0) {
+		// A real handle at /.claude.json is a write handle (read opens are
+		// synthetic): raw Fstat, no merged-view override.
+		if err := syscall.Fstat(int(fh), &st); err != nil {
+			return errno(err)
+		}
+		copyStat(stat, &st)
+		return 0
+	}
+	if err := syscall.Lstat(fs.real(path), &st); err != nil {
 		return errno(err)
 	}
 	copyStat(stat, &st)
+	if path == claudeJSONFusePath {
+		return fs.cj.overrideMergedAttr(stat)
+	}
 	return 0
 }
 
 func (fs *mirrorFS) Open(path string, flags int) (int, uint64) {
+	if path == claudeJSONFusePath && flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+		return fs.cj.openSnapshot()
+	}
 	fd, err := syscall.Open(fs.real(path), flags, 0)
 	if err != nil {
 		return errno(err), ^uint64(0)
@@ -110,6 +132,9 @@ func (fs *mirrorFS) Create(path string, flags int, mode uint32) (int, uint64) {
 }
 
 func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
+	if syntheticFh(fh) {
+		return fs.cj.readSnapshot(fh, buff, ofst)
+	}
 	n, err := syscall.Pread(int(fh), buff, ofst)
 	if err != nil {
 		return errno(err)
@@ -118,17 +143,33 @@ func (fs *mirrorFS) Read(path string, buff []byte, ofst int64, fh uint64) int {
 }
 
 func (fs *mirrorFS) Write(path string, buff []byte, ofst int64, fh uint64) int {
+	if syntheticFh(fh) {
+		// Synthetic merged-view handles are read-only; without this guard the
+		// huge handle ID would be passed to pwrite as a bogus fd int.
+		return -int(syscall.EBADF)
+	}
 	n, err := syscall.Pwrite(int(fh), buff, ofst)
 	if err != nil {
 		return errno(err)
+	}
+	if path == claudeJSONFusePath {
+		fs.cj.markDirty(fh)
 	}
 	return n
 }
 
 func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
+	if syntheticFh(fh) {
+		// Synthetic merged-view handles are read-only; without this guard the
+		// huge handle ID would be passed to ftruncate as a bogus fd int.
+		return -int(syscall.EINVAL)
+	}
 	var err error
 	if fh != ^uint64(0) {
 		err = syscall.Ftruncate(int(fh), size)
+		if err == nil && path == claudeJSONFusePath {
+			fs.cj.markDirty(fh)
+		}
 	} else {
 		err = syscall.Truncate(fs.real(path), size)
 	}
@@ -136,11 +177,26 @@ func (fs *mirrorFS) Truncate(path string, size int64, fh uint64) int {
 }
 
 func (fs *mirrorFS) Fsync(path string, datasync bool, fh uint64) int {
+	if syntheticFh(fh) {
+		return 0 // a merged snapshot is memory; nothing to sync
+	}
 	return errno(syscall.Fsync(int(fh)))
 }
 
 func (fs *mirrorFS) Release(path string, fh uint64) int {
-	return errno(syscall.Close(int(fh)))
+	if syntheticFh(fh) {
+		fs.cj.closeSnapshot(fh)
+		return 0
+	}
+	st := errno(syscall.Close(int(fh)))
+	if path == claudeJSONFusePath && fs.cj.takeDirty(fh) {
+		// The fd actually wrote into the private /.claude.json (an in-place
+		// commit): propagate the shareable keys to base after the close. A
+		// write-capable fd that never wrote stays clean — write-through would
+		// push possibly-stale private shareable keys over a newer base.
+		fs.cj.writeThrough()
+	}
+	return st
 }
 
 func (fs *mirrorFS) Opendir(path string) (int, uint64) {
@@ -161,6 +217,10 @@ func (fs *mirrorFS) Readdir(path string, fill func(name string, stat *fuse.Stat_
 	if err != nil {
 		return errno(err)
 	}
+	// Invariant: entries are filled with nil stats so the kernel issues a
+	// per-name Getattr — the path-based Getattr is where /.claude.json's
+	// merged size/mtime override applies. Filling real stats here would
+	// bypass it and pin the private file's raw size.
 	fill(".", nil, 0)
 	fill("..", nil, 0)
 	seen := map[string]bool{}
@@ -223,7 +283,16 @@ func (fs *mirrorFS) Readlink(path string) (int, string) {
 }
 
 func (fs *mirrorFS) Rename(oldpath string, newpath string) int {
-	return errno(syscall.Rename(fs.real(oldpath), fs.real(newpath)))
+	st := errno(syscall.Rename(fs.real(oldpath), fs.real(newpath)))
+	if st == 0 && newpath == claudeJSONFusePath {
+		// claude's atomic save (tmp + rename) just committed the private file;
+		// propagate its shareable keys to base. The private rename's status is
+		// ALWAYS returned — the commit durably happened, so a write-through
+		// failure must not fail the save; it goes sticky and surfaces via
+		// Health.
+		fs.cj.writeThrough()
+	}
+	return st
 }
 
 func (fs *mirrorFS) Chmod(path string, mode uint32) int {

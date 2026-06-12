@@ -155,7 +155,7 @@ CLAUDE_CODE_PLUGIN_CACHE_DIR="$HOME/.claude/plugins" CLAUDE_CONFIG_DIR=$(ccp sel
 `~/.claude` is **never moved** and never registered as a pool account. It
 stays the canonical config dir, so plain `claude` keeps working exactly as
 before, and is the **shared base** every pooled account mirrors. The
-pool never reads or writes plain claude's credential or state. Every account,
+pool never touches plain claude's credential or login identity. Every account,
 including your main subscription, joins with its own `claude /login`, so its
 token chain is fully independent of plain claude's.
 
@@ -191,8 +191,19 @@ A few entries stay per-account instead of shared: `daemon/` and `ide/`
 (Claude's PID-keyed supervisor and IDE lock/socket files, which would collide
 across concurrent sessions), `backups/` (rotating backups of each account's
 `.claude.json`), the identity and credential files `.claude.json` and
-`.credentials.json`, and `.last-update-result.json` (instance-local
-auto-update state).
+`.credentials.json`, `.last-update-result.json` (instance-local auto-update
+state), and `remote-settings.json` (claude's cached per-subscription
+settings).
+
+Per-account `.claude.json` doesn't mean settings fork, though: its shareable
+top-level keys — everything except identity, per-project state, and startup
+counters — flow from `~/.claude.json` into pooled sessions, so a setting you
+change in vanilla `claude` reaches every account. One caveat: under the
+default symlink overlay the flow is one-way (merged in at launch, base wins),
+so changing a shareable setting *inside* a pooled session reverts at the next
+launch — manage shared settings in vanilla `claude`, or use the fuse overlay,
+whose live merged view writes shareable changes back to `~/.claude.json`
+(two-way).
 
 ### Scoring
 

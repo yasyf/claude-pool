@@ -95,6 +95,9 @@ func newEnvCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				// env is a launch intent like select/run: propagate the base's
+				// shareable .claude.json settings before the user execs claude.
+				mergeLaunchSettings(cmd, m, a)
 				out := cmd.OutOrStdout()
 				fmt.Fprintf(out, "export CLAUDE_CONFIG_DIR=%s\n", shellQuote(a.ConfigDir))
 				// Pin claude's plugin root to the shared base so the session

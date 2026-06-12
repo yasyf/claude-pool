@@ -117,3 +117,85 @@ func TestFuseConvertRoundTrip(t *testing.T) {
 		t.Fatalf("backups after reverse = %q err=%v", got, err)
 	}
 }
+
+// TestFuseConvertIdentityVerifiedAgainstForeignBase pins the migrate↔merge
+// interplay at convertToFuse's post-mount identity verification: that re-read
+// traverses the live merged view, and with a base ~/.claude.json carrying a
+// DIFFERENT oauthAccount the verification must still see the account's own
+// identity — oauthAccount is blacklisted, so the merged read sources it from
+// the private file. A leak would surface the base UUID, mismatch, and roll the
+// conversion back. Requires fuse-t like TestFuseConvertRoundTrip; skips when a
+// mount cannot come up.
+func TestFuseConvertIdentityVerifiedAgainstForeignBase(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	base := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(filepath.Join(base, "projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The base SIBLING ~/.claude.json: a foreign identity plus a shareable
+	// marker proving the merged view (not a raw passthrough) serves the reads.
+	const foreignBase = `{"theme":"light","mergedViewMarker":true,"oauthAccount":{"accountUuid":"u-IMPOSTOR","emailAddress":"x@example.com"}}`
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(foreignBase), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	probeSrc, probeMnt := t.TempDir(), t.TempDir()
+	if err := (&overlay.FuseProvider{}).Setup(probeSrc, probeMnt); err != nil {
+		t.Skipf("fuse-t mount unavailable (acceptable; symlink is the default): %v", err)
+	}
+	if err := (&overlay.FuseProvider{}).Teardown(probeSrc, probeMnt); err != nil {
+		t.Fatalf("probe teardown: %v", err)
+	}
+
+	dir := filepath.Join(home, "acct-01")
+	if err := (&overlay.SymlinkProvider{}).Setup(base, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(identityJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st := openTestStore(t)
+	a := store.Account{ID: 1, ConfigDir: dir, KeychainService: "svc", KeychainAccount: "user", OverlayKind: "symlink"}
+	if err := st.UpsertAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Store: st}
+
+	fused, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err != nil {
+		t.Fatalf("convert to fuse with a foreign base identity: %v", err)
+	}
+	t.Cleanup(func() { _ = (&overlay.FuseProvider{}).Teardown(base, dir) })
+	if fused.OverlayKind != "fuse" {
+		t.Fatalf("row = %s, want fuse", fused.OverlayKind)
+	}
+
+	// The same read convertToFuse just verified: identity through the live
+	// merged view is the account's own, never the base's.
+	id, err := readIdentity(filepath.Join(dir, ".claude.json"))
+	if err != nil {
+		t.Fatalf("identity through merged mount: %v", err)
+	}
+	if id.AccountUUID != "u-1" || id.EmailAddress != "a@example.com" {
+		t.Fatalf("identity through merged mount = %+v, want the account's u-1/a@example.com", id)
+	}
+	// The merged view is provably live (base's shareable marker shows), so the
+	// identity above came through the merge, not a passthrough.
+	got := rawTop(t, readFile(t, filepath.Join(dir, ".claude.json")))
+	if string(got["mergedViewMarker"]) != `true` || string(got["theme"]) != `"light"` {
+		t.Fatalf("merged view not live through the mount: marker=%s theme=%s", got["mergedViewMarker"], got["theme"])
+	}
+	// Neither side was rewritten: a conversion is not a commit, so the private
+	// file keeps the identity verbatim and the base sibling keeps its own.
+	if gotPriv := readFileT(t, filepath.Join(overlay.FusePrivateRoot(dir), ".claude.json")); gotPriv != identityJSON {
+		t.Fatalf("private file = %q, want the untouched identity", gotPriv)
+	}
+	if gotBase := readFileT(t, filepath.Join(home, ".claude.json")); gotBase != foreignBase {
+		t.Fatalf("base sibling rewritten by conversion: %q", gotBase)
+	}
+}

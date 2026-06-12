@@ -3,9 +3,16 @@
 package overlay
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/winfsp/cgofuse/fuse"
 )
 
 // TestFuseMirrorRoundTrip mounts a passthrough mirror via fuse-t and verifies
@@ -65,13 +72,71 @@ func TestFuseMirrorRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(FusePrivateRoot(mnt), ".claude.json")); err != nil {
 		t.Fatalf(".claude.json not in private backing dir: %v", err)
 	}
+
+	// Merged read through the mount: the base SIBLING ~/.claude.json's
+	// shareable keys overlay the account's private file while the private
+	// identity wins. This pins fuse-t's read-open mode — read opens must
+	// arrive O_RDONLY for the synthetic merged handle to engage (the biggest
+	// fuse risk in the merged-view design).
+	sibling := filepath.Join(filepath.Dir(base), ".claude.json")
+	if err := os.WriteFile(sibling, []byte(`{"theme":"light","sharedKey":true,"oauthAccount":{"accountUuid":"base-own"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	privFile := filepath.Join(FusePrivateRoot(mnt), ".claude.json")
+	if err := os.WriteFile(privFile, []byte(`{"theme":"dark","oauthAccount":{"accountUuid":"acct-own"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := os.ReadFile(filepath.Join(mnt, ".claude.json"))
+	if err != nil {
+		t.Fatalf("merged read through mount: %v", err)
+	}
+	mgot := raw(t, merged)
+	if string(mgot["theme"]) != `"light"` {
+		t.Fatalf("merged theme = %s, want base's \"light\"", mgot["theme"])
+	}
+	if string(mgot["sharedKey"]) != `true` {
+		t.Fatalf("base-only shareable key missing from merged read: %s", merged)
+	}
+	if string(mgot["oauthAccount"]) != `{"accountUuid":"acct-own"}` {
+		t.Fatalf("merged oauthAccount = %s, want the account's own", mgot["oauthAccount"])
+	}
+
+	// Claude-style atomic save through the mount: WriteFile(tmp) + Rename.
+	// The commit lands in the private file verbatim and its shareable keys
+	// write through to the base sibling, which keeps its own oauthAccount.
+	committed := `{"theme":"solarized","sharedKey":true,"oauthAccount":{"accountUuid":"acct-own"}}`
+	tmp := filepath.Join(mnt, ".claude.json.tmp.cd34ef56")
+	if err := os.WriteFile(tmp, []byte(committed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, filepath.Join(mnt, ".claude.json")); err != nil {
+		t.Fatalf("claude-style commit through mount: %v", err)
+	}
+	pb, err := os.ReadFile(privFile)
+	if err != nil {
+		t.Fatalf("read private file after commit: %v", err)
+	}
+	if string(pb) != committed {
+		t.Fatalf("private file after commit = %q, want the full payload %q", pb, committed)
+	}
+	sb, err := os.ReadFile(sibling)
+	if err != nil {
+		t.Fatalf("read base sibling after commit: %v", err)
+	}
+	sgot := raw(t, sb)
+	if string(sgot["theme"]) != `"solarized"` {
+		t.Fatalf("base sibling theme = %s, want write-through \"solarized\"", sgot["theme"])
+	}
+	if string(sgot["oauthAccount"]) != `{"accountUuid":"base-own"}` {
+		t.Fatalf("base sibling oauthAccount = %s, want its own untouched", sgot["oauthAccount"])
+	}
 }
 
 // TestMirrorRealRedirectsLocalEntries pins the path-mapping table without
 // needing a live mount: every PrivateEntry top component (and its subtree)
 // must back onto privateRoot; everything else onto root.
 func TestMirrorRealRedirectsLocalEntries(t *testing.T) {
-	fs := newMirrorFS("/base", "/priv")
+	fs := newMirrorFS("/base", "/priv", "/.claude.json")
 	cases := map[string]string{
 		"/.claude.json":                      "/priv/.claude.json",
 		"/.claude.json.tmp.ab12cd34":         "/priv/.claude.json.tmp.ab12cd34",
@@ -92,4 +157,632 @@ func TestMirrorRealRedirectsLocalEntries(t *testing.T) {
 			t.Errorf("real(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// newClaudeJSONMirror builds a mirrorFS over a home-shaped temp tree —
+// home/.claude as the mirrored root, home/.claude.json as the base sibling,
+// home/acct.private as the private backing dir — without mounting anything
+// (the existing method-level pattern). Empty private/base mean "file absent".
+func newClaudeJSONMirror(t *testing.T, private, base string) (*mirrorFS, string) {
+	t.Helper()
+	home := t.TempDir()
+	for _, d := range []string{filepath.Join(home, ".claude"), filepath.Join(home, "acct.private")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if base != "" {
+		if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(base), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if private != "" {
+		if err := os.WriteFile(filepath.Join(home, "acct.private", ".claude.json"), []byte(private), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs := newMirrorFS(filepath.Join(home, ".claude"), filepath.Join(home, "acct.private"), filepath.Join(home, ".claude.json"))
+	return fs, home
+}
+
+// commitClaudeJSON rehearses claude's atomic save through the mirror: write a
+// tmp file into the private backing dir, then fs.Rename it onto /.claude.json
+// — the path that triggers the base write-through.
+func commitClaudeJSON(t *testing.T, fs *mirrorFS, home, payload string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(home, "acct.private", ".claude.json.tmp.ab12cd34"), []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st := fs.Rename("/.claude.json.tmp.ab12cd34", "/.claude.json"); st != 0 {
+		t.Fatalf("rename commit = %d, want 0", st)
+	}
+}
+
+// TestMirrorClaudeJSONMergedReadStatLitmus is the stat-then-read litmus: a
+// RDONLY open of /.claude.json yields a synthetic handle whose Getattr.Size
+// equals exactly the bytes Read returns, and those bytes are the merge of
+// base's shareable keys over the private file.
+func TestMirrorClaudeJSONMergedReadStatLitmus(t *testing.T) {
+	fs, _ := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	st, fh := fs.Open(claudeJSONFusePath, syscall.O_RDONLY)
+	if st != 0 {
+		t.Fatalf("open = %d, want 0", st)
+	}
+	if !syntheticFh(fh) {
+		t.Fatalf("fh = %d, want a synthetic handle (>= 1<<62)", fh)
+	}
+	var stat fuse.Stat_t
+	if st := fs.Getattr(claudeJSONFusePath, &stat, fh); st != 0 {
+		t.Fatalf("getattr(fh) = %d, want 0", st)
+	}
+	if stat.Mode&0o777 != 0o600 {
+		t.Errorf("mode = %o, want the private file's 600", stat.Mode&0o777)
+	}
+	buf := make([]byte, stat.Size+64)
+	n := fs.Read(claudeJSONFusePath, buf, 0, fh)
+	if n <= 0 {
+		t.Fatalf("read = %d, want > 0", n)
+	}
+	if int64(n) != stat.Size {
+		t.Fatalf("Getattr.Size = %d but Read returned %d bytes — stat/read incoherent", stat.Size, n)
+	}
+	if eof := fs.Read(claudeJSONFusePath, buf, int64(n), fh); eof != 0 {
+		t.Fatalf("read past end = %d, want 0 (EOF)", eof)
+	}
+	got := raw(t, buf[:n])
+	if string(got["theme"]) != `"light"` {
+		t.Errorf("theme = %s, want base's \"light\"", got["theme"])
+	}
+	if string(got["claudeInChromeDefaultEnabled"]) != `true` {
+		t.Errorf("base-only shareable key missing: %s", buf[:n])
+	}
+	if string(got["oauthAccount"]) != `{"accountUuid":"acct-own"}` {
+		t.Errorf("oauthAccount = %s, want the account's own", got["oauthAccount"])
+	}
+
+	// Path-based Getattr (no handle) reports the same merged size.
+	var pstat fuse.Stat_t
+	if st := fs.Getattr(claudeJSONFusePath, &pstat, ^uint64(0)); st != 0 {
+		t.Fatalf("getattr(path) = %d, want 0", st)
+	}
+	if pstat.Size != stat.Size {
+		t.Fatalf("path Getattr.Size = %d, handle Getattr.Size = %d — must agree", pstat.Size, stat.Size)
+	}
+	if st := fs.Release(claudeJSONFusePath, fh); st != 0 {
+		t.Fatalf("release = %d, want 0", st)
+	}
+}
+
+// TestMirrorClaudeJSONIdentityReadIgnoresBaseIdentity pins the migrate
+// interplay contract behind convertToFuse's post-mount identity verification
+// (pool/convert.go): a readIdentity-shaped parse of the merged /.claude.json
+// must see the PRIVATE file's oauthAccount even when the base sibling carries
+// a different one — base identity must never leak through the merged read.
+// Method-level on purpose: it runs without a fuse-t mount, unlike the pool
+// package's live-mount interplay test.
+func TestMirrorClaudeJSONIdentityReadIgnoresBaseIdentity(t *testing.T) {
+	const (
+		acctIdentity = `{"theme":"dark","oauthAccount":{"accountUuid":"u-1","emailAddress":"a@example.com"}}`
+		foreignBase  = `{"theme":"light","sharedKey":true,"oauthAccount":{"accountUuid":"u-IMPOSTOR","emailAddress":"x@example.com"}}`
+	)
+	fs, _ := newClaudeJSONMirror(t, acctIdentity, foreignBase)
+	merged := readMergedClaudeJSON(t, fs)
+	if bytes.Contains(merged, []byte("u-IMPOSTOR")) {
+		t.Fatalf("base identity leaked into the merged read:\n%s", merged)
+	}
+	got := raw(t, merged)
+	if string(got["sharedKey"]) != `true` || string(got["theme"]) != `"light"` {
+		t.Fatalf("merged view not live (base shareable keys missing): %s", merged)
+	}
+	// The exact parse pool's readIdentity performs on this view.
+	var oauth struct {
+		AccountUUID  string `json:"accountUuid"`
+		EmailAddress string `json:"emailAddress"`
+	}
+	if err := json.Unmarshal(got["oauthAccount"], &oauth); err != nil {
+		t.Fatalf("parse oauthAccount: %v", err)
+	}
+	if oauth.AccountUUID != "u-1" || oauth.EmailAddress != "a@example.com" {
+		t.Fatalf("identity through merged read = %+v, want the private file's u-1/a@example.com", oauth)
+	}
+}
+
+// TestMirrorClaudeJSONMissingPrivateENOENT pins onboarding semantics: with no
+// private file the read path is plain ENOENT even when base has content — a
+// view is never fabricated from base alone.
+func TestMirrorClaudeJSONMissingPrivateENOENT(t *testing.T) {
+	fs, _ := newClaudeJSONMirror(t, "", mergeBase)
+	st, _ := fs.Open(claudeJSONFusePath, syscall.O_RDONLY)
+	if st != -int(syscall.ENOENT) {
+		t.Fatalf("open = %d, want -ENOENT", st)
+	}
+	var stat fuse.Stat_t
+	if st := fs.Getattr(claudeJSONFusePath, &stat, ^uint64(0)); st != -int(syscall.ENOENT) {
+		t.Fatalf("getattr = %d, want -ENOENT", st)
+	}
+}
+
+// TestMirrorClaudeJSONRenameWriteThrough: a claude-style tmp+rename commit
+// lands the full payload in the private file AND writes the shareable keys
+// through to base, which keeps its own oauthAccount and counters verbatim.
+func TestMirrorClaudeJSONRenameWriteThrough(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	committed := `{"theme":"solarized","newSetting":42,"oauthAccount":{"accountUuid":"acct-own"},"numStartups":8}`
+	commitClaudeJSON(t, fs, home, committed)
+
+	priv, err := os.ReadFile(filepath.Join(home, "acct.private", ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(priv) != committed {
+		t.Fatalf("private file = %q, want the full committed payload %q (migrate depends on it)", priv, committed)
+	}
+	baseBytes, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := raw(t, baseBytes)
+	if string(got["theme"]) != `"solarized"` || string(got["newSetting"]) != `42` {
+		t.Errorf("shareable keys did not reach base: theme=%s newSetting=%s", got["theme"], got["newSetting"])
+	}
+	if string(got["oauthAccount"]) != `{"accountUuid":"base-own"}` {
+		t.Errorf("base oauthAccount = %s, want its own untouched", got["oauthAccount"])
+	}
+	if string(got["numStartups"]) != `9999` {
+		t.Errorf("base numStartups = %s, want its own 9999", got["numStartups"])
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
+// TestMirrorClaudeJSONWriteThroughSkipsMissingBase: with no base ~/.claude.json
+// a commit must not mint one — cc-pool must not pre-empt vanilla claude's own
+// onboarding.
+func TestMirrorClaudeJSONWriteThroughSkipsMissingBase(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, "")
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized"}`)
+	if _, err := os.Lstat(filepath.Join(home, ".claude.json")); !os.IsNotExist(err) {
+		t.Fatalf("base file was created (err %v); write-through must skip a missing base", err)
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil (skip is not a failure)", err)
+	}
+}
+
+// TestMirrorClaudeJSONWriteThroughErrStickyAndClears: a failing write-through
+// (read-only base dir) must not fail the rename, goes sticky for Health, and
+// clears on the next successful write-through.
+func TestMirrorClaudeJSONWriteThroughErrStickyAndClears(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	if err := os.Chmod(home, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized"}`) // fatals unless rename returns 0
+	if err := fs.healthErr(); err == nil {
+		t.Fatal("healthErr = nil, want the sticky write-through failure")
+	}
+	baseBytes, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(baseBytes) != mergeBase {
+		t.Fatalf("base changed despite the failed write-through:\n%s", baseBytes)
+	}
+
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commitClaudeJSON(t, fs, home, `{"theme":"zenburn"}`)
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil after a successful write-through", err)
+	}
+	got := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
+	if string(got["theme"]) != `"zenburn"` {
+		t.Fatalf("base theme = %s, want \"zenburn\" after recovery", got["theme"])
+	}
+}
+
+// TestMirrorClaudeJSONNoopWriteThroughSkipsRewrite: a commit whose shareable
+// keys already match base must not rewrite the base file — rewriting identical
+// bytes bumps base's mtime, which invalidates every mount's merge cache and
+// widens the vanilla-claude last-writer window for nothing. Pinned via mtime:
+// base is backdated after the first commit, so any rewrite by the identical
+// second commit would move ModTime forward.
+func TestMirrorClaudeJSONNoopWriteThroughSkipsRewrite(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	basePath := filepath.Join(home, ".claude.json")
+	committed := `{"theme":"solarized","oauthAccount":{"accountUuid":"acct-own"},"numStartups":7}`
+	commitClaudeJSON(t, fs, home, committed)
+	want := mustReadFile(t, basePath)
+
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(basePath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	commitClaudeJSON(t, fs, home, committed)
+	fi, err := os.Stat(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(old) {
+		t.Fatalf("no-op commit rewrote base: ModTime = %v, want untouched %v", fi.ModTime(), old)
+	}
+	if got := mustReadFile(t, basePath); !bytes.Equal(got, want) {
+		t.Fatalf("no-op commit changed base bytes:\n%s\nwant:\n%s", got, want)
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil (a skipped no-op cycle is a success)", err)
+	}
+}
+
+// TestMirrorClaudeJSONNoopWriteThroughClearsWriteErr pins the success
+// semantics of the skip: a commit whose shareable keys already match base is a
+// SUCCESSFUL write-through cycle even though nothing was written, so it clears
+// a sticky write error like any other success.
+func TestMirrorClaudeJSONNoopWriteThroughClearsWriteErr(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized","numStartups":7}`)
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil after the first commit", err)
+	}
+	if err := os.Chmod(home, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+	commitClaudeJSON(t, fs, home, `{"theme":"zenburn","numStartups":7}`)
+	if err := fs.healthErr(); err == nil {
+		t.Fatal("healthErr = nil, want the sticky write-through failure")
+	}
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Shareable state back to exactly what base holds: the write-through skips
+	// the rewrite yet must still clear the sticky error.
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized","numStartups":8}`)
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil — a skipped no-op write-through is a success", err)
+	}
+}
+
+// TestMirrorClaudeJSONWriteHandleRelease: a write open of /.claude.json is a
+// real fd (Getattr on it is the raw private file, not the merged view), and
+// its Release runs the same write-through as a rename commit.
+func TestMirrorClaudeJSONWriteHandleRelease(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	st, fh := fs.Open(claudeJSONFusePath, syscall.O_WRONLY|syscall.O_TRUNC)
+	if st != 0 {
+		t.Fatalf("open(WRONLY) = %d, want 0", st)
+	}
+	if syntheticFh(fh) {
+		t.Fatalf("write open returned a synthetic handle %d, want a real fd", fh)
+	}
+	payload := `{"theme":"in-place","oauthAccount":{"accountUuid":"acct-own"}}`
+	if n := fs.Write(claudeJSONFusePath, []byte(payload), 0, fh); n != len(payload) {
+		t.Fatalf("write = %d, want %d", n, len(payload))
+	}
+	var stat fuse.Stat_t
+	if st := fs.Getattr(claudeJSONFusePath, &stat, fh); st != 0 {
+		t.Fatalf("getattr(write fh) = %d, want 0", st)
+	}
+	if stat.Size != int64(len(payload)) {
+		t.Fatalf("write-handle Getattr.Size = %d, want the raw private size %d (no merged override)", stat.Size, len(payload))
+	}
+	if st := fs.Release(claudeJSONFusePath, fh); st != 0 {
+		t.Fatalf("release = %d, want 0", st)
+	}
+	got := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
+	if string(got["theme"]) != `"in-place"` {
+		t.Errorf("base theme = %s, want \"in-place\" after release write-through", got["theme"])
+	}
+	if string(got["oauthAccount"]) != `{"accountUuid":"base-own"}` {
+		t.Errorf("base oauthAccount = %s, want its own untouched", got["oauthAccount"])
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
+// TestMirrorClaudeJSONMtimeMax: the path-based Getattr's Mtim is the max of
+// private and base — base-driven changes must bump mtime or the NFS client
+// serves stale data pages.
+func TestMirrorClaudeJSONMtimeMax(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	privPath := filepath.Join(home, "acct.private", ".claude.json")
+	basePath := filepath.Join(home, ".claude.json")
+	old := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	newer := time.Now().Truncate(time.Second)
+
+	for _, tc := range []struct {
+		name         string
+		privT, baseT time.Time
+	}{
+		{"base newer wins", old, newer},
+		{"private newer wins", newer, old},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.Chtimes(privPath, tc.privT, tc.privT); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(basePath, tc.baseT, tc.baseT); err != nil {
+				t.Fatal(err)
+			}
+			var stat fuse.Stat_t
+			if st := fs.Getattr(claudeJSONFusePath, &stat, ^uint64(0)); st != 0 {
+				t.Fatalf("getattr = %d, want 0", st)
+			}
+			if stat.Mtim.Sec != newer.Unix() {
+				t.Fatalf("Mtim.Sec = %d, want max(private, base) = %d", stat.Mtim.Sec, newer.Unix())
+			}
+		})
+	}
+}
+
+// TestMirrorClaudeJSONSyntheticHandleGuards: Truncate on a synthetic handle is
+// refused without touching the private file, Fsync is a no-op success, and a
+// released handle is EBADF — none may reach a bogus kernel fd.
+func TestMirrorClaudeJSONSyntheticHandleGuards(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	st, fh := fs.Open(claudeJSONFusePath, syscall.O_RDONLY)
+	if st != 0 {
+		t.Fatalf("open = %d, want 0", st)
+	}
+	if st := fs.Truncate(claudeJSONFusePath, 0, fh); st != -int(syscall.EINVAL) {
+		t.Fatalf("truncate(synthetic fh) = %d, want -EINVAL", st)
+	}
+	if got := mustReadFile(t, filepath.Join(home, "acct.private", ".claude.json")); string(got) != mergePrivate {
+		t.Fatalf("refused truncate modified the private file:\n%s", got)
+	}
+	if st := fs.Write(claudeJSONFusePath, []byte(`{"evil":1}`), 0, fh); st != -int(syscall.EBADF) {
+		t.Fatalf("write(synthetic fh) = %d, want -EBADF", st)
+	}
+	if got := mustReadFile(t, filepath.Join(home, "acct.private", ".claude.json")); string(got) != mergePrivate {
+		t.Fatalf("refused write modified the private file:\n%s", got)
+	}
+	if st := fs.Fsync(claudeJSONFusePath, false, fh); st != 0 {
+		t.Fatalf("fsync(synthetic fh) = %d, want 0", st)
+	}
+	if st := fs.Release(claudeJSONFusePath, fh); st != 0 {
+		t.Fatalf("release = %d, want 0", st)
+	}
+	buf := make([]byte, 16)
+	if st := fs.Read(claudeJSONFusePath, buf, 0, fh); st != -int(syscall.EBADF) {
+		t.Fatalf("read after release = %d, want -EBADF", st)
+	}
+	var stat fuse.Stat_t
+	if st := fs.Getattr(claudeJSONFusePath, &stat, fh); st != -int(syscall.EBADF) {
+		t.Fatalf("getattr after release = %d, want -EBADF", st)
+	}
+}
+
+// TestMirrorClaudeJSONCorruptBaseServesRawPrivate: an unparseable base falls
+// back to the raw private bytes with a sticky error — the session must never
+// see EIO on its state file.
+func TestMirrorClaudeJSONCorruptBaseServesRawPrivate(t *testing.T) {
+	fs, _ := newClaudeJSONMirror(t, mergePrivate, `{not json`)
+	st, fh := fs.Open(claudeJSONFusePath, syscall.O_RDONLY)
+	if st != 0 {
+		t.Fatalf("open = %d, want 0 (never EIO on corruption)", st)
+	}
+	buf := make([]byte, len(mergePrivate)+64)
+	n := fs.Read(claudeJSONFusePath, buf, 0, fh)
+	if string(buf[:n]) != mergePrivate {
+		t.Fatalf("read = %q, want the raw private bytes", buf[:n])
+	}
+	if err := fs.healthErr(); err == nil {
+		t.Fatal("healthErr = nil, want a sticky read error for the corrupt base")
+	}
+}
+
+// TestMirrorClaudeJSONCorruptPrivateServesRaw: an unparseable PRIVATE file
+// falls back to its own raw bytes with a sticky read error — claude's recovery
+// must be able to read whatever is in its state file; never EIO.
+func TestMirrorClaudeJSONCorruptPrivateServesRaw(t *testing.T) {
+	const corrupt = `{not json`
+	fs, _ := newClaudeJSONMirror(t, corrupt, mergeBase)
+	if got := readMergedClaudeJSON(t, fs); string(got) != corrupt {
+		t.Fatalf("read = %q, want the raw private bytes %q", got, corrupt)
+	}
+	if err := fs.healthErr(); err == nil {
+		t.Fatal("healthErr = nil, want a sticky read error for the corrupt private file")
+	}
+}
+
+// TestMirrorClaudeJSONReadErrClearsOnBaseFix: the read error is sticky only
+// until the fault is gone — once the corrupt base is fixed, the next merged
+// read alone must clear it; no claude commit (write-through) required.
+func TestMirrorClaudeJSONReadErrClearsOnBaseFix(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, `{not json`)
+	readMergedClaudeJSON(t, fs)
+	if err := fs.healthErr(); err == nil {
+		t.Fatal("healthErr = nil, want a read error for the corrupt base")
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(mergeBase), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := raw(t, readMergedClaudeJSON(t, fs))
+	if string(got["theme"]) != `"light"` {
+		t.Fatalf("merged theme after fix = %s, want base's \"light\"", got["theme"])
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil once the fixed base merges cleanly", err)
+	}
+}
+
+// TestMirrorClaudeJSONWriteErrSurvivesReadRecovery: read and write-through
+// failures are independent domains — a merged read succeeding must not clear a
+// write-through failure; only a successful write-through may.
+func TestMirrorClaudeJSONWriteErrSurvivesReadRecovery(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, `{not json`)
+	// Committing against the unparseable base fails the write-through (never
+	// clobber a base you cannot parse) and records the write error.
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized"}`)
+	if err := fs.healthErr(); err == nil {
+		t.Fatal("healthErr = nil, want the write-through failure for the corrupt base")
+	}
+	// Fixing base lets the merged read succeed, which clears only the read
+	// domain — the write-through failure must persist.
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(mergeBase), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readMergedClaudeJSON(t, fs)
+	err := fs.healthErr()
+	if err == nil {
+		t.Fatal("healthErr = nil after a successful read, want the write-through failure to persist")
+	}
+	if !strings.Contains(err.Error(), "write-through") {
+		t.Fatalf("healthErr = %v, want the write-through failure", err)
+	}
+	// A successful write-through is the only thing that clears it.
+	commitClaudeJSON(t, fs, home, `{"theme":"zenburn"}`)
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil after a successful write-through", err)
+	}
+}
+
+// TestMirrorClaudeJSONCleanWriteHandleSkipsWriteThrough: a write-capable open
+// that closes WITHOUT writing must not write through — right after a
+// symlink→fuse conversion the private file's shareable keys can be staler than
+// base, and a no-op open/close must not push them over it.
+func TestMirrorClaudeJSONCleanWriteHandleSkipsWriteThrough(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	st, fh := fs.Open(claudeJSONFusePath, syscall.O_WRONLY)
+	if st != 0 {
+		t.Fatalf("open(WRONLY) = %d, want 0", st)
+	}
+	if st := fs.Release(claudeJSONFusePath, fh); st != 0 {
+		t.Fatalf("release = %d, want 0", st)
+	}
+	if got := mustReadFile(t, filepath.Join(home, ".claude.json")); string(got) != mergeBase {
+		t.Fatalf("base rewritten by a write handle that never wrote:\n%s", got)
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
+// TestMirrorClaudeJSONTruncateHandleMarksDirty: an fd Truncate counts as a
+// mutation — a truncate-only commit must still write through on Release.
+func TestMirrorClaudeJSONTruncateHandleMarksDirty(t *testing.T) {
+	const valid = `{"theme":"truncated","oauthAccount":{"accountUuid":"acct-own"}}`
+	fs, home := newClaudeJSONMirror(t, valid+`garbage-tail`, mergeBase)
+	st, fh := fs.Open(claudeJSONFusePath, syscall.O_WRONLY)
+	if st != 0 {
+		t.Fatalf("open(WRONLY) = %d, want 0", st)
+	}
+	if st := fs.Truncate(claudeJSONFusePath, int64(len(valid)), fh); st != 0 {
+		t.Fatalf("truncate(fh) = %d, want 0", st)
+	}
+	if st := fs.Release(claudeJSONFusePath, fh); st != 0 {
+		t.Fatalf("release = %d, want 0", st)
+	}
+	got := raw(t, mustReadFile(t, filepath.Join(home, ".claude.json")))
+	if string(got["theme"]) != `"truncated"` {
+		t.Fatalf("base theme = %s, want \"truncated\" after a truncate-only release write-through", got["theme"])
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil", err)
+	}
+}
+
+// TestMirrorClaudeJSONFailedRenameSkipsWriteThrough: a rename that fails (the
+// tmp file does not exist) returns the rename's own status and must not run
+// the write-through — nothing was committed.
+func TestMirrorClaudeJSONFailedRenameSkipsWriteThrough(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, mergeBase)
+	if st := fs.Rename("/.claude.json.tmp.missing", claudeJSONFusePath); st != -int(syscall.ENOENT) {
+		t.Fatalf("rename of a missing tmp = %d, want -ENOENT", st)
+	}
+	if got := mustReadFile(t, filepath.Join(home, ".claude.json")); string(got) != mergeBase {
+		t.Fatalf("base rewritten by a failed rename:\n%s", got)
+	}
+	if err := fs.healthErr(); err != nil {
+		t.Fatalf("healthErr = %v, want nil after a failed rename", err)
+	}
+}
+
+// TestFuseProviderHealthJoinsMirrorErrors pins the Health glue between the
+// package mounts registry and the mirror's sticky errors: a registered (but
+// dead) mount's write-through failure must surface through FuseProvider.Health
+// joined with the liveness error, and an unregistered dir reports only the
+// liveness error — never another mount's sticky state. No live mount needed:
+// the handle is registered by hand, the way Setup would.
+func TestFuseProviderHealthJoinsMirrorErrors(t *testing.T) {
+	fs, home := newClaudeJSONMirror(t, mergePrivate, `{not json`)
+	base := filepath.Join(home, ".claude")
+	// Liveness compares a base entry through the mountpoint; seed one so an
+	// unmounted dir is deterministically "not live" (an empty base is vacuously
+	// live).
+	if err := os.WriteFile(filepath.Join(base, "settings.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Committing over the unparseable base fails the write-through and leaves
+	// the sticky error Health must surface.
+	commitClaudeJSON(t, fs, home, `{"theme":"solarized"}`)
+	if err := fs.healthErr(); err == nil {
+		t.Fatal("precondition: healthErr = nil, want a sticky write-through failure")
+	}
+
+	accountDir := t.TempDir()
+	mountMu.Lock()
+	mounts[accountDir] = &mountHandle{fs: fs}
+	mountMu.Unlock()
+	t.Cleanup(func() {
+		mountMu.Lock()
+		delete(mounts, accountDir)
+		mountMu.Unlock()
+	})
+
+	p := &FuseProvider{}
+	err := p.Health(base, accountDir)
+	if err == nil {
+		t.Fatal("Health = nil, want liveness and write-through failures joined")
+	}
+	if !strings.Contains(err.Error(), "not live") {
+		t.Errorf("Health = %v, want the liveness error joined in", err)
+	}
+	if !strings.Contains(err.Error(), "write-through") {
+		t.Errorf("Health = %v, want the mirror's sticky write-through failure joined in", err)
+	}
+
+	err = p.Health(base, t.TempDir())
+	if err == nil {
+		t.Fatal("Health(unregistered) = nil, want the liveness error")
+	}
+	if !strings.Contains(err.Error(), "not live") {
+		t.Errorf("Health(unregistered) = %v, want the liveness error", err)
+	}
+	if strings.Contains(err.Error(), "write-through") {
+		t.Errorf("Health(unregistered) = %v, leaked another mount's sticky write-through state", err)
+	}
+}
+
+// readMergedClaudeJSON opens /.claude.json read-only through the mirror,
+// returns what one full read serves (the merged document, or the raw private
+// fallback on corruption), and releases the handle.
+func readMergedClaudeJSON(t *testing.T, fs *mirrorFS) []byte {
+	t.Helper()
+	st, fh := fs.Open(claudeJSONFusePath, syscall.O_RDONLY)
+	if st != 0 {
+		t.Fatalf("open = %d, want 0 (never EIO on corruption)", st)
+	}
+	defer fs.Release(claudeJSONFusePath, fh)
+	buf := make([]byte, 1<<16)
+	n := fs.Read(claudeJSONFusePath, buf, 0, fh)
+	if n < 0 {
+		t.Fatalf("read = %d, want >= 0", n)
+	}
+	return buf[:n]
+}
+
+// mustReadFile reads a file or fails the test.
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

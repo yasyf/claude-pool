@@ -5,8 +5,11 @@
 //
 //   - ~/.claude      The canonical Claude Code config dir: plain `claude`'s
 //     home and the shared overlay base. NEVER moved, never
-//     registered as a pool account, never read or written — the
-//     pool never touches plain claude's credential or state.
+//     registered as a pool account — the pool never touches plain
+//     claude's credential or login identity. Its sibling state
+//     file ~/.claude.json IS read (seeding, every launch merge)
+//     and, under the fuse overlay, written through with shareable
+//     keys; overlay.ClaudeJSONPrivateKeys never cross either way.
 //   - ~/.cc-pool/    cc-pool's OWN state (sqlite db, daemon socket, logs),
 //     plus accounts/ holding the pool account dirs
 //     (acct-01, acct-02, ...). Each account dir is a real,
@@ -44,8 +47,11 @@ func ClaudeDir() string {
 
 // ClaudeJSONPath is plain claude's primary state file (~/.claude.json — in
 // $HOME, NOT inside ~/.claude). With CLAUDE_CONFIG_DIR set, claude reads and
-// writes $CONFIG_DIR/.claude.json instead; new accounts are seeded from this
-// file so they inherit onboarding state and settings.
+// writes $CONFIG_DIR/.claude.json instead. The pool reads it at add time
+// (seedClaudeJSON, so new accounts inherit onboarding state and settings) and
+// at every symlink-arm launch (MergeBaseClaudeJSON, shareable keys in, base
+// wins); the fuse merged view writes shareable keys back through to it. Keys
+// in overlay.ClaudeJSONPrivateKeys never cross in either direction.
 func ClaudeJSONPath() string {
 	return filepath.Join(mustHome(), ".claude.json")
 }

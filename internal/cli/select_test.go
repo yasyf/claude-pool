@@ -3,7 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +17,7 @@ import (
 	"github.com/yasyf/cc-pool/internal/keychain"
 	"github.com/yasyf/cc-pool/internal/pool"
 	"github.com/yasyf/cc-pool/internal/store"
+	"github.com/yasyf/cc-pool/internal/version"
 )
 
 func selectTestManager(t *testing.T) *pool.Manager {
@@ -293,6 +297,191 @@ func TestResolveSelectionWaitRefusesExhaustedFallback(t *testing.T) {
 	if strings.Contains(out, "WILL bill") {
 		t.Fatalf("--wait must never accept (or warn about) a billing fallback: %q", out)
 	}
+}
+
+// TestResolveSelectionMergesBaseSettings pins the launch-time settings merge at
+// its integration points: both the forced arm and the live no-daemon arm of
+// resolveSelection must land a shareable ~/.claude.json key in the selected
+// account's private .claude.json. Deleting the mergeLaunchSettings call in
+// prepareAccount fails both arms.
+func TestResolveSelectionMergesBaseSettings(t *testing.T) {
+	cases := map[string]func(id int) selectReq{
+		"forced arm": func(id int) selectReq { return selectReq{noDaemon: true, account: &id, cwd: "/proj"} },
+		"live arm":   func(int) selectReq { return selectReq{noDaemon: true, cwd: "/proj"} },
+	}
+	for name, mkReq := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := exhaustedPoolManager(t) // sets HOME; accounts are symlink-kind
+			marker := []byte(`{"mergeMarker": "yes"}`)
+			if err := os.WriteFile(filepath.Join(os.Getenv("HOME"), ".claude.json"), marker, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetErr(&stderr)
+			cmd.SetContext(context.Background())
+
+			dir, _, err := resolveSelection(cmd, m, mkReq(1))
+			if err != nil || dir == "" {
+				t.Fatalf("selection must succeed: dir=%q err=%v", dir, err)
+			}
+			b, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+			if err != nil {
+				t.Fatalf("account .claude.json missing after launch merge: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(b, &got); err != nil {
+				t.Fatalf("merged file unparseable: %v", err)
+			}
+			if got["mergeMarker"] != "yes" {
+				t.Fatalf("base marker did not reach the account file: %v", got)
+			}
+		})
+	}
+}
+
+// TestResolveSelectionDaemonPickMergesBaseSettings pins the daemon fast path's
+// launch-settings hook at its integration point: an outcomePicked reply must
+// trigger the shared-settings merge for the picked account before the dir is
+// handed back — the merge runs client-side, after the daemon replies. The
+// daemon is faked on pool.SocketPath() under an isolated HOME (the
+// status_test.go fixture pattern): EnsureRunning's ping is satisfied by the
+// live listener, daemonAt by an OK health reply at version.String(). Deleting
+// the mergeDaemonPick call in resolveSelection fails this test.
+func TestResolveSelectionDaemonPickMergesBaseSettings(t *testing.T) {
+	// Short HOME under /tmp: macOS caps sun_path at 104 bytes, and t.TempDir's
+	// /var/folders path plus the test name exceeds it.
+	home, err := os.MkdirTemp("/tmp", "ccp-home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mergeMarker": "yes"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st := openTestStore(t)
+	id := 1
+	dir := filepath.Join(home, "acct-01")
+	if err := st.UpsertAccount(store.Account{
+		ID: id, ConfigDir: dir, Label: "work@example.com",
+		KeychainService: "svc", KeychainAccount: "u", OverlayKind: "symlink",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(pool.StateDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", pool.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req daemon.Request
+			_ = json.NewDecoder(conn).Decode(&req)
+			resp := daemon.Response{Proto: daemon.ProtocolVersion, OK: true, Version: version.String()}
+			if req.Op == daemon.OpSelect {
+				resp.SelectedID = &id
+				resp.Dir = dir
+			}
+			_ = json.NewEncoder(conn).Encode(resp)
+			conn.Close()
+		}
+	}()
+
+	m := &pool.Manager{Store: st}
+	var stderr bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetErr(&stderr)
+	cmd.SetContext(context.Background())
+
+	gotDir, _, err := resolveSelection(cmd, m, selectReq{cwd: "/proj"})
+	if err != nil || gotDir != dir {
+		t.Fatalf("daemon pick must succeed: dir=%q err=%v (stderr=%q)", gotDir, err, stripANSI(stderr.String()))
+	}
+	var got map[string]any
+	if err := json.Unmarshal(readSelectTestFile(t, filepath.Join(dir, ".claude.json")), &got); err != nil || got["mergeMarker"] != "yes" {
+		t.Fatalf("daemon-pick merge did not land the base marker (err=%v): %v", err, got)
+	}
+}
+
+// TestMergeDaemonPick pins the daemon-pick merge hook's degradation contract:
+// a nil or unknown SelectedID warns and skips (a daemon hiccup must not block
+// the launch), while a valid id merges the base's shareable settings.
+func TestMergeDaemonPick(t *testing.T) {
+	known, unknown := 5, 999
+	cases := map[string]struct {
+		id       *int
+		wantWarn bool
+		wantFile bool
+	}{
+		"nil id warns and skips":     {nil, true, false},
+		"unknown id warns and skips": {&unknown, true, false},
+		"valid id merges":            {&known, false, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mergeMarker": "yes"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			st := openTestStore(t)
+			dir := filepath.Join(home, "acct-05")
+			if err := st.UpsertAccount(store.Account{
+				ID: known, ConfigDir: dir, Label: "work@example.com",
+				KeychainService: "svc", KeychainAccount: "u", OverlayKind: "symlink",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			m := &pool.Manager{Store: st}
+			var stderr bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetErr(&stderr)
+
+			mergeDaemonPick(cmd, m, tc.id)
+
+			out := stripANSI(stderr.String())
+			if tc.wantWarn && !strings.Contains(out, "shared-settings merge") {
+				t.Fatalf("expected a skip warning, got %q", out)
+			}
+			if !tc.wantWarn && out != "" {
+				t.Fatalf("expected silence, got %q", out)
+			}
+			_, err := os.Stat(filepath.Join(dir, ".claude.json"))
+			if tc.wantFile {
+				if err != nil {
+					t.Fatalf("merge did not write the account file: %v", err)
+				}
+				var got map[string]any
+				if err := json.Unmarshal(readSelectTestFile(t, filepath.Join(dir, ".claude.json")), &got); err != nil || got["mergeMarker"] != "yes" {
+					t.Fatalf("marker missing from merged file (err=%v): %v", err, got)
+				}
+				return
+			}
+			if !os.IsNotExist(err) {
+				t.Fatalf("no account file should be written on a skipped merge (err=%v)", err)
+			}
+		})
+	}
+}
+
+// readSelectTestFile reads a file or fails the test.
+func readSelectTestFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 // TestAnnounceLineSilentWhenNotTTY is the core of the noise fix: when stdout is

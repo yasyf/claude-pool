@@ -398,6 +398,93 @@ func TestHealStrandedPrivate(t *testing.T) {
 	}
 }
 
+// TestConvertRetreatThenLaunchMergePropagatesBase pins the migrate↔merge
+// interplay across a fuse→symlink retreat: while the row says fuse the launch
+// merge stays out, and once the retreat moves the private file back and flips
+// the row, the launch merge propagates a fresh base key into the moved-back
+// file while the account's identity survives byte-identical.
+func TestConvertRetreatThenLaunchMergePropagatesBase(t *testing.T) {
+	ops := []string{}
+	fake := &fakeFuse{ops: &ops}
+	m, a, dir := newConvertFixture(t, fake)
+	if err := os.WriteFile(ClaudeJSONPath(),
+		[]byte(`{"theme":"light","freshKey":true,"oauthAccount":{"accountUuid":"base-own"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fwd, err := m.ConvertOverlay(a, overlay.KindFuse)
+	if err != nil {
+		t.Fatalf("forward convert: %v", err)
+	}
+	out, err := m.MergeBaseClaudeJSON(fwd)
+	if err != nil || out != MergeSkippedOverlay {
+		t.Fatalf("merge against the fuse row: outcome=%q err=%v, want %q", out, err, MergeSkippedOverlay)
+	}
+
+	back, err := m.ConvertOverlay(fwd, overlay.KindSymlink)
+	if err != nil {
+		t.Fatalf("retreat: %v", err)
+	}
+	out, err = m.MergeBaseClaudeJSON(back)
+	if err != nil || out != MergeApplied {
+		t.Fatalf("launch merge after retreat: outcome=%q err=%v, want %q", out, err, MergeApplied)
+	}
+	got := rawTop(t, readFile(t, filepath.Join(dir, ".claude.json")))
+	if string(got["freshKey"]) != `true` || string(got["theme"]) != `"light"` {
+		t.Fatalf("fresh base keys did not reach the moved-back file: freshKey=%s theme=%s", got["freshKey"], got["theme"])
+	}
+	if string(got["oauthAccount"]) != `{"accountUuid":"u-1","emailAddress":"a@example.com"}` {
+		t.Fatalf("identity disturbed by the launch merge: %s", got["oauthAccount"])
+	}
+}
+
+// TestStrandedPrivateMergeRefusalKeepsHealable pins the no-collision interplay
+// between the launch merge's stranded-copy guard and HealStrandedPrivate: with
+// the account's .claude.json stranded in the fuse private backing dir
+// (interrupted conversion), the launch merge errors without minting a file, so
+// the subsequent heal's moveEntry meets no collision, the healed file carries
+// the stranded identity, and the next launch merge converges.
+func TestStrandedPrivateMergeRefusalKeepsHealable(t *testing.T) {
+	m, a, dir := newConvertFixture(t, nil)
+	priv := overlay.FusePrivateRoot(dir)
+	if err := os.MkdirAll(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".claude.json"), filepath.Join(priv, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ClaudeJSONPath(), []byte(`{"theme":"light"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.MergeBaseClaudeJSON(a); err == nil || !strings.Contains(err.Error(), "ccp doctor") {
+		t.Fatalf("merge with a stranded copy = %v, want the ccp doctor refusal", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ".claude.json")); !os.IsNotExist(err) {
+		t.Fatal("the refused merge minted a file over the heal's restore target")
+	}
+
+	healed, err := m.HealStrandedPrivate(a)
+	if err != nil || !healed {
+		t.Fatalf("heal after refused merge: healed=%v err=%v, want true,nil", healed, err)
+	}
+	if got := readFileT(t, filepath.Join(dir, ".claude.json")); got != identityJSON {
+		t.Fatalf("healed file = %q, want the stranded identity %q", got, identityJSON)
+	}
+
+	out, err := m.MergeBaseClaudeJSON(a)
+	if err != nil || out != MergeApplied {
+		t.Fatalf("launch merge after heal: outcome=%q err=%v, want %q", out, err, MergeApplied)
+	}
+	got := rawTop(t, readFile(t, filepath.Join(dir, ".claude.json")))
+	if string(got["theme"]) != `"light"` {
+		t.Fatalf("base key did not reach the healed file: %s", got["theme"])
+	}
+	if string(got["oauthAccount"]) != `{"accountUuid":"u-1","emailAddress":"a@example.com"}` {
+		t.Fatalf("identity disturbed by the post-heal merge: %s", got["oauthAccount"])
+	}
+}
+
 func TestSetDefaultOverlayKind(t *testing.T) {
 	st := openTestStore(t)
 	m := &Manager{Store: st}

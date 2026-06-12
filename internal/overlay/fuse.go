@@ -15,6 +15,7 @@
 package overlay
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -51,6 +52,7 @@ var (
 
 type mountHandle struct {
 	host *fuse.FileSystemHost
+	fs   *mirrorFS
 	done chan struct{}
 }
 
@@ -90,7 +92,11 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 		_ = os.MkdirAll(filepath.Join(priv, name), 0o700)
 	}
 
-	fs := newMirrorFS(base, priv)
+	// The shared ~/.claude.json is a SIBLING of base (~/.claude), not inside
+	// it — the third path the mirror needs, for the merged /.claude.json read
+	// view and its shareable-key write-through.
+	baseClaudeJSON := filepath.Join(filepath.Dir(base), ".claude.json")
+	fs := newMirrorFS(base, priv, baseClaudeJSON)
 	host := fuse.NewFileSystemHost(fs)
 	host.SetCapReaddirPlus(true)
 	done := make(chan struct{})
@@ -122,7 +128,7 @@ func (p *FuseProvider) Setup(base, accountDir string) error {
 		return fmt.Errorf("fuse mount of %s did not come up (grant Network Volumes access once in System Settings ▸ Privacy, then retry; symlink is used until then)", accountDir)
 	}
 	mountMu.Lock()
-	mounts[accountDir] = &mountHandle{host: host, done: done}
+	mounts[accountDir] = &mountHandle{host: host, fs: fs, done: done}
 	mountMu.Unlock()
 	return nil
 }
@@ -133,12 +139,23 @@ func (p *FuseProvider) Sync(base, accountDir string) error {
 	return p.Health(base, accountDir)
 }
 
-// Health verifies the mount is live by stat-ing a known entry through it.
+// Health verifies the mount is live by stat-ing a known entry through it, and
+// joins in the mirror's sticky /.claude.json merged-read and base
+// write-through errors so the daemon logs propagation failures every poll.
+// The scheduler's reaction to a Health error is benign for a live mount: it
+// retries Setup, which early-returns on the registered mount.
 func (p *FuseProvider) Health(base, accountDir string) error {
+	var liveness error
 	if !mountLive(base, accountDir) {
-		return fmt.Errorf("fuse mount at %s is not live", accountDir)
+		liveness = fmt.Errorf("fuse mount at %s is not live", accountDir)
 	}
-	return nil
+	mountMu.Lock()
+	h, ok := mounts[accountDir]
+	mountMu.Unlock()
+	if !ok {
+		return liveness
+	}
+	return errors.Join(liveness, h.fs.healthErr())
 }
 
 const (
