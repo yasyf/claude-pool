@@ -168,7 +168,9 @@ func TestMirrorProbeFileRejectsWrites(t *testing.T) {
 		{"rmdir", func() error { return syscall.Rmdir(probePath) }},
 		{"truncate", func() error { return os.Truncate(probePath, 0) }},
 		{"chmod", func() error { return os.Chmod(probePath, 0o600) }},
-		{"chown", func() error { return os.Chown(probePath, os.Getuid(), os.Getgid()) }},
+		// chown to the current owner is a kernel/NFS no-op that issues no SETATTR
+		// and never reaches the fs, so the Chown guard is pinned directly in
+		// TestMirrorProbeOpsGuardedWithoutMount instead of through the mount.
 		{"chtimes", func() error { return os.Chtimes(probePath, time.Now(), time.Now()) }},
 		{"setxattr", func() error { return unix.Setxattr(probePath, "user.ccp-test", []byte("x"), 0) }},
 		{"removexattr", func() error { return unix.Removexattr(probePath, "user.ccp-test") }},
@@ -248,7 +250,9 @@ func TestMirrorProbeFileShadowsRealBaseEntry(t *testing.T) {
 		op   func() error
 	}{
 		{"chtimes", func() error { return os.Chtimes(probePath, time.Unix(1, 0), time.Unix(1, 0)) }},
-		{"chown", func() error { return os.Chown(probePath, os.Getuid(), os.Getgid()) }},
+		// chown-to-self is a kernel/NFS no-op (no SETATTR), pinned at the fs level
+		// in TestMirrorProbeOpsGuardedWithoutMount; the base-unchanged check below
+		// already proves no chown lands on the shadowed base entry.
 		{"setxattr", func() error { return unix.Setxattr(probePath, "user.ccp-shadow-test", []byte("x"), 0) }},
 		{"removexattr", func() error { return unix.Removexattr(probePath, "user.ccp-shadow-test") }},
 		{"truncate", func() error { return os.Truncate(probePath, 1) }},
@@ -370,6 +374,19 @@ func TestMirrorProbeOpsGuardedWithoutMount(t *testing.T) {
 	}
 	if st, fh := fs.Opendir(probeFusePath); st != -int(syscall.ENOTDIR) || fh != ^uint64(0) {
 		t.Errorf("Opendir(%s) = (%d, %#x), want (-ENOTDIR, no handle)", probeFusePath, st, fh)
+	}
+
+	// Metadata-mutation guards. A through-mount chown to the current owner is a
+	// kernel/NFS no-op that issues no SETATTR, so only a direct call proves the
+	// Chown guard; chmod/utimens are pinned here too for symmetry.
+	if st := fs.Chmod(probeFusePath, 0o600); st != -int(syscall.EPERM) {
+		t.Errorf("Chmod(%s) = %d, want -EPERM", probeFusePath, st)
+	}
+	if st := fs.Chown(probeFusePath, uint32(os.Getuid()), uint32(os.Getgid())); st != -int(syscall.EPERM) {
+		t.Errorf("Chown(%s) = %d, want -EPERM", probeFusePath, st)
+	}
+	if st := fs.Utimens(probeFusePath, []fuse.Timespec{{Sec: 1}, {Sec: 1}}); st != -int(syscall.EPERM) {
+		t.Errorf("Utimens(%s) = %d, want -EPERM", probeFusePath, st)
 	}
 
 	// Readdir of root hides the shadow entry's name but lists real entries.
